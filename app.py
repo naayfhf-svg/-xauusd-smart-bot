@@ -2,6 +2,10 @@ import streamlit as st
 import requests
 import pandas as pd
 
+# ==========================================
+# إعداد الصفحة
+# ==========================================
+
 st.set_page_config(
     page_title="بوت الذهب XAU/USD",
     page_icon="🥇",
@@ -9,13 +13,19 @@ st.set_page_config(
 )
 
 st.title("🥇 بوت الذهب XAU/USD")
-st.caption("Smart Paper Trading • Multi-Timeframe Confluence Engine")
+st.caption(
+    "Smart Paper Trading • Multi-Timeframe Confluence Engine"
+)
 
-API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
+API_KEY = st.secrets.get(
+    "TWELVE_DATA_API_KEY",
+    ""
+)
 
-# =========================
-# DATA
-# =========================
+
+# ==========================================
+# جلب البيانات
+# ==========================================
 
 def get_candles(interval, outputsize=200):
 
@@ -35,165 +45,330 @@ def get_candles(interval, outputsize=200):
     data = response.json()
 
     if "values" not in data:
-        raise RuntimeError(str(data))
 
-    df = pd.DataFrame(data["values"])
+        message = data.get(
+            "message",
+            "تعذر الحصول على بيانات الذهب"
+        )
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(
-            df[col],
+        raise RuntimeError(message)
+
+    df = pd.DataFrame(
+        data["values"]
+    )
+
+    # تحويل البيانات الرقمية بشكل صريح
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]
+
+    for column in numeric_columns:
+
+        if column not in df.columns:
+            raise RuntimeError(
+                f"العمود {column} غير موجود في البيانات"
+            )
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
 
-    return (
-        df
-        .dropna()
-        .sort_values("datetime")
-        .reset_index(drop=True)
+    df = df.dropna(
+        subset=numeric_columns
     )
 
+    df = df.sort_values(
+        "datetime"
+    )
 
-# =========================
-# INDICATORS
-# =========================
+    df = df.reset_index(
+        drop=True
+    )
+
+    if len(df) < 60:
+
+        raise RuntimeError(
+            "عدد بيانات الشموع غير كافٍ للتحليل"
+        )
+
+    return df
+
+
+# ==========================================
+# المؤشرات
+# ==========================================
 
 def calculate_indicators(df):
 
     df = df.copy()
 
+    # التأكد من النوع الرقمي
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close"
+        ]
+    )
+
+    # --------------------------------------
     # EMA
+    # --------------------------------------
+
     df["ema20"] = (
         df["close"]
-        .ewm(span=20, adjust=False)
+        .ewm(
+            span=20,
+            adjust=False
+        )
         .mean()
     )
 
     df["ema50"] = (
         df["close"]
-        .ewm(span=50, adjust=False)
+        .ewm(
+            span=50,
+            adjust=False
+        )
         .mean()
     )
 
+    # --------------------------------------
     # RSI
+    # --------------------------------------
+
     delta = df["close"].diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
 
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
+    loss = -delta.clip(
+        upper=0
+    )
 
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
+    avg_gain = (
+        gain
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        pd.NA
+    avg_loss = (
+        loss
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    rs = (
+        avg_gain
+        / avg_loss.replace(
+            0,
+            pd.NA
+        )
     )
 
     df["rsi"] = (
-        100 - (100 / (1 + rs))
-    ).fillna(50)
+        100
+        - (
+            100
+            / (1 + rs)
+        )
+    )
 
+    df["rsi"] = pd.to_numeric(
+        df["rsi"],
+        errors="coerce"
+    )
+
+    df["rsi"] = (
+        df["rsi"]
+        .fillna(50)
+    )
+
+    # --------------------------------------
     # MACD
+    # --------------------------------------
+
     ema12 = (
         df["close"]
-        .ewm(span=12, adjust=False)
+        .ewm(
+            span=12,
+            adjust=False
+        )
         .mean()
     )
 
     ema26 = (
         df["close"]
-        .ewm(span=26, adjust=False)
+        .ewm(
+            span=26,
+            adjust=False
+        )
         .mean()
     )
 
-    df["macd"] = ema12 - ema26
+    df["macd"] = (
+        ema12 - ema26
+    )
 
     df["macd_signal"] = (
         df["macd"]
-        .ewm(span=9, adjust=False)
+        .ewm(
+            span=9,
+            adjust=False
+        )
         .mean()
     )
 
+    # --------------------------------------
     # ATR
-    previous_close = df["close"].shift(1)
+    # --------------------------------------
 
-    tr = pd.concat(
+    previous_close = (
+        df["close"]
+        .shift(1)
+    )
+
+    tr1 = (
+        df["high"]
+        - df["low"]
+    )
+
+    tr2 = (
+        df["high"]
+        - previous_close
+    ).abs()
+
+    tr3 = (
+        df["low"]
+        - previous_close
+    ).abs()
+
+    true_range = pd.concat(
         [
-            df["high"] - df["low"],
-            (
-                df["high"]
-                - previous_close
-            ).abs(),
-            (
-                df["low"]
-                - previous_close
-            ).abs()
+            tr1,
+            tr2,
+            tr3
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     df["atr"] = (
-        tr
-        .ewm(alpha=1 / 14, adjust=False)
+        true_range
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
         .mean()
     )
 
-    # =========================
+    # --------------------------------------
     # ADX
-    # =========================
+    # --------------------------------------
 
-    high_diff = df["high"].diff()
-    low_diff = -df["low"].diff()
+    high_diff = (
+        df["high"]
+        .diff()
+    )
+
+    low_diff = (
+        -df["low"]
+        .diff()
+    )
 
     plus_dm = high_diff.where(
-        (high_diff > low_diff)
-        & (high_diff > 0),
+        (
+            (high_diff > low_diff)
+            & (high_diff > 0)
+        ),
         0
     )
 
     minus_dm = low_diff.where(
-        (low_diff > high_diff)
-        & (low_diff > 0),
+        (
+            (low_diff > high_diff)
+            & (low_diff > 0)
+        ),
         0
     )
 
     atr14 = (
-        tr
-        .ewm(alpha=1 / 14, adjust=False)
+        true_range
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
         .mean()
     )
 
     plus_di = (
         100
-        * plus_dm.ewm(
+        * plus_dm
+        .ewm(
             alpha=1 / 14,
             adjust=False
-        ).mean()
-        / atr14
+        )
+        .mean()
+        / atr14.replace(
+            0,
+            pd.NA
+        )
     )
 
     minus_di = (
         100
-        * minus_dm.ewm(
+        * minus_dm
+        .ewm(
             alpha=1 / 14,
             adjust=False
-        ).mean()
-        / atr14
+        )
+        .mean()
+        / atr14.replace(
+            0,
+            pd.NA
+        )
+    )
+
+    denominator = (
+        plus_di
+        + minus_di
+    ).replace(
+        0,
+        pd.NA
     )
 
     dx = (
         100
-        * (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(
-            0,
-            pd.NA
-        )
+        * (
+            plus_di
+            - minus_di
+        ).abs()
+        / denominator
     )
 
     df["adx"] = (
@@ -203,38 +378,68 @@ def calculate_indicators(df):
             adjust=False
         )
         .mean()
-        .fillna(0)
     )
 
     df["plus_di"] = plus_di
     df["minus_di"] = minus_di
 
+    # --------------------------------------
     # Momentum
+    # --------------------------------------
+
     df["momentum"] = (
         df["close"]
         .diff(5)
     )
 
+    # تحويل نهائي
+    indicator_columns = [
+        "ema20",
+        "ema50",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "atr",
+        "adx",
+        "plus_di",
+        "minus_di",
+        "momentum"
+    ]
+
+    for column in indicator_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
     return df
 
 
-# =========================
-# ANALYSIS
-# =========================
+# ==========================================
+# تحليل الإطار الزمني
+# ==========================================
 
 def analyze_timeframe(df):
 
-    df = calculate_indicators(df)
+    df = calculate_indicators(
+        df
+    )
 
     x = df.iloc[-1]
 
     score = 0
+
     reasons = []
 
-    # Trend
+    # --------------------------------------
+    # EMA
+    # --------------------------------------
+
     if x["ema20"] > x["ema50"]:
 
         score += 2
+
         reasons.append(
             "EMA صاعد"
         )
@@ -242,29 +447,54 @@ def analyze_timeframe(df):
     else:
 
         score -= 2
+
         reasons.append(
             "EMA هابط"
         )
 
+    # --------------------------------------
     # RSI
-    if 55 <= x["rsi"] <= 70:
+    # --------------------------------------
+
+    if (
+        x["rsi"] >= 55
+        and x["rsi"] <= 70
+    ):
 
         score += 1
+
         reasons.append(
             "RSI يدعم الصعود"
         )
 
-    elif 30 <= x["rsi"] <= 45:
+    elif (
+        x["rsi"] >= 30
+        and x["rsi"] <= 45
+    ):
 
         score -= 1
+
         reasons.append(
             "RSI يدعم الهبوط"
         )
 
+    else:
+
+        reasons.append(
+            "RSI محايد"
+        )
+
+    # --------------------------------------
     # MACD
-    if x["macd"] > x["macd_signal"]:
+    # --------------------------------------
+
+    if (
+        x["macd"]
+        > x["macd_signal"]
+    ):
 
         score += 1
+
         reasons.append(
             "MACD صاعد"
         )
@@ -272,93 +502,160 @@ def analyze_timeframe(df):
     else:
 
         score -= 1
+
         reasons.append(
             "MACD هابط"
         )
 
+    # --------------------------------------
     # ADX
+    # --------------------------------------
+
     if x["adx"] >= 25:
 
-        if x["plus_di"] > x["minus_di"]:
+        if (
+            x["plus_di"]
+            > x["minus_di"]
+        ):
 
             score += 2
+
             reasons.append(
-                "ADX + اتجاه قوي"
+                "ADX يدعم الاتجاه الصاعد"
             )
 
         else:
 
             score -= 2
+
             reasons.append(
-                "ADX - اتجاه قوي"
+                "ADX يدعم الاتجاه الهابط"
             )
 
     else:
 
         reasons.append(
-            "ADX ضعيف / سوق متذبذب"
+            "ADX ضعيف"
         )
 
+    # --------------------------------------
     # Momentum
+    # --------------------------------------
+
     if x["momentum"] > 0:
 
         score += 1
+
         reasons.append(
             "Momentum موجب"
         )
 
-    else:
+    elif x["momentum"] < 0:
 
         score -= 1
+
         reasons.append(
             "Momentum سالب"
         )
 
-    return df, score, reasons
+    else:
+
+        reasons.append(
+            "Momentum محايد"
+        )
+
+    return (
+        df,
+        score,
+        reasons
+    )
 
 
-# =========================
-# SUPPORT / RESISTANCE
-# =========================
+# ==========================================
+# الدعم والمقاومة
+# ==========================================
 
 def support_resistance(df):
 
-    recent = df.tail(30)
+    recent = df.tail(
+        30
+    ).copy()
+
+    recent["low"] = pd.to_numeric(
+        recent["low"],
+        errors="coerce"
+    )
+
+    recent["high"] = pd.to_numeric(
+        recent["high"],
+        errors="coerce"
+    )
+
+    lows = (
+        recent["low"]
+        .dropna()
+    )
+
+    highs = (
+        recent["high"]
+        .dropna()
+    )
+
+    if lows.empty:
+
+        raise RuntimeError(
+            "بيانات الدعم غير صالحة"
+        )
+
+    if highs.empty:
+
+        raise RuntimeError(
+            "بيانات المقاومة غير صالحة"
+        )
 
     support = float(
-        recent["low"].min()
+        lows.min()
     )
 
     resistance = float(
-        recent["high"].max()
+        highs.max()
     )
 
-    return support, resistance
+    return (
+        support,
+        resistance
+    )
 
 
-# =========================
-# MAIN
-# =========================
+# ==========================================
+# واجهة البداية
+# ==========================================
 
 if not API_KEY:
 
     st.error(
-        "مفتاح Twelve Data غير موجود."
+        "مفتاح Twelve Data غير موجود في Streamlit Secrets."
     )
 
     st.stop()
 
 
-st.metric(
+top1, top2 = st.columns(2)
+
+top1.metric(
     "حالة البوت",
     "Paper Trading"
 )
 
-st.metric(
+top2.metric(
     "الرصيد التجريبي",
     "$10,000"
 )
 
+
+# ==========================================
+# تشغيل التحليل
+# ==========================================
 
 if st.button(
     "🔄 تحليل الذهب الآن",
@@ -368,29 +665,43 @@ if st.button(
     try:
 
         frames = {}
+
         scores = {}
+
         reasons_all = {}
 
-        for label, interval in [
+        # ----------------------------------
+        # M5 / M15 / H1
+        # ----------------------------------
+
+        timeframes = [
             ("M5", "5min"),
             ("M15", "15min"),
             ("H1", "1h")
-        ]:
+        ]
+
+        for label, interval in timeframes:
 
             raw = get_candles(
                 interval
             )
 
-            frames[label], scores[label], reasons_all[label] = (
-                analyze_timeframe(raw)
+            (
+                frames[label],
+                scores[label],
+                reasons_all[label]
+            ) = analyze_timeframe(
+                raw
             )
 
+        # ----------------------------------
+        # السعر
+        # ----------------------------------
 
-        # =========================
-        # PRICE
-        # =========================
-
-        latest = frames["M5"].iloc[-1]
+        latest = (
+            frames["M5"]
+            .iloc[-1]
+        )
 
         price = float(
             latest["close"]
@@ -400,10 +711,9 @@ if st.button(
             latest["atr"]
         )
 
-
-        # =========================
-        # SUPPORT / RESISTANCE
-        # =========================
+        # ----------------------------------
+        # الدعم والمقاومة
+        # ----------------------------------
 
         support, resistance = (
             support_resistance(
@@ -411,31 +721,31 @@ if st.button(
             )
         )
 
+        # ----------------------------------
+        # مجموع النقاط
+        # ----------------------------------
 
-        # =========================
-        # MULTI-TIMEFRAME
-        # =========================
-
-        total_score = sum(
-            scores.values()
+        total_score = int(
+            sum(
+                scores.values()
+            )
         )
 
         bullish_frames = sum(
             1
-            for s in scores.values()
-            if s > 0
+            for value in scores.values()
+            if value > 0
         )
 
         bearish_frames = sum(
             1
-            for s in scores.values()
-            if s < 0
+            for value in scores.values()
+            if value < 0
         )
 
-
-        # =========================
-        # TREND
-        # =========================
+        # ----------------------------------
+        # الاتجاه
+        # ----------------------------------
 
         if bullish_frames >= 2:
 
@@ -449,49 +759,43 @@ if st.button(
 
             trend = "مختلط ↔️"
 
-
-        # =========================
-        # SIGNAL ENGINE
-        # =========================
+        # ----------------------------------
+        # محرك الإشارة
+        # ----------------------------------
 
         signal = "WAIT"
 
         if (
             total_score >= 8
             and bullish_frames >= 2
-            and latest["adx"] >= 20
+            and float(latest["adx"]) >= 20
             and price > support
         ):
 
             signal = "BUY"
 
-
         elif (
             total_score <= -8
             and bearish_frames >= 2
-            and latest["adx"] >= 20
+            and float(latest["adx"]) >= 20
             and price < resistance
         ):
 
             signal = "SELL"
 
-
-        # =========================
-        # STRENGTH
-        # =========================
+        # ----------------------------------
+        # قوة التوافق
+        # ----------------------------------
 
         strength = min(
             100,
-            int(
-                50
-                + abs(total_score) * 5
-            )
+            50
+            + abs(total_score) * 5
         )
 
-
-        # =========================
-        # TRADE LEVELS
-        # =========================
+        # ----------------------------------
+        # مستويات الصفقة
+        # ----------------------------------
 
         entry = price
 
@@ -499,46 +803,55 @@ if st.button(
         target1 = None
         target2 = None
 
-
         if signal == "BUY":
 
             stop_loss = (
                 entry
-                - 1.5 * atr
+                - (
+                    1.5 * atr
+                )
             )
 
             target1 = (
                 entry
-                + 1.5 * atr
+                + (
+                    1.5 * atr
+                )
             )
 
             target2 = (
                 entry
-                + 2.5 * atr
+                + (
+                    2.5 * atr
+                )
             )
-
 
         elif signal == "SELL":
 
             stop_loss = (
                 entry
-                + 1.5 * atr
+                + (
+                    1.5 * atr
+                )
             )
 
             target1 = (
                 entry
-                - 1.5 * atr
+                - (
+                    1.5 * atr
+                )
             )
 
             target2 = (
                 entry
-                - 2.5 * atr
+                - (
+                    2.5 * atr
+                )
             )
 
-
-        # =========================
-        # DASHBOARD
-        # =========================
+        # ==================================
+        # الشاشة
+        # ==================================
 
         st.divider()
 
@@ -561,9 +874,12 @@ if st.button(
 
         c4.metric(
             "ADX",
-            f"{latest['adx']:.1f}"
+            f"{float(latest['adx']):.1f}"
         )
 
+        # ----------------------------------
+        # الإشارة
+        # ----------------------------------
 
         if signal == "BUY":
 
@@ -583,10 +899,9 @@ if st.button(
                 "🟡 WAIT — لا يوجد توافق كافٍ للدخول"
             )
 
-
-        # =========================
-        # TRADE PLAN
-        # =========================
+        # ----------------------------------
+        # خطة الصفقة
+        # ----------------------------------
 
         st.subheader(
             "🎯 خطة الصفقة"
@@ -601,29 +916,34 @@ if st.button(
 
         p2.metric(
             "وقف الخسارة",
-            f"${stop_loss:,.2f}"
-            if stop_loss
-            else "—"
+            (
+                f"${stop_loss:,.2f}"
+                if stop_loss is not None
+                else "—"
+            )
         )
 
         p3.metric(
             "الهدف 1",
-            f"${target1:,.2f}"
-            if target1
-            else "—"
+            (
+                f"${target1:,.2f}"
+                if target1 is not None
+                else "—"
+            )
         )
 
         p4.metric(
             "الهدف 2",
-            f"${target2:,.2f}"
-            if target2
-            else "—"
+            (
+                f"${target2:,.2f}"
+                if target2 is not None
+                else "—"
+            )
         )
 
-
-        # =========================
-        # MARKET STRUCTURE
-        # =========================
+        # ----------------------------------
+        # هيكل السوق
+        # ----------------------------------
 
         st.subheader(
             "📐 هيكل السوق"
@@ -646,10 +966,9 @@ if st.button(
             f"{atr:.2f}"
         )
 
-
-        # =========================
-        # TIMEFRAMES
-        # =========================
+        # ----------------------------------
+        # تحليل الأطر
+        # ----------------------------------
 
         st.subheader(
             "📊 التحليل متعدد الأطر"
@@ -657,90 +976,128 @@ if st.button(
 
         rows = []
 
-        for tf in [
+        for timeframe in [
             "M5",
             "M15",
             "H1"
         ]:
 
-            x = frames[tf].iloc[-1]
+            x = (
+                frames[timeframe]
+                .iloc[-1]
+            )
 
-            rows.append({
+            rows.append(
+                {
+                    "الإطار": timeframe,
 
-                "الإطار": tf,
+                    "Score":
+                        int(
+                            scores[timeframe]
+                        ),
 
-                "Score":
-                    scores[tf],
+                    "RSI":
+                        round(
+                            float(
+                                x["rsi"]
+                            ),
+                            1
+                        ),
 
-                "RSI":
-                    round(
-                        float(x["rsi"]),
-                        1
-                    ),
+                    "ADX":
+                        round(
+                            float(
+                                x["adx"]
+                            ),
+                            1
+                        ),
 
-                "ADX":
-                    round(
-                        float(x["adx"]),
-                        1
-                    ),
+                    "MACD":
+                        (
+                            "صاعد"
+                            if x["macd"]
+                            > x["macd_signal"]
+                            else "هابط"
+                        ),
 
-                "MACD":
-                    "صاعد"
-                    if x["macd"]
-                    > x["macd_signal"]
-                    else "هابط",
+                    "EMA":
+                        (
+                            "صاعد"
+                            if x["ema20"]
+                            > x["ema50"]
+                            else "هابط"
+                        ),
 
-                "EMA":
-                    "صاعد"
-                    if x["ema20"]
-                    > x["ema50"]
-                    else "هابط",
+                    "Momentum":
+                        (
+                            "موجب"
+                            if x["momentum"] > 0
+                            else "سالب"
+                        )
+                }
+            )
 
-                "Momentum":
-                    "موجب"
-                    if x["momentum"] > 0
-                    else "سالب"
-            })
-
+        result_table = pd.DataFrame(
+            rows
+        )
 
         st.dataframe(
-            pd.DataFrame(rows),
+            result_table,
             use_container_width=True,
             hide_index=True
         )
 
-
-        # =========================
-        # REASONS
-        # =========================
+        # ----------------------------------
+        # أسباب التحليل
+        # ----------------------------------
 
         st.subheader(
             "🧠 أسباب التحليل"
         )
 
-        for tf in [
+        for timeframe in [
             "M5",
             "M15",
             "H1"
         ]:
 
             st.write(
-                f"**{tf}:** "
+                f"**{timeframe}:** "
                 + " • ".join(
-                    reasons_all[tf]
+                    reasons_all[
+                        timeframe
+                    ]
                 )
             )
 
+        # ----------------------------------
+        # المحرك
+        # ----------------------------------
 
         st.divider()
 
-        st.info(
-            "Paper Trading فقط. "
-            "المحرك لا يضمن الربح، وقوة التوافق ليست "
-            "احتمالًا للربح. سيتم استخدام النتائج "
-            "لاحقًا في الاختبار الخلفي وقياس الأداء."
+        st.write(
+            f"**مجموع نقاط التوافق:** "
+            f"{total_score}"
         )
 
+        st.write(
+            f"**الاتجاه العام:** "
+            f"{trend}"
+        )
+
+        st.write(
+            f"**الإشارة الحالية:** "
+            f"{signal}"
+        )
+
+        st.info(
+            "Paper Trading فقط. "
+            "قوة التوافق ليست احتمالًا للربح، "
+            "ولا يوجد ضمان لنتيجة أي صفقة. "
+            "سيتم اختبار المحرك تاريخيًا قبل استخدامه "
+            "في أي تداول حقيقي."
+        )
 
     except Exception as e:
 
@@ -749,9 +1106,9 @@ if st.button(
             + str(e)
         )
 
-
 else:
 
     st.info(
-        "اضغط «🔄 تحليل الذهب الآن» لبدء التحليل."
+        "اضغط «🔄 تحليل الذهب الآن» "
+        "لبدء التحليل."
     )
