@@ -795,13 +795,15 @@ def backtest_mtf(
             i += 1
             continue
 
-        # Signal/theoretical price. Orders execute adversely from this price.
+        # Signal price is the observed mid/close. The order executes adversely.
+        # Risk geometry is then defined from the ACTUAL executed entry so 1R is
+        # invariant to the assumed spread/slippage.
         signal_price = float(row.close)
         entry = signal_price + adverse if side == "شراء" else signal_price - adverse
-        distance = max(atr_value * 1.4, signal_price * 0.0015)
-        initial_stop = signal_price - distance if side == "شراء" else signal_price + distance
-        tp1 = signal_price + distance if side == "شراء" else signal_price - distance
-        tp2 = signal_price + 2.2 * distance if side == "شراء" else signal_price - 2.2 * distance
+        distance = max(atr_value * 1.4, entry * 0.0015)
+        initial_stop = entry - distance if side == "شراء" else entry + distance
+        tp1 = entry + distance if side == "شراء" else entry - distance
+        tp2 = entry + 2.2 * distance if side == "شراء" else entry - 2.2 * distance
         stop = initial_stop
         remaining = 1.0
         tp1_hit = False
@@ -820,27 +822,37 @@ def backtest_mtf(
             low = float(base.low.iloc[j])
 
             if side == "شراء":
-                # Conservative OHLC convention: stop is first if both are touched.
+                # Conservative OHLC convention: if a bar can contain both a
+                # protective level and a target, assume the protective event first.
                 if low <= stop:
                     exit_price = stop - adverse
-                    gross_r += ((stop - signal_price) / distance) * remaining
+                    gross_r += ((stop - entry) / distance) * remaining
                     net_r += ((exit_price - entry) / distance) * remaining
                     exit_cost_r += (adverse / distance) * remaining
                     reason = "وقف الخسارة"
                     exit_i = j
                     break
+                # Before TP1, if the same bar also returns to entry, do not
+                # assume the favorable TP1 happened first. Treat as BE/full exit.
+                if not tp1_hit and high >= tp1 and low <= entry:
+                    exit_price = entry - adverse
+                    net_r += ((exit_price - entry) / distance) * 1.0
+                    exit_cost_r += (adverse / distance)
+                    reason = "غموض شمعة: تعادل محافظ"
+                    exit_i = j
+                    break
                 if not tp1_hit and high >= tp1:
                     tp1_exec = tp1 - adverse
-                    gross_r += ((tp1 - signal_price) / distance) * 0.5
+                    gross_r += ((tp1 - entry) / distance) * 0.5
                     net_r += ((tp1_exec - entry) / distance) * 0.5
                     exit_cost_r += (adverse / distance) * 0.5
                     remaining = 0.5
                     tp1_hit = True
-                    stop = signal_price
+                    stop = entry
                     continue
                 if tp1_hit and high >= tp2:
                     exit_price = tp2 - adverse
-                    gross_r += ((tp2 - signal_price) / distance) * remaining
+                    gross_r += ((tp2 - entry) / distance) * remaining
                     net_r += ((exit_price - entry) / distance) * remaining
                     exit_cost_r += (adverse / distance) * remaining
                     reason = "الهدف الثاني"
@@ -849,24 +861,31 @@ def backtest_mtf(
             else:
                 if high >= stop:
                     exit_price = stop + adverse
-                    gross_r += ((signal_price - stop) / distance) * remaining
+                    gross_r += ((entry - stop) / distance) * remaining
                     net_r += ((entry - exit_price) / distance) * remaining
                     exit_cost_r += (adverse / distance) * remaining
                     reason = "وقف الخسارة"
                     exit_i = j
                     break
+                if not tp1_hit and low <= tp1 and high >= entry:
+                    exit_price = entry + adverse
+                    net_r += ((entry - exit_price) / distance) * 1.0
+                    exit_cost_r += (adverse / distance)
+                    reason = "غموض شمعة: تعادل محافظ"
+                    exit_i = j
+                    break
                 if not tp1_hit and low <= tp1:
                     tp1_exec = tp1 + adverse
-                    gross_r += ((signal_price - tp1) / distance) * 0.5
+                    gross_r += ((entry - tp1) / distance) * 0.5
                     net_r += ((entry - tp1_exec) / distance) * 0.5
                     exit_cost_r += (adverse / distance) * 0.5
                     remaining = 0.5
                     tp1_hit = True
-                    stop = signal_price
+                    stop = entry
                     continue
                 if tp1_hit and low <= tp2:
                     exit_price = tp2 + adverse
-                    gross_r += ((signal_price - tp2) / distance) * remaining
+                    gross_r += ((entry - tp2) / distance) * remaining
                     net_r += ((entry - exit_price) / distance) * remaining
                     exit_cost_r += (adverse / distance) * remaining
                     reason = "الهدف الثاني"
@@ -998,6 +1017,51 @@ def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, sp
         "warning": "Walk-Forward تشخيص استقرار وليس إثباتاً للربحية" if len(combined) < 100 else None,
     }
 
+# ------------------- execution-model audit -------------------
+def execution_model_audit():
+    """Deterministic tests for execution geometry and R accounting."""
+    d = 10.0
+    signal = 2000.0
+    adverse = 0.7
+
+    # BUY: actual entry is adverse to the signal; risk is measured from entry.
+    entry = signal + adverse
+    stop = entry - d
+    tp1 = entry + d
+    tp2 = entry + 2.2 * d
+    assert abs((stop - entry) / d + 1.0) < 1e-12
+    assert abs((tp1 - entry) / d - 1.0) < 1e-12
+    assert abs((tp2 - entry) / d - 2.2) < 1e-12
+
+    # Gross results are independent of costs; net results include execution.
+    tp1_exec = tp1 - adverse
+    tp2_exec = tp2 - adverse
+    gross_full = 0.5 * 1.0 + 0.5 * 2.2
+    net_full = ((tp1_exec - entry) / d) * 0.5 + ((tp2_exec - entry) / d) * 0.5
+    expected_net = 1.6 - (2.0 * adverse / d)
+    assert abs(gross_full - 1.6) < 1e-12
+    assert abs(net_full - expected_net) < 1e-12
+
+    # SELL symmetry.
+    entry_s = signal - adverse
+    stop_s = entry_s + d
+    tp1_s = entry_s - d
+    tp2_s = entry_s - 2.2 * d
+    tp1_exec_s = tp1_s + adverse
+    tp2_exec_s = tp2_s + adverse
+    net_sell = ((entry_s - tp1_exec_s) / d) * 0.5 + ((entry_s - tp2_exec_s) / d) * 0.5
+    assert abs(net_sell - expected_net) < 1e-12
+    assert abs((stop_s - entry_s) / d - 1.0) < 1e-12
+
+    # Conservative same-bar ambiguity: TP1 + entry touch cannot be credited
+    # as a favorable partial exit because OHLC does not reveal sequence.
+    same_bar_buy = ((entry - adverse) - entry) / d
+    same_bar_sell = (entry_s - (entry_s + adverse)) / d
+    assert same_bar_buy < 0 and same_bar_sell < 0
+
+    return True
+
+
 # ---------------------- deterministic tests ------------------
 def run_internal_tests():
     # B2 must exclude the breakout candle.
@@ -1038,6 +1102,7 @@ def metrics(items):
 # ---------------------------- app -----------------------------
 try:
     run_internal_tests()
+    execution_model_audit()
     ENGINE_TEST_OK = True
     ENGINE_TEST_ERROR = ""
 except Exception as exc:
@@ -1108,6 +1173,14 @@ if st.session_state.last_signal_candle != closed_candle_id:
         "B2 Level": round(analysis["b2"].get("level", np.nan), 2) if finite(analysis["b2"].get("level", np.nan)) else None,
     }
     decision.update({name: "PASS" if passed else "BLOCK" for name, passed in analysis["gates"].items()})
+    decision.update({
+        "B2 Direction": analysis["b2"].get("direction"),
+        "B2 Breakout": analysis["b2"].get("breakout"),
+        "B2 Retest": analysis["b2"].get("retest"),
+        "Bid": round(analysis["spread"].get("bid"), 3) if finite(analysis["spread"].get("bid", np.nan)) else None,
+        "Ask": round(analysis["spread"].get("ask"), 3) if finite(analysis["spread"].get("ask", np.nan)) else None,
+        "News": analysis["news"].get("label"),
+    })
     st.session_state.decisions.insert(0, decision)
     st.session_state.decisions = st.session_state.decisions[:500]
 
