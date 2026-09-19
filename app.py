@@ -11,7 +11,7 @@ import streamlit as st
 
 # ============================================================
 # GOLD AI — XAU/USD Smart Paper Trading
-# Clean single-file research / paper-trading application • v1.1.
+# Clean single-file research / paper-trading application • v1.4.
 # No live broker execution is implemented.
 # ============================================================
 
@@ -202,15 +202,22 @@ def fetch_history():
     return history, message, len(frames), credits
 
 
-def closed_m5(frame):
+def closed_m5(frame, as_of=None):
+    """Return only M5 candles whose right boundary is known at as_of."""
     if frame.empty:
         return frame.copy()
-    boundary = now_utc().floor("5min")
-    return frame[frame["datetime"] < boundary].copy().reset_index(drop=True)
+    cutoff = now_utc() if as_of is None else pd.Timestamp(as_of)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    else:
+        cutoff = cutoff.tz_convert("UTC")
+    boundary = cutoff.floor("5min")
+    return frame[frame["datetime"] + pd.Timedelta(minutes=5) <= boundary].copy().reset_index(drop=True)
 
 
-def resample_closed(frame, rule):
-    frame = closed_m5(frame)
+def resample_closed(frame, rule, as_of=None):
+    """Build higher-TF candles using only source bars fully closed by as_of."""
+    frame = closed_m5(frame, as_of=as_of)
     if frame.empty:
         return frame.copy()
 
@@ -222,10 +229,13 @@ def resample_closed(frame, rule):
         .reset_index()
     )
 
-    # A higher-TF candle is usable only after its right boundary has passed.
-    out = out[out["datetime"] + pd.Timedelta(rule) <= now_utc()].reset_index(drop=True)
+    cutoff = now_utc() if as_of is None else pd.Timestamp(as_of)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    else:
+        cutoff = cutoff.tz_convert("UTC")
+    out = out[out["datetime"] + pd.Timedelta(rule) <= cutoff].reset_index(drop=True)
     return out
-
 
 def data_quality(frame):
     if frame.empty:
@@ -664,17 +674,26 @@ def manage_trade(price):
             return
 
 # ------------------------- backtest ---------------------------
-def prepare_mtf_backtest(raw):
-    m5 = add_indicators(closed_m5(raw)).dropna().reset_index(drop=True)
-    m15 = add_indicators(resample_closed(raw, "15min")).dropna().reset_index(drop=True)
-    h1 = add_indicators(resample_closed(raw, "1h")).dropna().reset_index(drop=True)
-    h4 = add_indicators(resample_closed(raw, "4h")).dropna().reset_index(drop=True)
+def prepare_mtf_backtest(raw, as_of=None):
+    """Prepare MTF data without using any candle that was incomplete at as_of."""
+    if raw is None or raw.empty:
+        return None, "بيانات خام فارغة"
+    if as_of is None:
+        as_of = pd.Timestamp(raw["datetime"].max()) + pd.Timedelta(minutes=5)
+    as_of = pd.Timestamp(as_of)
+    if as_of.tzinfo is None:
+        as_of = as_of.tz_localize("UTC")
+    else:
+        as_of = as_of.tz_convert("UTC")
+
+    m5 = add_indicators(closed_m5(raw, as_of=as_of)).dropna().reset_index(drop=True)
+    m15 = add_indicators(resample_closed(raw, "15min", as_of=as_of)).dropna().reset_index(drop=True)
+    h1 = add_indicators(resample_closed(raw, "1h", as_of=as_of)).dropna().reset_index(drop=True)
+    h4 = add_indicators(resample_closed(raw, "4h", as_of=as_of)).dropna().reset_index(drop=True)
 
     if min(len(m5), len(m15), len(h1), len(h4)) < 250:
         return None, "بيانات غير كافية لاختبار MTF"
 
-    # Decision timestamp = M5 close. Higher-TF timestamp = higher-TF close.
-    # Exact equality is deliberately rejected: a higher-TF candle becomes usable on the next M5 decision.
     m5["decision_ts"] = m5["datetime"] + pd.Timedelta(minutes=5)
     prepared = m5[["datetime", "decision_ts", "open", "high", "low", "close", "atr", "rsi", "macd_hist", "momentum", "adx", "ema20", "ema50", "ema100"]].copy()
 
@@ -696,37 +715,33 @@ def prepare_mtf_backtest(raw):
     prepared = prepared.dropna().reset_index(drop=True)
     return prepared, None
 
-
 def backtest_mtf(
     raw,
     oos_fraction=0.30,
-    round_trip_cost=0.0,
+    spread_per_round_trip=0.0,
     slippage_per_side=0.0,
     oos_start_ts=None,
     oos_end_ts=None,
 ):
-    """
-    Research backtest on closed MTF data.
+    """Deterministic MTF/B2 research backtest with price-level costs.
 
-    Cost model:
-      - round_trip_cost is a fixed full round-trip price cost.
-      - slippage_per_side is applied once at entry and once at exit.
-      - costs are represented as execution-price adjustments, then converted to R.
-    These are assumptions when historical bid/ask data is unavailable.
+    `spread_per_round_trip` is the assumed full bid/ask width at execution.
+    `slippage_per_side` is adverse price movement per entry/exit.
+    Historical bid/ask is not available from the current OHLC dataset, so these
+    are explicit research assumptions rather than broker-observed costs.
     """
-    base, error = prepare_mtf_backtest(raw)
-    if base is None:
-        return pd.DataFrame(), {"trades": 0, "warning": error}
+    raw = closed_m5(raw)
+    if raw.empty:
+        return pd.DataFrame(), {"trades": 0, "warning": "بيانات فارغة"}
 
     if oos_start_ts is None:
-        split_index = int(len(base) * (1 - oos_fraction))
-        split_ts = base["decision_ts"].iloc[min(split_index, len(base) - 1)]
+        split_index = max(1, int(len(raw) * (1 - oos_fraction)))
+        oos_start_ts = raw["datetime"].iloc[min(split_index, len(raw)-1)]
+    split_ts = pd.Timestamp(oos_start_ts)
+    if split_ts.tzinfo is None:
+        split_ts = split_ts.tz_localize("UTC")
     else:
-        split_ts = pd.Timestamp(oos_start_ts)
-        if split_ts.tzinfo is None:
-            split_ts = split_ts.tz_localize("UTC")
-        else:
-            split_ts = split_ts.tz_convert("UTC")
+        split_ts = split_ts.tz_convert("UTC")
 
     end_ts = None
     if oos_end_ts is not None:
@@ -736,207 +751,108 @@ def backtest_mtf(
         else:
             end_ts = end_ts.tz_convert("UTC")
 
-    trades = []
-    i = 1
+    # Build only with information available by the test endpoint.
+    as_of = end_ts if end_ts is not None else raw["datetime"].max() + pd.Timedelta(minutes=5)
+    base, error = prepare_mtf_backtest(raw[raw["datetime"] < as_of], as_of=as_of)
+    if base is None:
+        return pd.DataFrame(), {"trades": 0, "warning": error}
 
-    while i < len(base) - 2:
-        row = base.iloc[i]
-        decision_ts = pd.Timestamp(row["decision_ts"])
-
-        if decision_ts < split_ts:
-            i += 1
-            continue
-        if end_ts is not None and decision_ts >= end_ts:
+    spread_half = max(0.0, float(spread_per_round_trip)) / 2.0
+    slip = max(0.0, float(slippage_per_side))
+    trades=[]
+    i=22
+    while i < len(base)-2:
+        row=base.iloc[i]
+        ts=pd.Timestamp(row.decision_ts)
+        if ts < split_ts:
+            i += 1; continue
+        if end_ts is not None and ts >= end_ts:
             break
 
-        # B2 levels use only M5 candles before the breakout candle.
-        if i < 22 or not finite(row["atr"]):
-            i += 1
-            continue
+        history=base.iloc[i-21:i-1]
+        breakout=base.iloc[i-1]
+        resistance=float(history.high.max()); support=float(history.low.min()); atr_value=float(row.atr)
+        if not finite(atr_value) or atr_value <= 0:
+            i += 1; continue
 
-        history = base.iloc[i - 21:i - 1]
-        breakout = base.iloc[i - 1]
-        current = row
-        resistance = float(history["high"].max())
-        support = float(history["low"].min())
-        atr_value = float(current["atr"])
-
-        bullish_break = float(breakout["close"]) > resistance
-        bearish_break = float(breakout["close"]) < support
-        bullish_retest = (
-            bullish_break
-            and float(current["low"]) <= resistance + 0.35 * atr_value
-            and float(current["close"]) > resistance
-        )
-        bearish_retest = (
-            bearish_break
-            and float(current["high"]) >= support - 0.35 * atr_value
-            and float(current["close"]) < support
-        )
-
-        bull_mtf = (
-            current.close > current.ema20 > current.ema50 > current.ema100
-            and current.close_m15 > current.ema20_m15 > current.ema50_m15 > current.ema100_m15
-            and current.close_h1 > current.ema20_h1 > current.ema50_h1 > current.ema100_h1
-            and current.close_h4 > current.ema20_h4 > current.ema50_h4 > current.ema100_h4
-        )
-        bear_mtf = (
-            current.close < current.ema20 < current.ema50 < current.ema100
-            and current.close_m15 < current.ema20_m15 < current.ema50_m15 < current.ema100_m15
-            and current.close_h1 < current.ema20_h1 < current.ema50_h1 < current.ema100_h1
-            and current.close_h4 < current.ema20_h4 < current.ema50_h4 < current.ema100_h4
-        )
-        momentum_buy = current.rsi >= 52 and current.momentum > 0 and current.macd_hist > 0 and current.adx >= 25
-        momentum_sell = current.rsi <= 48 and current.momentum < 0 and current.macd_hist < 0 and current.adx >= 25
-
-        side = "شراء" if bullish_retest and bull_mtf and momentum_buy else None
-        if bearish_retest and bear_mtf and momentum_sell:
-            side = "بيع"
-
+        bullish_break=float(breakout.close)>resistance
+        bearish_break=float(breakout.close)<support
+        bullish_retest=bullish_break and float(row.low)<=resistance+0.35*atr_value and float(row.close)>resistance
+        bearish_retest=bearish_break and float(row.high)>=support-0.35*atr_value and float(row.close)<support
+        bull_mtf=(row.close>row.ema20>row.ema50>row.ema100 and row.close_m15>row.ema20_m15>row.ema50_m15>row.ema100_m15 and row.close_h1>row.ema20_h1>row.ema50_h1>row.ema100_h1 and row.close_h4>row.ema20_h4>row.ema50_h4>row.ema100_h4)
+        bear_mtf=(row.close<row.ema20<row.ema50<row.ema100 and row.close_m15<row.ema20_m15<row.ema50_m15<row.ema100_m15 and row.close_h1<row.ema20_h1<row.ema50_h1<row.ema100_h1 and row.close_h4<row.ema20_h4<row.ema50_h4<row.ema100_h4)
+        mom_buy=row.rsi>=52 and row.momentum>0 and row.macd_hist>0 and row.adx>=25
+        mom_sell=row.rsi<=48 and row.momentum<0 and row.macd_hist<0 and row.adx>=25
+        side="شراء" if bullish_retest and bull_mtf and mom_buy else "بيع" if bearish_retest and bear_mtf and mom_sell else None
         if side is None:
-            i += 1
-            continue
+            i += 1; continue
 
-        # Fixed spread is a research assumption. Split it around the mid price.
-        spread_half = max(0.0, float(round_trip_cost)) / 2.0
-        slip = max(0.0, float(slippage_per_side))
-        raw_entry = float(current["close"])
+        mid=float(row.close)
+        entry=mid+spread_half+slip if side=="شراء" else mid-spread_half-slip
+        distance=max(atr_value*1.4, entry*0.0015)
+        stop=entry-distance if side=="شراء" else entry+distance
+        tp1=entry+distance if side=="شراء" else entry-distance
+        tp2=entry+2.2*distance if side=="شراء" else entry-2.2*distance
+        realized=0.0; remaining=1.0; tp1_hit=False; exit_price=None; reason=None; exit_i=None
 
-        # Execution price: worse for the trader in both directions.
-        if side == "شراء":
-            entry = raw_entry + spread_half + slip
-        else:
-            entry = raw_entry - spread_half - slip
-
-        distance = max(atr_value * 1.4, entry * 0.0015)
-        stop = entry - distance if side == "شراء" else entry + distance
-        tp1 = entry + distance if side == "شراء" else entry - distance
-        tp2 = entry + 2.2 * distance if side == "شراء" else entry - 2.2 * distance
-
-        realized_r = 0.0
-        remaining = 1.0
-        tp1_hit = False
-        outcome = None
-        reason = None
-        exit_index = None
-
-        for j in range(i + 1, min(i + 100, len(base))):
-            bar_ts = pd.Timestamp(base["decision_ts"].iloc[j])
-            if end_ts is not None and bar_ts >= end_ts:
-                break
-
-            high = float(base.high.iloc[j])
-            low = float(base.low.iloc[j])
-
-            if side == "شراء":
-                # Conservative convention: stop first if both levels occur in one bar.
-                stop_exec = stop - slip - spread_half
-                if low <= stop:
-                    outcome = realized_r - remaining
-                    reason = "وقف الخسارة"
-                    exit_index = j
-                    break
-                if not tp1_hit and high >= tp1:
-                    realized_r += 0.5
-                    remaining = 0.5
-                    tp1_hit = True
-                    stop = entry
-                    continue
-                if tp1_hit and high >= tp2:
-                    realized_r += 1.1
-                    outcome = realized_r
-                    reason = "الهدف الثاني"
-                    exit_index = j
-                    break
+        for j in range(i+1,min(i+100,len(base))):
+            bar_ts=pd.Timestamp(base.decision_ts.iloc[j])
+            if end_ts is not None and bar_ts>=end_ts: break
+            high=float(base.high.iloc[j]); low=float(base.low.iloc[j])
+            if side=="شراء":
+                stop_exec=stop-spread_half-slip
+                tp1_exec=tp1-spread_half-slip
+                tp2_exec=tp2-spread_half-slip
+                # Stop-first when OHLC cannot reveal intrabar order.
+                if low<=stop:
+                    exit_price=stop_exec
+                    realized += (exit_price-entry)/distance*remaining
+                    reason="وقف الخسارة"; exit_i=j; break
+                if not tp1_hit and high>=tp1:
+                    realized += (tp1_exec-entry)/distance*0.5
+                    remaining=0.5; tp1_hit=True; stop=entry; continue
+                if tp1_hit and high>=tp2:
+                    exit_price=tp2_exec
+                    realized += (exit_price-entry)/distance*remaining
+                    reason="الهدف الثاني"; exit_i=j; break
             else:
-                stop_exec = stop + slip + spread_half
-                if high >= stop:
-                    outcome = realized_r - remaining
-                    reason = "وقف الخسارة"
-                    exit_index = j
-                    break
-                if not tp1_hit and low <= tp1:
-                    realized_r += 0.5
-                    remaining = 0.5
-                    tp1_hit = True
-                    stop = entry
-                    continue
-                if tp1_hit and low <= tp2:
-                    realized_r += 1.1
-                    outcome = realized_r
-                    reason = "الهدف الثاني"
-                    exit_index = j
-                    break
+                stop_exec=stop+spread_half+slip
+                tp1_exec=tp1+spread_half+slip
+                tp2_exec=tp2+spread_half+slip
+                if high>=stop:
+                    exit_price=stop_exec
+                    realized += (entry-exit_price)/distance*remaining
+                    reason="وقف الخسارة"; exit_i=j; break
+                if not tp1_hit and low<=tp1:
+                    realized += (entry-tp1_exec)/distance*0.5
+                    remaining=0.5; tp1_hit=True; stop=entry; continue
+                if tp1_hit and low<=tp2:
+                    exit_price=tp2_exec
+                    realized += (entry-exit_price)/distance*remaining
+                    reason="الهدف الثاني"; exit_i=j; break
 
-        if outcome is not None:
-            # Charge both execution sides explicitly in R. The entry/exit
-            # thresholds are based on the executed entry price, while this
-            # separate deduction keeps the reported R net of assumed costs.
-            entry_cost = (spread_half + slip) / distance if distance > 0 else 0.0
-            exit_cost = (spread_half + slip) / distance if distance > 0 else 0.0
-            total_cost_r = entry_cost + exit_cost
-            outcome_after_cost = float(outcome) - total_cost_r
-
-            trades.append({
-                "الوقت": current.datetime,
-                "النوع": side,
-                "الدخول": round(entry, 2),
-                "الوقف": round(stop - distance if side == "شراء" else stop + distance, 2),
-                "TP1": round(tp1, 2),
-                "TP2": round(tp2, 2),
-                "R": round(outcome_after_cost, 3),
-                "تكلفة_السعر_R": round(total_cost_r, 4),
-                "السبب": reason,
-                "OOS": True,
-            })
-            i = exit_index + 1
+        if exit_i is not None:
+            cost_r=2.0*(spread_half+slip)/distance
+            trades.append({"الوقت":row.datetime,"النوع":side,"الدخول":round(entry,2),"الوقف":round(stop-distance if side=="شراء" else stop+distance,2),"TP1":round(tp1,2),"TP2":round(tp2,2),"الخروج":round(exit_price,2),"R":round(realized,4),"تكلفة_السعر_R":round(cost_r,4),"السبب":reason,"OOS":True})
+            i=exit_i+1
         else:
             i += 1
 
-    result = pd.DataFrame(trades)
+    result=pd.DataFrame(trades)
     if result.empty:
-        return result, {"trades": 0, "warning": "لا توجد صفقات OOS مطابقة لكل بوابات MTF"}
+        return result,{"trades":0,"warning":"لا توجد صفقات OOS مطابقة لكل بوابات MTF"}
+    eq=result["R"].cumsum(); dd=eq.cummax()-eq
+    result["Equity_R"]=eq; result["Drawdown_R"]=dd
+    wins=result.loc[result.R>0,"R"].sum(); losses=abs(result.loc[result.R<0,"R"].sum())
+    pf=wins/losses if losses else math.inf
+    return result,{"trades":len(result),"win_rate":float((result.R>0).mean()*100),"profit_factor":float(pf),"total_r":float(result.R.sum()),"max_dd_r":float(dd.max()),"warning":"العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result)<100 else None,"oos_start":str(split_ts),"avg_cost_r":float(result["تكلفة_السعر_R"].mean()),"equity_curve":eq.tolist(),"drawdown_curve":dd.tolist()}
 
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    equity_curve = []
-    drawdown_curve = []
-    for value in result["R"]:
-        equity += float(value)
-        peak = max(peak, equity)
-        dd = peak - equity
-        max_dd = max(max_dd, dd)
-        equity_curve.append(equity)
-        drawdown_curve.append(dd)
-
-    result["Equity_R"] = equity_curve
-    result["Drawdown_R"] = drawdown_curve
-
-    gross_win = result.loc[result["R"] > 0, "R"].sum()
-    gross_loss = abs(result.loc[result["R"] < 0, "R"].sum())
-    profit_factor = gross_win / gross_loss if gross_loss else math.inf
-
-    return result, {
-        "trades": len(result),
-        "win_rate": float((result["R"] > 0).mean() * 100),
-        "profit_factor": float(profit_factor),
-        "total_r": float(result["R"].sum()),
-        "max_dd_r": float(max_dd),
-        "warning": "العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result) < 100 else None,
-        "oos_start": str(split_ts),
-        "avg_cost_r": float(result["تكلفة_السعر_R"].mean()),
-        "equity_curve": equity_curve,
-        "drawdown_curve": drawdown_curve,
-    }
-
-
-def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, round_trip_cost=0.0, slippage_per_side=0.0):
+def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, spread_per_round_trip=0.0, slippage_per_side=0.0):
     """
-    True rolling walk-forward diagnostic:
-      train -> unseen OOS test -> roll forward -> repeat.
-    No parameters are optimized in the training segment yet; it exists to
-    enforce temporal separation and prevent using future observations.
+    Rolling out-of-sample stability diagnostic:
+      expanding historical context -> unseen OOS test -> roll forward.
+    Parameters are fixed; no optimization is claimed. This deliberately avoids
+    overstating the method as Walk-Forward Optimization.
     """
     if raw is None or raw.empty or windows < 2:
         return pd.DataFrame(), {"windows": 0, "warning": "بيانات غير كافية"}
@@ -966,7 +882,7 @@ def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, ro
             chunk,
             oos_start_ts=test_start_ts,
             oos_end_ts=test_end_ts + pd.Timedelta(minutes=5),
-            round_trip_cost=round_trip_cost,
+            spread_per_round_trip=spread_per_round_trip,
             slippage_per_side=slippage_per_side,
         )
 
@@ -1011,27 +927,29 @@ def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, ro
 
 # ---------------------- deterministic tests ------------------
 def run_internal_tests():
-    # 1) B2 level must exclude the breakout candle.
-    idx = pd.date_range("2026-01-01", periods=40, freq="5min", tz="UTC")
-    frame = pd.DataFrame({"datetime": idx, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
-    frame.loc[38, ["open", "high", "low", "close"]] = [100.0, 103.0, 99.5, 102.5]
-    frame.loc[39, ["open", "high", "low", "close"]] = [102.5, 103.0, 102.0, 102.8]
-    calculated = add_indicators(frame)
-    b2 = b2_signal(calculated)
-    assert finite(b2["level"]) and b2["level"] < 103.0, "B2 level leaked breakout candle"
-
-    # 2) Risk accounting invariant.
-    assert abs((0.5 + 1.1) - 1.6) < 1e-12, "TP1/TP2 R invariant failed"
-
-    # 3) Bearish MTF expression must be strictly descending.
-    assert (100 > 99 > 98 > 97) and not (100 < 99 < 98 < 97), "Trend comparison invariant failed"
-
-    # 4) Exact higher-TF close must not be accepted by the merge rule.
-    left = pd.DataFrame({"decision_ts": pd.to_datetime(["2026-01-01 01:00"], utc=True)})
-    right = pd.DataFrame({"available_ts": pd.to_datetime(["2026-01-01 01:00"], utc=True), "v": [1]})
-    merged = pd.merge_asof(left, right, left_on="decision_ts", right_on="available_ts", direction="backward", allow_exact_matches=False)
-    assert pd.isna(merged.loc[0, "v"]), "Exact higher-TF close leaked into same decision"
-
+    # B2 must exclude the breakout candle.
+    idx=pd.date_range("2026-01-01",periods=40,freq="5min",tz="UTC")
+    frame=pd.DataFrame({"datetime":idx,"open":100.0,"high":101.0,"low":99.0,"close":100.0})
+    frame.loc[38,["open","high","low","close"]]=[100,103,99.5,102.5]
+    frame.loc[39,["open","high","low","close"]]=[102.5,103,102,102.8]
+    b2=b2_signal(add_indicators(frame)); assert finite(b2["level"]) and b2["level"]<103.0
+    # R invariants.
+    assert abs(0.5+1.1-1.6)<1e-12
+    # Exact higher-TF timestamp must not merge.
+    left=pd.DataFrame({"decision_ts":pd.to_datetime(["2026-01-01 01:00"],utc=True)})
+    right=pd.DataFrame({"available_ts":pd.to_datetime(["2026-01-01 01:00"],utc=True),"v":[1]})
+    m=pd.merge_asof(left,right,left_on="decision_ts",right_on="available_ts",direction="backward",allow_exact_matches=False)
+    assert pd.isna(m.loc[0,"v"])
+    # Cost conversion is explicit and positive.
+    distance=10.0; spread=1.0; slip=0.2
+    assert abs(2*((spread/2)+slip)/distance-0.14)<1e-12
+    # BUY: TP1 +0.5R, TP2 remaining +1.1R.
+    entry=2000.0; d=10.0; tp1=entry+d; tp2=entry+2.2*d
+    assert abs(((tp1-entry)/d)*0.5-0.5)<1e-12
+    assert abs(((tp2-entry)/d)*0.5-1.1)<1e-12
+    # SELL mirror.
+    assert abs(((entry-(entry-d))/d)*0.5-0.5)<1e-12
+    assert abs(((entry-(entry-2.2*d))/d)*0.5-1.1)<1e-12
     return True
 
 # --------------------------- UI helpers -----------------------
@@ -1041,15 +959,25 @@ def metrics(items):
         column.markdown(f"<div class='metric'><div class='label'>{label}</div><div class='value'>{value}</div></div>", unsafe_allow_html=True)
 
 # ---------------------------- app -----------------------------
-run_internal_tests()
+try:
+    run_internal_tests()
+    ENGINE_TEST_OK = True
+    ENGINE_TEST_ERROR = ""
+except Exception as exc:
+    ENGINE_TEST_OK = False
+    ENGINE_TEST_ERROR = str(exc)
 
 with st.sidebar:
     st.markdown("## 🟡 GOLD AI")
-    st.caption("XAU/USD • Paper Trading فقط")
+    st.caption("XAU/USD • Paper Trading فقط • لا يوجد تنفيذ حي")
     st.session_state.research_mode = st.toggle("وضع البحث التجريبي", value=st.session_state.research_mode)
     st.session_state.kill_switch = st.toggle("Kill Switch", value=st.session_state.kill_switch)
     st.session_state.auto_refresh = st.toggle("تحديث تلقائي", value=st.session_state.auto_refresh)
     refresh_seconds = st.slider("ثواني التحديث", 15, 120, 45)
+
+if not ENGINE_TEST_OK:
+    st.error("فشل اختبار محرك التداول الداخلي: " + ENGINE_TEST_ERROR)
+    st.stop()
 
 raw, history_message, chunk_count, credits = fetch_history()
 raw = closed_m5(raw)
@@ -1203,7 +1131,7 @@ with st.expander("تشغيل OOS MTF Backtest"):
         raw_window = raw.tail(min(len(raw), bars * 3))
         cost = st.number_input("تكلفة السبريد التاريخية المفترضة (دولار/وحدة سعر)", min_value=0.0, max_value=5.0, value=0.0, step=0.05, help="ليست بيانات سبريد فعلية من الوسيط؛ استخدمها فقط كافتراض محافظ.")
         slip = st.number_input("Slippage لكل جانب (دولار/وحدة سعر)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        trades, stats = backtest_mtf(raw_window, round_trip_cost=cost, slippage_per_side=slip)
+        trades, stats = backtest_mtf(raw_window, spread_per_round_trip=cost, slippage_per_side=slip)
         if stats["trades"]:
             metrics([
                 ("OOS Trades", stats["trades"]),
@@ -1219,7 +1147,7 @@ with st.expander("تشغيل OOS MTF Backtest"):
                 st.line_chart(pd.DataFrame({"Equity R": stats["equity_curve"], "Drawdown R": stats["drawdown_curve"]}))
             st.dataframe(trades.tail(100), hide_index=True, use_container_width=True)
             st.markdown("### Walk-Forward")
-            wf, wf_stats = walk_forward_mtf(raw_window, windows=4, round_trip_cost=cost, slippage_per_side=slip)
+            wf, wf_stats = walk_forward_mtf(raw_window, windows=4, spread_per_round_trip=cost, slippage_per_side=slip)
             if not wf.empty:
                 st.dataframe(wf, hide_index=True, use_container_width=True)
                 metrics([("WF Trades", wf_stats.get("trades", 0)), ("WF Win Rate", f"{wf_stats.get('win_rate', 0):.1f}%"), ("WF PF", f"{wf_stats.get('profit_factor', 0):.2f}"), ("WF Total R", f"{wf_stats.get('total_r', 0):.2f}R"), ("WF Max DD", f"{wf_stats.get('max_dd_r', 0):.2f}R")])
