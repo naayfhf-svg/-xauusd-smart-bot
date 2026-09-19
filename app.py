@@ -240,32 +240,131 @@ def manage_trade(price):
 
 
 def backtest(df):
-    x=indicators(df).dropna().reset_index(drop=True)
-    if len(x)<350:return pd.DataFrame(),{"trades":0,"warning":"العينة صغيرة للاختبار"}
-    split=int(len(x)*.70); rows=[]
-    for i in range(120,len(x)-2):
-        r=x.iloc[i]; p=x.iloc[i-1]; side=None
-        hi=x.iloc[max(0,i-21):i].high.max(); lo=x.iloc[max(0,i-21):i].low.min()
-        if r.close>r.ema20>r.ema50>r.ema100 and r.rsi>=52 and r.macd_hist>0 and r.adx>=25 and p.high>hi and r.low<=p.high:side="شراء"
-        elif r.close<r.ema20<r.ema50<r.ema100 and r.rsi<=48 and r.macd_hist<0 and r.adx>=25 and p.low<lo and r.high>=p.low:side="بيع"
-        if not side:continue
-        dist=max(float(r.atr)*1.4,float(r.close)*.0015); stop=float(r.close-dist if side=="شراء" else r.close+dist); tp=float(r.close+2.2*dist if side=="شراء" else r.close-2.2*dist); outcome=None
-        for j in range(i+1,min(i+80,len(x))):
-            hi2,lo2=float(x.high.iloc[j]),float(x.low.iloc[j])
-            if side=="شراء":
-                if lo2<=stop:outcome=-1.;break
-                if hi2>=tp:outcome=2.2;break
+    """Backtest the same B2 entry and TP1/BE/TP2 management used by paper trading."""
+    x = indicators(df).dropna().reset_index(drop=True)
+    if len(x) < 350:
+        return pd.DataFrame(), {"trades": 0, "warning": "العينة صغيرة للاختبار"}
+
+    split = int(len(x) * 0.70)
+    rows = []
+    i = 120
+    while i < len(x) - 2:
+        r = x.iloc[i]
+        p20 = x.iloc[max(0, i - 21):i]
+        resistance = float(p20.high.max())
+        support = float(p20.low.min())
+        av = float(r.atr)
+        if not np.isfinite(av) or av <= 0:
+            i += 1
+            continue
+
+        prev_close = float(x.close.iloc[i - 1])
+        breakout_buy = prev_close > resistance
+        breakout_sell = prev_close < support
+        retest_buy = breakout_buy and float(r.low) <= resistance + 0.35 * av and float(r.close) > resistance
+        retest_sell = breakout_sell and float(r.high) >= support - 0.35 * av and float(r.close) < support
+
+        bull = r.close > r.ema20 > r.ema50 > r.ema100 and r.rsi >= 52 and r.momentum > 0 and r.macd_hist > 0
+        bear = r.close < r.ema20 < r.ema50 < r.ema100 and r.rsi <= 48 and r.momentum < 0 and r.macd_hist < 0
+        side = "شراء" if retest_buy and bull and r.adx >= 25 else "بيع" if retest_sell and bear and r.adx >= 25 else None
+        if side is None:
+            i += 1
+            continue
+
+        entry = float(r.close)
+        dist = max(av * 1.4, entry * 0.0015)
+        if side == "شراء":
+            stop, tp1, tp2 = entry - dist, entry + dist, entry + 2.2 * dist
+        else:
+            stop, tp1, tp2 = entry + dist, entry - dist, entry - 2.2 * dist
+
+        realized_r = 0.0
+        remaining = 1.0
+        sl = stop
+        tp1_hit = False
+        outcome = None
+        reason = None
+        close_index = None
+
+        for j in range(i + 1, min(i + 80, len(x))):
+            hi = float(x.high.iloc[j])
+            lo = float(x.low.iloc[j])
+            # Conservative rule: if stop and target are both touched in one bar,
+            # assume the stop was hit first because intrabar order is unknown.
+            if side == "شراء":
+                if lo <= sl:
+                    outcome = realized_r - remaining
+                    reason = "وقف الخسارة"
+                    close_index = j
+                    break
+                if not tp1_hit and hi >= tp1:
+                    realized_r += 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    sl = entry
+                if tp1_hit and hi >= tp2:
+                    outcome = realized_r + 1.1
+                    reason = "الهدف الثاني"
+                    close_index = j
+                    break
             else:
-                if hi2>=stop:outcome=-1.;break
-                if lo2<=tp:outcome=2.2;break
-        if outcome is not None:rows.append({"الفهرس":i,"الوقت":x.datetime.iloc[i],"النوع":side,"R":outcome,"OOS":i>=split})
-    t=pd.DataFrame(rows)
-    o=t[t.OOS].copy() if not t.empty else t
-    if o.empty:return t,{"trades":0,"warning":"لا توجد صفقات OOS بالشروط الحالية"}
-    eq=0.;peak=0.;dd=0.
-    for v in o.R: eq+=v;peak=max(peak,eq);dd=max(dd,peak-eq)
-    gw=o.loc[o.R>0,"R"].sum();gl=abs(o.loc[o.R<0,"R"].sum());pf=gw/gl if gl else math.inf
-    return t,{"trades":len(o),"win_rate":(o.R>0).mean()*100,"profit_factor":pf,"total_r":o.R.sum(),"max_dd_r":dd,"warning":None}
+                if hi >= sl:
+                    outcome = realized_r - remaining
+                    reason = "وقف الخسارة"
+                    close_index = j
+                    break
+                if not tp1_hit and lo <= tp1:
+                    realized_r += 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    sl = entry
+                if tp1_hit and lo <= tp2:
+                    outcome = realized_r + 1.1
+                    reason = "الهدف الثاني"
+                    close_index = j
+                    break
+
+        if outcome is not None:
+            rows.append({
+                "الفهرس": i,
+                "الوقت": x.datetime.iloc[i],
+                "النوع": side,
+                "الدخول": round(entry, 2),
+                "الوقف": round(stop, 2),
+                "TP1": round(tp1, 2),
+                "TP2": round(tp2, 2),
+                "R": round(outcome, 3),
+                "السبب": reason,
+                "OOS": i >= split,
+            })
+            i = close_index + 1
+        else:
+            i += 1
+
+    trades = pd.DataFrame(rows)
+    oos = trades[trades.OOS].copy() if not trades.empty else trades
+    if oos.empty:
+        return trades, {"trades": 0, "warning": "لا توجد صفقات OOS بالشروط الحالية"}
+
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for value in oos.R:
+        eq += float(value)
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+    gross_win = oos.loc[oos.R > 0, "R"].sum()
+    gross_loss = abs(oos.loc[oos.R < 0, "R"].sum())
+    pf = gross_win / gross_loss if gross_loss else math.inf
+    return trades, {
+        "trades": len(oos),
+        "win_rate": float((oos.R > 0).mean() * 100),
+        "profit_factor": float(pf),
+        "total_r": float(oos.R.sum()),
+        "max_dd_r": float(max_dd),
+        "warning": None,
+    }
 
 
 def metrics(items):
