@@ -723,12 +723,13 @@ def backtest_mtf(
     oos_start_ts=None,
     oos_end_ts=None,
 ):
-    """Deterministic MTF/B2 research backtest with price-level costs.
+    """MTF/B2 research backtest with explicit price-level execution costs.
 
-    `spread_per_round_trip` is the assumed full bid/ask width at execution.
-    `slippage_per_side` is adverse price movement per entry/exit.
-    Historical bid/ask is not available from the current OHLC dataset, so these
-    are explicit research assumptions rather than broker-observed costs.
+    Strategy levels are defined from the theoretical signal price (mid).
+    Entry and every exit are then executed adversely by half-spread + slippage.
+    This prevents transaction costs from being accidentally hidden inside or
+    deducted twice from R. Historical bid/ask is not available in OHLC data,
+    so spread/slippage are explicit assumptions.
     """
     raw = closed_m5(raw)
     if raw.empty:
@@ -738,115 +739,186 @@ def backtest_mtf(
         split_index = max(1, int(len(raw) * (1 - oos_fraction)))
         oos_start_ts = raw["datetime"].iloc[min(split_index, len(raw)-1)]
     split_ts = pd.Timestamp(oos_start_ts)
-    if split_ts.tzinfo is None:
-        split_ts = split_ts.tz_localize("UTC")
-    else:
-        split_ts = split_ts.tz_convert("UTC")
+    split_ts = split_ts.tz_localize("UTC") if split_ts.tzinfo is None else split_ts.tz_convert("UTC")
 
     end_ts = None
     if oos_end_ts is not None:
         end_ts = pd.Timestamp(oos_end_ts)
-        if end_ts.tzinfo is None:
-            end_ts = end_ts.tz_localize("UTC")
-        else:
-            end_ts = end_ts.tz_convert("UTC")
+        end_ts = end_ts.tz_localize("UTC") if end_ts.tzinfo is None else end_ts.tz_convert("UTC")
 
-    # Build only with information available by the test endpoint.
     as_of = end_ts if end_ts is not None else raw["datetime"].max() + pd.Timedelta(minutes=5)
-    base, error = prepare_mtf_backtest(raw[raw["datetime"] < as_of], as_of=as_of)
+    available_raw = raw[raw["datetime"] < as_of].copy()
+    base, error = prepare_mtf_backtest(available_raw, as_of=as_of)
     if base is None:
         return pd.DataFrame(), {"trades": 0, "warning": error}
 
-    spread_half = max(0.0, float(spread_per_round_trip)) / 2.0
+    half_spread = max(0.0, float(spread_per_round_trip)) / 2.0
     slip = max(0.0, float(slippage_per_side))
-    trades=[]
-    i=22
-    while i < len(base)-2:
-        row=base.iloc[i]
-        ts=pd.Timestamp(row.decision_ts)
+    adverse = half_spread + slip
+    trades = []
+    i = 22
+
+    while i < len(base) - 2:
+        row = base.iloc[i]
+        ts = pd.Timestamp(row.decision_ts)
         if ts < split_ts:
-            i += 1; continue
+            i += 1
+            continue
         if end_ts is not None and ts >= end_ts:
             break
 
-        history=base.iloc[i-21:i-1]
-        breakout=base.iloc[i-1]
-        resistance=float(history.high.max()); support=float(history.low.min()); atr_value=float(row.atr)
+        history = base.iloc[i-21:i-1]
+        breakout = base.iloc[i-1]
+        resistance = float(history.high.max())
+        support = float(history.low.min())
+        atr_value = float(row.atr)
         if not finite(atr_value) or atr_value <= 0:
-            i += 1; continue
+            i += 1
+            continue
 
-        bullish_break=float(breakout.close)>resistance
-        bearish_break=float(breakout.close)<support
-        bullish_retest=bullish_break and float(row.low)<=resistance+0.35*atr_value and float(row.close)>resistance
-        bearish_retest=bearish_break and float(row.high)>=support-0.35*atr_value and float(row.close)<support
-        bull_mtf=(row.close>row.ema20>row.ema50>row.ema100 and row.close_m15>row.ema20_m15>row.ema50_m15>row.ema100_m15 and row.close_h1>row.ema20_h1>row.ema50_h1>row.ema100_h1 and row.close_h4>row.ema20_h4>row.ema50_h4>row.ema100_h4)
-        bear_mtf=(row.close<row.ema20<row.ema50<row.ema100 and row.close_m15<row.ema20_m15<row.ema50_m15<row.ema100_m15 and row.close_h1<row.ema20_h1<row.ema50_h1<row.ema100_h1 and row.close_h4<row.ema20_h4<row.ema50_h4<row.ema100_h4)
-        mom_buy=row.rsi>=52 and row.momentum>0 and row.macd_hist>0 and row.adx>=25
-        mom_sell=row.rsi<=48 and row.momentum<0 and row.macd_hist<0 and row.adx>=25
-        side="شراء" if bullish_retest and bull_mtf and mom_buy else "بيع" if bearish_retest and bear_mtf and mom_sell else None
+        bullish_break = float(breakout.close) > resistance
+        bearish_break = float(breakout.close) < support
+        bullish_retest = bullish_break and float(row.low) <= resistance + 0.35 * atr_value and float(row.close) > resistance
+        bearish_retest = bearish_break and float(row.high) >= support - 0.35 * atr_value and float(row.close) < support
+        bull_mtf = (row.close > row.ema20 > row.ema50 > row.ema100 and
+                    row.close_m15 > row.ema20_m15 > row.ema50_m15 > row.ema100_m15 and
+                    row.close_h1 > row.ema20_h1 > row.ema50_h1 > row.ema100_h1 and
+                    row.close_h4 > row.ema20_h4 > row.ema50_h4 > row.ema100_h4)
+        bear_mtf = (row.close < row.ema20 < row.ema50 < row.ema100 and
+                    row.close_m15 < row.ema20_m15 < row.ema50_m15 < row.ema100_m15 and
+                    row.close_h1 < row.ema20_h1 < row.ema50_h1 < row.ema100_h1 and
+                    row.close_h4 < row.ema20_h4 < row.ema50_h4 < row.ema100_h4)
+        mom_buy = row.rsi >= 52 and row.momentum > 0 and row.macd_hist > 0 and row.adx >= 25
+        mom_sell = row.rsi <= 48 and row.momentum < 0 and row.macd_hist < 0 and row.adx >= 25
+        side = "شراء" if bullish_retest and bull_mtf and mom_buy else "بيع" if bearish_retest and bear_mtf and mom_sell else None
         if side is None:
-            i += 1; continue
+            i += 1
+            continue
 
-        mid=float(row.close)
-        entry=mid+spread_half+slip if side=="شراء" else mid-spread_half-slip
-        distance=max(atr_value*1.4, entry*0.0015)
-        stop=entry-distance if side=="شراء" else entry+distance
-        initial_stop=stop
-        tp1=entry+distance if side=="شراء" else entry-distance
-        tp2=entry+2.2*distance if side=="شراء" else entry-2.2*distance
-        realized=0.0; remaining=1.0; tp1_hit=False; exit_price=None; reason=None; exit_i=None
+        # Signal/theoretical price. Orders execute adversely from this price.
+        signal_price = float(row.close)
+        entry = signal_price + adverse if side == "شراء" else signal_price - adverse
+        distance = max(atr_value * 1.4, signal_price * 0.0015)
+        initial_stop = signal_price - distance if side == "شراء" else signal_price + distance
+        tp1 = signal_price + distance if side == "شراء" else signal_price - distance
+        tp2 = signal_price + 2.2 * distance if side == "شراء" else signal_price - 2.2 * distance
+        stop = initial_stop
+        remaining = 1.0
+        tp1_hit = False
+        net_r = 0.0
+        gross_r = 0.0
+        exit_cost_r = 0.0
+        exit_price = None
+        reason = None
+        exit_i = None
 
-        for j in range(i+1,min(i+100,len(base))):
-            bar_ts=pd.Timestamp(base.decision_ts.iloc[j])
-            if end_ts is not None and bar_ts>=end_ts: break
-            high=float(base.high.iloc[j]); low=float(base.low.iloc[j])
-            if side=="شراء":
-                stop_exec=stop-spread_half-slip
-                tp1_exec=tp1-spread_half-slip
-                tp2_exec=tp2-spread_half-slip
-                # Stop-first when OHLC cannot reveal intrabar order.
-                if low<=stop:
-                    exit_price=stop_exec
-                    realized += (exit_price-entry)/distance*remaining
-                    reason="وقف الخسارة"; exit_i=j; break
-                if not tp1_hit and high>=tp1:
-                    realized += (tp1_exec-entry)/distance*0.5
-                    remaining=0.5; tp1_hit=True; stop=entry; continue
-                if tp1_hit and high>=tp2:
-                    exit_price=tp2_exec
-                    realized += (exit_price-entry)/distance*remaining
-                    reason="الهدف الثاني"; exit_i=j; break
+        for j in range(i + 1, min(i + 100, len(base))):
+            bar_ts = pd.Timestamp(base.decision_ts.iloc[j])
+            if end_ts is not None and bar_ts >= end_ts:
+                break
+            high = float(base.high.iloc[j])
+            low = float(base.low.iloc[j])
+
+            if side == "شراء":
+                # Conservative OHLC convention: stop is first if both are touched.
+                if low <= stop:
+                    exit_price = stop - adverse
+                    gross_r += ((stop - signal_price) / distance) * remaining
+                    net_r += ((exit_price - entry) / distance) * remaining
+                    exit_cost_r += (adverse / distance) * remaining
+                    reason = "وقف الخسارة"
+                    exit_i = j
+                    break
+                if not tp1_hit and high >= tp1:
+                    tp1_exec = tp1 - adverse
+                    gross_r += ((tp1 - signal_price) / distance) * 0.5
+                    net_r += ((tp1_exec - entry) / distance) * 0.5
+                    exit_cost_r += (adverse / distance) * 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    stop = signal_price
+                    continue
+                if tp1_hit and high >= tp2:
+                    exit_price = tp2 - adverse
+                    gross_r += ((tp2 - signal_price) / distance) * remaining
+                    net_r += ((exit_price - entry) / distance) * remaining
+                    exit_cost_r += (adverse / distance) * remaining
+                    reason = "الهدف الثاني"
+                    exit_i = j
+                    break
             else:
-                stop_exec=stop+spread_half+slip
-                tp1_exec=tp1+spread_half+slip
-                tp2_exec=tp2+spread_half+slip
-                if high>=stop:
-                    exit_price=stop_exec
-                    realized += (entry-exit_price)/distance*remaining
-                    reason="وقف الخسارة"; exit_i=j; break
-                if not tp1_hit and low<=tp1:
-                    realized += (entry-tp1_exec)/distance*0.5
-                    remaining=0.5; tp1_hit=True; stop=entry; continue
-                if tp1_hit and low<=tp2:
-                    exit_price=tp2_exec
-                    realized += (entry-exit_price)/distance*remaining
-                    reason="الهدف الثاني"; exit_i=j; break
+                if high >= stop:
+                    exit_price = stop + adverse
+                    gross_r += ((signal_price - stop) / distance) * remaining
+                    net_r += ((entry - exit_price) / distance) * remaining
+                    exit_cost_r += (adverse / distance) * remaining
+                    reason = "وقف الخسارة"
+                    exit_i = j
+                    break
+                if not tp1_hit and low <= tp1:
+                    tp1_exec = tp1 + adverse
+                    gross_r += ((signal_price - tp1) / distance) * 0.5
+                    net_r += ((entry - tp1_exec) / distance) * 0.5
+                    exit_cost_r += (adverse / distance) * 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    stop = signal_price
+                    continue
+                if tp1_hit and low <= tp2:
+                    exit_price = tp2 + adverse
+                    gross_r += ((signal_price - tp2) / distance) * remaining
+                    net_r += ((entry - exit_price) / distance) * remaining
+                    exit_cost_r += (adverse / distance) * remaining
+                    reason = "الهدف الثاني"
+                    exit_i = j
+                    break
 
         if exit_i is not None:
-            cost_r=2.0*(spread_half+slip)/distance
-            trades.append({"الوقت":row.datetime,"النوع":side,"الدخول":round(entry,2),"الوقف":round(initial_stop,2),"TP1":round(tp1,2),"TP2":round(tp2,2),"الخروج":round(exit_price,2),"R":round(realized,4),"تكلفة_السعر_R":round(cost_r,4),"السبب":reason,"OOS":True})
-            i=exit_i+1
+            entry_cost_r = adverse / distance
+            total_cost_r = entry_cost_r + exit_cost_r
+            # Net R is authoritative; gross R is the idealized no-cost result.
+            trades.append({
+                "الوقت": row.datetime,
+                "النوع": side,
+                "الدخول": round(entry, 2),
+                "الوقف": round(initial_stop, 2),
+                "TP1": round(tp1, 2),
+                "TP2": round(tp2, 2),
+                "الخروج": round(exit_price, 2),
+                "Gross_R": round(gross_r, 4),
+                "R": round(net_r, 4),
+                "تكلفة_السعر_R": round(total_cost_r, 4),
+                "السبب": reason,
+                "OOS": True,
+            })
+            i = exit_i + 1
         else:
             i += 1
 
-    result=pd.DataFrame(trades)
+    result = pd.DataFrame(trades)
     if result.empty:
-        return result,{"trades":0,"warning":"لا توجد صفقات OOS مطابقة لكل بوابات MTF"}
-    eq=result["R"].cumsum(); dd=eq.cummax()-eq
-    result["Equity_R"]=eq; result["Drawdown_R"]=dd
-    wins=result.loc[result.R>0,"R"].sum(); losses=abs(result.loc[result.R<0,"R"].sum())
-    pf=wins/losses if losses else math.inf
-    return result,{"trades":len(result),"win_rate":float((result.R>0).mean()*100),"profit_factor":float(pf),"total_r":float(result.R.sum()),"max_dd_r":float(dd.max()),"warning":"العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result)<100 else None,"oos_start":str(split_ts),"avg_cost_r":float(result["تكلفة_السعر_R"].mean()),"equity_curve":eq.tolist(),"drawdown_curve":dd.tolist()}
+        return result, {"trades": 0, "warning": "لا توجد صفقات OOS مطابقة لكل بوابات MTF"}
+
+    equity = result["R"].cumsum()
+    drawdown = equity.cummax() - equity
+    result["Equity_R"] = equity
+    result["Drawdown_R"] = drawdown
+    wins = result.loc[result.R > 0, "R"].sum()
+    losses = abs(result.loc[result.R < 0, "R"].sum())
+    pf = wins / losses if losses else math.inf
+    return result, {
+        "trades": len(result),
+        "win_rate": float((result.R > 0).mean() * 100),
+        "profit_factor": float(pf),
+        "total_r": float(result.R.sum()),
+        "gross_total_r": float(result.Gross_R.sum()),
+        "max_dd_r": float(drawdown.max()),
+        "warning": "العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result) < 100 else None,
+        "oos_start": str(split_ts),
+        "avg_cost_r": float(result["تكلفة_السعر_R"].mean()),
+        "equity_curve": equity.tolist(),
+        "drawdown_curve": drawdown.tolist(),
+    }
 
 def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, spread_per_round_trip=0.0, slippage_per_side=0.0):
     """
@@ -941,9 +1013,13 @@ def run_internal_tests():
     right=pd.DataFrame({"available_ts":pd.to_datetime(["2026-01-01 01:00"],utc=True),"v":[1]})
     m=pd.merge_asof(left,right,left_on="decision_ts",right_on="available_ts",direction="backward",allow_exact_matches=False)
     assert pd.isna(m.loc[0,"v"])
-    # Cost conversion is explicit and positive.
-    distance=10.0; spread=1.0; slip=0.2
-    assert abs(2*((spread/2)+slip)/distance-0.14)<1e-12
+    # Price-level execution cost: adverse entry plus adverse exit.
+    distance=10.0; spread=1.0; slip=0.2; adverse=(spread/2)+slip
+    assert abs(adverse/distance-0.07)<1e-12
+    assert abs((2*adverse)/distance-0.14)<1e-12
+    # A theoretical +1R BUY target becomes less than +1R after adverse exit.
+    entry=2000.0+adverse; target=2000.0+distance; exit_exec=target-adverse
+    assert ((exit_exec-entry)/distance) < 1.0
     # BUY: TP1 +0.5R, TP2 remaining +1.1R.
     entry=2000.0; d=10.0; tp1=entry+d; tp2=entry+2.2*d
     assert abs(((tp1-entry)/d)*0.5-0.5)<1e-12
