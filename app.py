@@ -4,28 +4,17 @@ import numpy as np
 import requests
 from datetime import datetime
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-
 st.set_page_config(
     page_title="بوت الذهب XAU/USD",
     page_icon="🟡",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+    layout="wide"
 )
 
 SYMBOL = "XAU/USD"
 API_URL = "https://api.twelvedata.com/time_series"
 
 st.title("🟡 بوت الذهب XAU/USD")
-st.caption(
-    "Smart Paper Trading — Multi-Timeframe + Backtest + Out-of-Sample"
-)
-
-# =========================================================
-# API KEY
-# =========================================================
+st.caption("Smart Paper Trading — Multi-Timeframe + OOS Comparison")
 
 try:
     API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
@@ -33,14 +22,12 @@ except Exception:
     API_KEY = ""
 
 if not API_KEY:
-    st.error(
-        "لم يتم العثور على TWELVE_DATA_API_KEY في Streamlit Secrets."
-    )
+    st.error("لم يتم العثور على TWELVE_DATA_API_KEY في Streamlit Secrets.")
     st.stop()
 
 
 # =========================================================
-# DATA — TWELVE DATA
+# DATA
 # =========================================================
 
 @st.cache_data(ttl=65, show_spinner=False)
@@ -55,7 +42,7 @@ def get_candles(interval, outputsize=300, end_date=None):
         "apikey": API_KEY
     }
 
-    if end_date is not None:
+    if end_date:
         params["end_date"] = end_date
 
     try:
@@ -72,31 +59,21 @@ def get_candles(interval, outputsize=300, end_date=None):
             data.get("message", "")
         )
 
-        # -------------------------------------------------
-        # RATE LIMIT
-        # -------------------------------------------------
-
         if (
             data.get("code") == 429
-            or "run out of api credits" in message.lower()
-            or "current limit" in message.lower()
+            or "api credits" in message.lower()
         ):
-
             return pd.DataFrame()
 
-        # -------------------------------------------------
-        # API ERROR
-        # -------------------------------------------------
-
-        if data.get("status") != "ok":
+        if (
+            data.get("status") != "ok"
+            or not data.get("values")
+        ):
             return pd.DataFrame()
 
-        values = data.get("values", [])
-
-        if not values:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(values)
+        df = pd.DataFrame(
+            data["values"]
+        )
 
         required = [
             "datetime",
@@ -107,8 +84,8 @@ def get_candles(interval, outputsize=300, end_date=None):
         ]
 
         if not all(
-            col in df.columns
-            for col in required
+            c in df.columns
+            for c in required
         ):
             return pd.DataFrame()
 
@@ -117,29 +94,16 @@ def get_candles(interval, outputsize=300, end_date=None):
             errors="coerce"
         )
 
-        for col in [
-            "open",
-            "high",
-            "low",
-            "close"
-        ]:
+        for c in required[1:]:
 
-            df[col] = pd.to_numeric(
-                df[col],
+            df[c] = pd.to_numeric(
+                df[c],
                 errors="coerce"
             )
 
         df = (
             df
-            .dropna(
-                subset=[
-                    "datetime",
-                    "open",
-                    "high",
-                    "low",
-                    "close"
-                ]
-            )
+            .dropna(subset=required)
             .drop_duplicates("datetime")
             .sort_values("datetime")
             .reset_index(drop=True)
@@ -148,12 +112,9 @@ def get_candles(interval, outputsize=300, end_date=None):
         return df
 
     except Exception:
+
         return pd.DataFrame()
 
-
-# =========================================================
-# HISTORICAL M5
-# =========================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_historical_m5(total_bars=15000):
@@ -161,19 +122,20 @@ def get_historical_m5(total_bars=15000):
     chunks = []
 
     remaining = total_bars
+
     end_date = None
 
     while remaining > 0:
 
-        request_size = min(
+        size = min(
             5000,
             remaining
         )
 
         df = get_candles(
             "5min",
-            outputsize=request_size,
-            end_date=end_date
+            size,
+            end_date
         )
 
         if df.empty:
@@ -188,14 +150,11 @@ def get_historical_m5(total_bars=15000):
             - pd.Timedelta(minutes=5)
         )
 
-        if end_date is not None:
-
-            old_end = pd.to_datetime(
-                end_date
-            )
-
-            if new_end >= old_end:
-                break
+        if (
+            end_date is not None
+            and new_end >= pd.to_datetime(end_date)
+        ):
+            break
 
         end_date = new_end.strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -203,7 +162,7 @@ def get_historical_m5(total_bars=15000):
 
         remaining -= len(df)
 
-        if len(df) < request_size:
+        if len(df) < size:
             break
 
     if not chunks:
@@ -227,7 +186,7 @@ def get_historical_m5(total_bars=15000):
 # INDICATORS
 # =========================================================
 
-def calculate_indicators(df):
+def indicators(df):
 
     df = df.copy()
 
@@ -235,9 +194,7 @@ def calculate_indicators(df):
     high = df["high"]
     low = df["low"]
 
-    # -----------------------------------------------------
     # EMA
-    # -----------------------------------------------------
 
     df["ema20"] = (
         close
@@ -266,22 +223,13 @@ def calculate_indicators(df):
         .mean()
     )
 
-    # -----------------------------------------------------
     # RSI
-    # -----------------------------------------------------
 
     delta = close.diff()
 
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = (
-        gain
+    gain = (
+        delta
+        .clip(lower=0)
         .ewm(
             alpha=1 / 14,
             adjust=False
@@ -289,8 +237,9 @@ def calculate_indicators(df):
         .mean()
     )
 
-    avg_loss = (
-        loss
+    loss = (
+        -delta
+        .clip(upper=0)
         .ewm(
             alpha=1 / 14,
             adjust=False
@@ -299,12 +248,9 @@ def calculate_indicators(df):
     )
 
     rs = (
-        avg_gain
+        gain
         /
-        avg_loss.replace(
-            0,
-            np.nan
-        )
+        loss.replace(0, np.nan)
     )
 
     df["rsi"] = (
@@ -317,9 +263,7 @@ def calculate_indicators(df):
         )
     )
 
-    # -----------------------------------------------------
     # MACD
-    # -----------------------------------------------------
 
     ema12 = (
         close
@@ -339,9 +283,7 @@ def calculate_indicators(df):
         .mean()
     )
 
-    df["macd"] = (
-        ema12 - ema26
-    )
+    df["macd"] = ema12 - ema26
 
     df["macd_signal"] = (
         df["macd"]
@@ -358,20 +300,22 @@ def calculate_indicators(df):
         df["macd_signal"]
     )
 
-    # -----------------------------------------------------
     # ATR
-    # -----------------------------------------------------
 
     previous_close = close.shift(1)
 
     tr1 = high - low
 
     tr2 = (
-        high - previous_close
+        high
+        -
+        previous_close
     ).abs()
 
     tr3 = (
-        low - previous_close
+        low
+        -
+        previous_close
     ).abs()
 
     true_range = tr1.copy()
@@ -395,30 +339,22 @@ def calculate_indicators(df):
         .mean()
     )
 
-    # -----------------------------------------------------
-    # MOMENTUM
-    # -----------------------------------------------------
+    # Momentum
 
     df["momentum"] = (
         close.diff(10)
     )
 
-    # -----------------------------------------------------
-    # ADX / DI
-    # -----------------------------------------------------
+    # ADX
 
-    up_move = high.diff()
+    up = high.diff()
 
-    down_move = -low.diff()
+    down = -low.diff()
 
     plus_dm = pd.Series(
         np.where(
-            (
-                (up_move > down_move)
-                &
-                (up_move > 0)
-            ),
-            up_move,
+            (up > down) & (up > 0),
+            up,
             0
         ),
         index=df.index
@@ -426,12 +362,8 @@ def calculate_indicators(df):
 
     minus_dm = pd.Series(
         np.where(
-            (
-                (down_move > up_move)
-                &
-                (down_move > 0)
-            ),
-            down_move,
+            (down > up) & (down > 0),
+            down,
             0
         ),
         index=df.index
@@ -439,10 +371,7 @@ def calculate_indicators(df):
 
     atr_safe = (
         df["atr"]
-        .replace(
-            0,
-            np.nan
-        )
+        .replace(0, np.nan)
     )
 
     df["plus_di"] = (
@@ -508,7 +437,10 @@ def calculate_indicators(df):
 # RESAMPLE
 # =========================================================
 
-def resample_ohlc(df, rule):
+def resample_ohlc(
+    df,
+    rule
+):
 
     result = (
         df
@@ -545,7 +477,7 @@ def resample_ohlc(df, rule):
 # SCORE
 # =========================================================
 
-def score_timeframe(
+def score(
     row,
     prefix=""
 ):
@@ -553,34 +485,37 @@ def score_timeframe(
     def value(name):
 
         return row.get(
-            f"{prefix}{name}",
+            prefix + name,
             np.nan
         )
 
-    ema20 = value("ema20")
-    ema50 = value("ema50")
-    ema100 = value("ema100")
-    close = value("close")
-    rsi = value("rsi")
-    macd = value("macd")
-    macd_signal = value(
-        "macd_signal"
-    )
-    macd_hist = value(
-        "macd_hist"
-    )
-    momentum = value(
-        "momentum"
-    )
-    adx = value("adx")
-    plus_di = value(
-        "plus_di"
-    )
-    minus_di = value(
+    names = [
+        "ema20",
+        "ema50",
+        "ema100",
+        "close",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "momentum",
+        "adx",
+        "plus_di",
         "minus_di"
-    )
+    ]
 
-    values = [
+    vals = [
+        value(x)
+        for x in names
+    ]
+
+    if any(
+        pd.isna(x)
+        for x in vals
+    ):
+        return 0
+
+    (
         ema20,
         ema50,
         ema100,
@@ -593,17 +528,9 @@ def score_timeframe(
         adx,
         plus_di,
         minus_di
-    ]
+    ) = vals
 
-    if any(
-        pd.isna(v)
-        for v in values
-    ):
-        return 0
-
-    score = 0
-
-    # EMA structure
+    s = 0
 
     if (
         ema20
@@ -612,7 +539,7 @@ def score_timeframe(
         >
         ema100
     ):
-        score += 3
+        s += 3
 
     elif (
         ema20
@@ -621,113 +548,111 @@ def score_timeframe(
         <
         ema100
     ):
-        score -= 3
+        s -= 3
 
-    # Price / EMA20
-
-    if close > ema20:
-        score += 1
-
-    elif close < ema20:
-        score -= 1
-
-    # RSI
+    s += (
+        1
+        if close > ema20
+        else -1
+    )
 
     if (
-        52
-        <=
-        rsi
-        <=
-        68
+        52 <= rsi <= 68
     ):
-        score += 2
+        s += 2
 
     elif (
-        32
-        <=
-        rsi
-        <
-        48
+        32 <= rsi < 48
     ):
-        score -= 2
-
-    # MACD
+        s -= 2
 
     if (
         macd > macd_signal
         and macd_hist > 0
     ):
-        score += 2
+        s += 2
 
     elif (
         macd < macd_signal
         and macd_hist < 0
     ):
-        score -= 2
+        s -= 2
 
-    # Momentum
-
-    if momentum > 0:
-        score += 1
-
-    elif momentum < 0:
-        score -= 1
-
-    # ADX + DI
+    s += (
+        1
+        if momentum > 0
+        else -1
+    )
 
     if adx >= 25:
 
         if plus_di > minus_di:
-            score += 2
+            s += 2
 
         elif minus_di > plus_di:
-            score -= 2
+            s -= 2
 
-    return score
+    return s
 
 
-def trend_from_score(score):
+def trend(s):
 
-    if score >= 5:
+    if s >= 5:
         return "صاعد 📈"
 
-    if score <= -5:
+    if s <= -5:
         return "هابط 📉"
 
     return "محايد ↔️"
 
 
 # =========================================================
-# SUPPORT / RESISTANCE
+# LIVE DATA
 # =========================================================
 
-def get_support_resistance(m15):
+@st.cache_data(
+    ttl=65,
+    show_spinner=False
+)
+def live_data():
 
-    if len(m15) < 50:
-        return np.nan, np.nan
-
-    support = (
-        m15["low"]
-        .iloc[-50:]
-        .min()
+    m5 = get_candles(
+        "5min",
+        300
     )
 
-    resistance = (
-        m15["high"]
-        .iloc[-50:]
-        .max()
+    if m5.empty:
+        return None
+
+    m15 = resample_ohlc(
+        m5,
+        "15min"
     )
 
-    return support, resistance
+    h1 = resample_ohlc(
+        m5,
+        "1h"
+    )
+
+    if (
+        m15.empty
+        or h1.empty
+    ):
+        return None
+
+    return (
+        indicators(m5),
+        indicators(m15),
+        indicators(h1)
+    )
 
 
-# =========================================================
-# BREAKOUT / RETEST
-# =========================================================
-
-def breakout_retest(m15):
+def breakout_text(
+    m15
+):
 
     if len(m15) < 25:
+
         return "لا توجد بيانات كافية"
 
     current = m15.iloc[-1]
@@ -746,33 +671,21 @@ def breakout_retest(m15):
         .min()
     )
 
-    atr = current["atr"]
-
     if (
-        pd.isna(atr)
-        or atr <= 0
+        pd.isna(current["atr"])
+        or current["atr"] <= 0
     ):
         return "لا يوجد"
 
     if (
-        current["close"]
-        >
-        resistance
-        and
-        previous["close"]
-        <=
-        resistance
+        current["close"] > resistance
+        and previous["close"] <= resistance
     ):
         return "كسر مقاومة 📈"
 
     if (
-        current["close"]
-        <
-        support
-        and
-        previous["close"]
-        >=
-        support
+        current["close"] < support
+        and previous["close"] >= support
     ):
         return "كسر دعم 📉"
 
@@ -782,8 +695,7 @@ def breakout_retest(m15):
             -
             resistance
         )
-        <=
-        atr * 0.5
+        <= current["atr"] * 0.5
     ):
         return "إعادة اختبار مقاومة"
 
@@ -793,73 +705,11 @@ def breakout_retest(m15):
             -
             support
         )
-        <=
-        atr * 0.5
+        <= current["atr"] * 0.5
     ):
         return "إعادة اختبار دعم"
 
     return "لا يوجد كسر أو إعادة اختبار واضحة"
-
-
-# =========================================================
-# LIVE DATA
-# =========================================================
-
-@st.cache_data(
-    ttl=65,
-    show_spinner=False
-)
-def get_live_market_data():
-
-    # -----------------------------------------------------
-    # IMPORTANT:
-    # ONE API REQUEST ONLY
-    # M5 is used to construct M15 and H1 locally.
-    # -----------------------------------------------------
-
-    m5 = get_candles(
-        "5min",
-        300
-    )
-
-    if m5.empty:
-        return None
-
-    # Build higher timeframes locally
-
-    m15_raw = resample_ohlc(
-        m5,
-        "15min"
-    )
-
-    h1_raw = resample_ohlc(
-        m5,
-        "1h"
-    )
-
-    if (
-        m15_raw.empty
-        or h1_raw.empty
-    ):
-        return None
-
-    m5 = calculate_indicators(
-        m5
-    )
-
-    m15 = calculate_indicators(
-        m15_raw
-    )
-
-    h1 = calculate_indicators(
-        h1_raw
-    )
-
-    return (
-        m5,
-        m15,
-        h1
-    )
 
 
 # =========================================================
@@ -868,7 +718,7 @@ def get_live_market_data():
 
 def live_analysis():
 
-    data = get_live_market_data()
+    data = live_data()
 
     if data is None:
         return None
@@ -876,34 +726,18 @@ def live_analysis():
     m5, m15, h1 = data
 
     a5 = m5.iloc[-1]
+
     a15 = m15.iloc[-1]
+
     ah1 = h1.iloc[-1]
 
-    s5 = score_timeframe(
-        a5
-    )
+    s5 = score(a5)
 
-    s15 = score_timeframe(
-        a15
-    )
+    s15 = score(a15)
 
-    sh1 = score_timeframe(
-        ah1
-    )
+    sh1 = score(ah1)
 
-    trend5 = trend_from_score(
-        s5
-    )
-
-    trend15 = trend_from_score(
-        s15
-    )
-
-    trendh1 = trend_from_score(
-        sh1
-    )
-
-    total_score = (
+    total = (
         s5
         +
         s15
@@ -911,22 +745,7 @@ def live_analysis():
         sh1
     )
 
-    confidence = min(
-        100,
-        round(
-            abs(total_score)
-            /
-            30
-            *
-            100
-        )
-    )
-
-    # -----------------------------------------------------
-    # BUY
-    # -----------------------------------------------------
-
-    buy_conditions = (
+    buy = (
         s5 >= 5
         and
         s15 >= 5
@@ -940,11 +759,7 @@ def live_analysis():
         a15["macd"] > 0
     )
 
-    # -----------------------------------------------------
-    # SELL
-    # -----------------------------------------------------
-
-    sell_conditions = (
+    sell = (
         s5 <= -5
         and
         s15 <= -5
@@ -958,13 +773,14 @@ def live_analysis():
         a15["macd"] < 0
     )
 
-    signal = "WAIT"
-
-    if buy_conditions:
+    if buy:
         signal = "BUY"
 
-    elif sell_conditions:
+    elif sell:
         signal = "SELL"
+
+    else:
+        signal = "WAIT"
 
     price = float(
         a5["close"]
@@ -1018,23 +834,25 @@ def live_analysis():
             2.5 * atr
         )
 
-    support, resistance = (
-        get_support_resistance(
-            m15
-        )
-    )
-
     return {
         "price": price,
         "signal": signal,
-        "confidence": confidence,
-        "trend5": trend5,
-        "trend15": trend15,
-        "trendh1": trendh1,
+        "confidence": min(
+            100,
+            round(
+                abs(total)
+                /
+                30
+                *
+                100
+            )
+        ),
+        "trend5": trend(s5),
+        "trend15": trend(s15),
+        "trendh1": trend(sh1),
         "score5": s5,
         "score15": s15,
         "scoreh1": sh1,
-        "total_score": total_score,
         "rsi": float(a15["rsi"]),
         "adx": float(a15["adx"]),
         "macd": float(a15["macd"]),
@@ -1042,12 +860,10 @@ def live_analysis():
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "support": support,
-        "resistance": resistance,
-        "breakout": breakout_retest(m15),
-        "m5": m5,
-        "m15": m15,
-        "h1": h1
+        "support": m15["low"].iloc[-50:].min(),
+        "resistance": m15["high"].iloc[-50:].max(),
+        "breakout": breakout_text(m15),
+        "m15": m15
     }
 
 
@@ -1055,35 +871,27 @@ def live_analysis():
 # BACKTEST PREPARATION
 # =========================================================
 
-def prepare_backtest_data(
-    m5_raw
+def prepare_backtest(
+    raw
 ):
 
-    m5 = calculate_indicators(
-        m5_raw.copy()
+    m5 = indicators(
+        raw.copy()
     )
 
-    m15_raw = resample_ohlc(
-        m5_raw,
-        "15min"
+    m15 = indicators(
+        resample_ohlc(
+            raw,
+            "15min"
+        )
     )
 
-    h1_raw = resample_ohlc(
-        m5_raw,
-        "1h"
+    h1 = indicators(
+        resample_ohlc(
+            raw,
+            "1h"
+        )
     )
-
-    m15 = calculate_indicators(
-        m15_raw
-    )
-
-    h1 = calculate_indicators(
-        h1_raw
-    )
-
-    # -----------------------------------------------------
-    # Previous support / resistance
-    # -----------------------------------------------------
 
     m15["prev_resistance"] = (
         m15["high"]
@@ -1127,24 +935,16 @@ def prepare_backtest_data(
         )
     )
 
-    # -----------------------------------------------------
-    # Higher timeframe availability
-    # -----------------------------------------------------
-
-    m15a = m15.copy()
-
-    m15a["available_at"] = (
-        m15a["datetime"]
+    m15["available_at"] = (
+        m15["datetime"]
         +
         pd.Timedelta(
             minutes=15
         )
     )
 
-    h1a = h1.copy()
-
-    h1a["available_at"] = (
-        h1a["datetime"]
+    h1["available_at"] = (
+        h1["datetime"]
         +
         pd.Timedelta(
             hours=1
@@ -1171,19 +971,6 @@ def prepare_backtest_data(
         "breakout_sell"
     ]
 
-    m15a = m15a[
-        ["available_at"]
-        +
-        m15_cols
-    ]
-
-    m15a = m15a.rename(
-        columns={
-            c: f"m15_{c}"
-            for c in m15_cols
-        }
-    )
-
     h1_cols = [
         "close",
         "ema20",
@@ -1200,22 +987,39 @@ def prepare_backtest_data(
         "minus_di"
     ]
 
-    h1a = h1a[
-        ["available_at"]
-        +
-        h1_cols
-    ]
-
-    h1a = h1a.rename(
-        columns={
-            c: f"h1_{c}"
-            for c in h1_cols
-        }
+    m15a = (
+        m15[
+            ["available_at"]
+            +
+            m15_cols
+        ]
+        .rename(
+            columns={
+                c: "m15_" + c
+                for c in m15_cols
+            }
+        )
+        .sort_values(
+            "available_at"
+        )
     )
 
-    # -----------------------------------------------------
-    # M5 signal available after candle closes
-    # -----------------------------------------------------
+    h1a = (
+        h1[
+            ["available_at"]
+            +
+            h1_cols
+        ]
+        .rename(
+            columns={
+                c: "h1_" + c
+                for c in h1_cols
+            }
+        )
+        .sort_values(
+            "available_at"
+        )
+    )
 
     base = m5.copy()
 
@@ -1229,14 +1033,6 @@ def prepare_backtest_data(
 
     base = base.sort_values(
         "signal_time"
-    )
-
-    m15a = m15a.sort_values(
-        "available_at"
-    )
-
-    h1a = h1a.sort_values(
-        "available_at"
     )
 
     merged = pd.merge_asof(
@@ -1266,10 +1062,8 @@ def prepare_backtest_data(
         ]
     )
 
-    return (
-        merged.reset_index(drop=True),
-        m15,
-        h1
+    return merged.reset_index(
+        drop=True
     )
 
 
@@ -1277,36 +1071,37 @@ def prepare_backtest_data(
 # BACKTEST SIGNAL
 # =========================================================
 
-def backtest_signal(row):
+def backtest_signal(
+    row,
+    require_breakout_retest=False
+):
 
-    score5 = score_timeframe(
-        row
-    )
+    s5 = score(row)
 
-    score15 = score_timeframe(
+    s15 = score(
         row,
         "m15_"
     )
 
-    scoreh1 = score_timeframe(
+    sh1 = score(
         row,
         "h1_"
     )
 
-    total_score = (
-        score5
+    total = (
+        s5
         +
-        score15
+        s15
         +
-        scoreh1
+        sh1
     )
 
     buy = (
-        score5 >= 5
+        s5 >= 5
         and
-        score15 >= 5
+        s15 >= 5
         and
-        scoreh1 >= 5
+        sh1 >= 5
         and
         row["m15_adx"] >= 20
         and
@@ -1316,11 +1111,11 @@ def backtest_signal(row):
     )
 
     sell = (
-        score5 <= -5
+        s5 <= -5
         and
-        score15 <= -5
+        s15 <= -5
         and
-        scoreh1 <= -5
+        sh1 <= -5
         and
         row["m15_adx"] >= 20
         and
@@ -1329,57 +1124,147 @@ def backtest_signal(row):
         row["m15_macd"] < 0
     )
 
+    # -----------------------------------------------------
+    # VERSION B
+    # BREAKOUT + RETEST REQUIRED
+    # -----------------------------------------------------
+
+    if require_breakout_retest:
+
+        close = row["m15_close"]
+
+        atr = row["m15_atr"]
+
+        resistance = (
+            row["m15_prev_resistance"]
+        )
+
+        support = (
+            row["m15_prev_support"]
+        )
+
+        buy_breakout = bool(
+            row["m15_breakout_buy"]
+        )
+
+        sell_breakout = bool(
+            row["m15_breakout_sell"]
+        )
+
+        buy_retest = (
+            buy_breakout
+            and
+            np.isfinite(close)
+            and
+            np.isfinite(atr)
+            and
+            np.isfinite(resistance)
+            and
+            close >= resistance
+            and
+            (
+                close - resistance
+            )
+            <=
+            (
+                0.5 * atr
+            )
+        )
+
+        sell_retest = (
+            sell_breakout
+            and
+            np.isfinite(close)
+            and
+            np.isfinite(atr)
+            and
+            np.isfinite(support)
+            and
+            close <= support
+            and
+            (
+                support - close
+            )
+            <=
+            (
+                0.5 * atr
+            )
+        )
+
+        buy = (
+            buy
+            and
+            buy_retest
+        )
+
+        sell = (
+            sell
+            and
+            sell_retest
+        )
+
     if buy:
-        return "BUY", total_score
+
+        return (
+            "BUY",
+            total
+        )
 
     if sell:
-        return "SELL", total_score
 
-    return "WAIT", total_score
+        return (
+            "SELL",
+            total
+        )
+
+    return (
+        "WAIT",
+        total
+    )
 
 
 # =========================================================
 # TRADE SIMULATION
 # =========================================================
 
-def simulate_segment(
+def simulate(
     df,
-    start_idx,
-    end_idx
+    start,
+    end,
+    require_breakout_retest=False
 ):
 
     trades = []
 
-    i = start_idx
+    i = start
 
-    while i < end_idx - 1:
-
-        row = df.iloc[i]
+    while i < end - 1:
 
         signal, total_score = (
-            backtest_signal(row)
+            backtest_signal(
+                df.iloc[i],
+                require_breakout_retest
+            )
         )
 
         if signal == "WAIT":
 
             i += 1
+
             continue
 
-        entry_idx = i + 1
+        entry_i = i + 1
 
-        if entry_idx >= end_idx:
-            break
-
-        entry_row = df.iloc[
-            entry_idx
-        ]
-
-        entry_price = float(
-            entry_row["open"]
+        entry = float(
+            df.iloc[
+                entry_i
+            ]["open"]
         )
 
         atr = float(
-            row["m15_atr"]
+            df.iloc[
+                i
+            ]["m15_atr"]
         )
 
         if (
@@ -1389,6 +1274,7 @@ def simulate_segment(
         ):
 
             i += 1
+
             continue
 
         risk = (
@@ -1398,19 +1284,19 @@ def simulate_segment(
         if signal == "BUY":
 
             sl = (
-                entry_price
+                entry
                 -
                 risk
             )
 
             tp1 = (
-                entry_price
+                entry
                 +
                 1.5 * atr
             )
 
             tp2 = (
-                entry_price
+                entry
                 +
                 2.5 * atr
             )
@@ -1418,44 +1304,40 @@ def simulate_segment(
         else:
 
             sl = (
-                entry_price
+                entry
                 +
                 risk
             )
 
             tp1 = (
-                entry_price
+                entry
                 -
                 1.5 * atr
             )
 
             tp2 = (
-                entry_price
+                entry
                 -
                 2.5 * atr
             )
 
-        exit_idx = None
+        exit_i = None
+
         exit_price = None
+
         result = None
 
-        # -------------------------------------------------
-        # Candle-by-candle execution
-        # -------------------------------------------------
-
         for j in range(
-            entry_idx,
-            end_idx
+            entry_i,
+            end
         ):
 
-            future = df.iloc[j]
-
             high = float(
-                future["high"]
+                df.iloc[j]["high"]
             )
 
             low = float(
-                future["low"]
+                df.iloc[j]["low"]
             )
 
             if signal == "BUY":
@@ -1468,34 +1350,6 @@ def simulate_segment(
                     high >= tp2
                 )
 
-                # Conservative:
-                # SL first if both occur
-                # inside the same candle.
-
-                if hit_sl and hit_tp:
-
-                    exit_idx = j
-                    exit_price = sl
-                    result = "SL"
-
-                    break
-
-                if hit_sl:
-
-                    exit_idx = j
-                    exit_price = sl
-                    result = "SL"
-
-                    break
-
-                if hit_tp:
-
-                    exit_idx = j
-                    exit_price = tp2
-                    result = "TP2"
-
-                    break
-
             else:
 
                 hit_sl = (
@@ -1506,64 +1360,54 @@ def simulate_segment(
                     low <= tp2
                 )
 
-                if hit_sl and hit_tp:
+            # Conservative:
+            # SL assumed first
+            # if both hit on same candle.
 
-                    exit_idx = j
-                    exit_price = sl
-                    result = "SL"
+            if hit_sl:
 
-                    break
+                exit_i = j
 
-                if hit_sl:
+                exit_price = sl
 
-                    exit_idx = j
-                    exit_price = sl
-                    result = "SL"
+                result = "SL"
 
-                    break
+                break
 
-                if hit_tp:
+            if hit_tp:
 
-                    exit_idx = j
-                    exit_price = tp2
-                    result = "TP2"
+                exit_i = j
 
-                    break
+                exit_price = tp2
 
-        # -------------------------------------------------
-        # Close at segment end
-        # -------------------------------------------------
+                result = "TP2"
 
-        if exit_idx is None:
+                break
 
-            exit_idx = (
-                end_idx - 1
-            )
+        if exit_i is None:
+
+            exit_i = end - 1
 
             exit_price = float(
                 df.iloc[
-                    exit_idx
+                    end - 1
                 ]["close"]
             )
 
             result = "END"
 
-        # -------------------------------------------------
-        # R MULTIPLE
-        # -------------------------------------------------
-
         if signal == "BUY":
 
-            r_multiple = (
+            r = (
                 exit_price
                 -
-                entry_price
+                entry
             ) / risk
 
         else:
 
-            r_multiple = (
-                entry_price
+            r = (
+                entry
                 -
                 exit_price
             ) / risk
@@ -1571,53 +1415,21 @@ def simulate_segment(
         trades.append(
             {
                 "direction": signal,
-                "signal_time": row[
-                    "signal_time"
-                ],
-                "entry_time": entry_row[
-                    "datetime"
-                ],
-                "exit_time": df.iloc[
-                    exit_idx
-                ]["datetime"],
-                "entry": round(
-                    entry_price,
-                    3
-                ),
-                "SL": round(
-                    sl,
-                    3
-                ),
-                "TP1": round(
-                    tp1,
-                    3
-                ),
-                "TP2": round(
-                    tp2,
-                    3
-                ),
-                "exit": round(
-                    exit_price,
-                    3
-                ),
+                "signal_time": df.iloc[i]["signal_time"],
+                "entry_time": df.iloc[entry_i]["datetime"],
+                "exit_time": df.iloc[exit_i]["datetime"],
+                "entry": round(entry, 3),
+                "SL": round(sl, 3),
+                "TP1": round(tp1, 3),
+                "TP2": round(tp2, 3),
+                "exit": round(exit_price, 3),
                 "result": result,
-                "R": round(
-                    float(
-                        r_multiple
-                    ),
-                    4
-                ),
+                "R": round(float(r), 4),
                 "score": total_score
             }
         )
 
-        # Prevent overlapping trades
-
-        i = (
-            exit_idx
-            +
-            1
-        )
+        i = exit_i + 1
 
     return pd.DataFrame(
         trades
@@ -1628,7 +1440,7 @@ def simulate_segment(
 # METRICS
 # =========================================================
 
-def calculate_metrics(
+def metrics(
     trades
 ):
 
@@ -1647,35 +1459,30 @@ def calculate_metrics(
             "sell_trades": 0
         }
 
-    r = (
-        trades["R"]
-        .astype(float)
-    )
-
-    wins = int(
-        (r > 0).sum()
-    )
-
-    losses = int(
-        (r < 0).sum()
-    )
-
-    total = len(trades)
-
-    win_rate = (
-        wins
-        /
-        total
-        *
-        100
-    )
+    r = trades[
+        "R"
+    ].astype(float)
 
     gross_profit = (
-        r[r > 0].sum()
+        r[r > 0]
+        .sum()
     )
 
     gross_loss = abs(
-        r[r < 0].sum()
+        r[r < 0]
+        .sum()
+    )
+
+    equity = r.cumsum()
+
+    drawdown = (
+        equity
+        -
+        equity.cummax()
+    )
+
+    max_drawdown = abs(
+        drawdown.min()
     )
 
     if gross_loss > 0:
@@ -1686,39 +1493,38 @@ def calculate_metrics(
             gross_loss
         )
 
+    elif gross_profit > 0:
+
+        profit_factor = np.inf
+
     else:
 
-        profit_factor = (
-            np.inf
-            if gross_profit > 0
-            else 0
-        )
-
-    equity = r.cumsum()
-
-    running_max = (
-        equity.cummax()
-    )
-
-    drawdown = (
-        equity
-        -
-        running_max
-    )
-
-    max_drawdown = abs(
-        drawdown.min()
-    )
+        profit_factor = 0
 
     return {
-        "trades": total,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "total_r": r.sum(),
-        "average_r": r.mean(),
-        "max_drawdown": max_drawdown,
+        "trades": len(trades),
+        "wins": int(
+            (r > 0).sum()
+        ),
+        "losses": int(
+            (r < 0).sum()
+        ),
+        "win_rate": float(
+            (r > 0).mean()
+            * 100
+        ),
+        "profit_factor": float(
+            profit_factor
+        ),
+        "total_r": float(
+            r.sum()
+        ),
+        "average_r": float(
+            r.mean()
+        ),
+        "max_drawdown": float(
+            max_drawdown
+        ),
         "buy_trades": int(
             (
                 trades["direction"]
@@ -1737,95 +1543,100 @@ def calculate_metrics(
 
 
 # =========================================================
-# OOS
+# STRATEGY TEST
 # =========================================================
 
 @st.cache_data(
     ttl=600,
     show_spinner=False
 )
-def run_oos_test(
-    total_bars
+def run_strategy(
+    total_bars,
+    require_breakout_retest=False
 ):
 
-    historical = (
-        get_historical_m5(
-            total_bars
-        )
+    raw = get_historical_m5(
+        total_bars
     )
 
-    if historical.empty:
+    if raw.empty:
+
         return None
 
-    prepared, m15, h1 = (
-        prepare_backtest_data(
-            historical
-        )
+    df = prepare_backtest(
+        raw
     )
 
-    if len(prepared) < 300:
+    if len(df) < 300:
+
         return None
 
-    # -----------------------------------------------------
-    # 70 / 30 chronological split
-    # -----------------------------------------------------
-
-    split_index = int(
-        len(prepared)
+    split = int(
+        len(df)
         *
         0.70
     )
 
-    is_data = (
-        prepared
-        .iloc[:split_index]
-        .copy()
-    )
-
-    oos_data = (
-        prepared
-        .iloc[split_index:]
-        .copy()
-    )
-
-    is_trades = simulate_segment(
-        prepared,
+    is_trades = simulate(
+        df,
         0,
-        split_index
+        split,
+        require_breakout_retest
     )
 
-    oos_trades = simulate_segment(
-        prepared,
-        split_index,
-        len(prepared)
-    )
-
-    is_metrics = (
-        calculate_metrics(
-            is_trades
-        )
-    )
-
-    oos_metrics = (
-        calculate_metrics(
-            oos_trades
-        )
+    oos_trades = simulate(
+        df,
+        split,
+        len(df),
+        require_breakout_retest
     )
 
     return {
-        "historical": historical,
-        "prepared": prepared,
-        "m15": m15,
-        "h1": h1,
-        "is_data": is_data,
-        "oos_data": oos_data,
+        "raw": raw,
+        "df": df,
+        "split_time": df.iloc[
+            split
+        ]["signal_time"],
         "is_trades": is_trades,
         "oos_trades": oos_trades,
-        "is_metrics": is_metrics,
-        "oos_metrics": oos_metrics,
-        "split_time": oos_data[
-            "signal_time"
-        ].iloc[0]
+        "is_metrics": metrics(
+            is_trades
+        ),
+        "oos_metrics": metrics(
+            oos_trades
+        )
+    }
+
+
+@st.cache_data(
+    ttl=600,
+    show_spinner=False
+)
+def run_comparison(
+    total_bars
+):
+
+    current = run_strategy(
+        total_bars,
+        False
+    )
+
+    breakout = run_strategy(
+        total_bars,
+        True
+    )
+
+    if (
+        current is None
+        or
+        breakout is None
+    ):
+
+        return None
+
+    return {
+        "current": current,
+        "breakout": breakout
     }
 
 
@@ -1839,18 +1650,20 @@ st.subheader(
     "📡 التحليل المباشر"
 )
 
-# ---------------------------------------------------------
-# Refresh button
-# ---------------------------------------------------------
-
 if st.button(
     "🔄 تحديث التحليل",
     use_container_width=True
 ):
 
     get_candles.clear()
-    get_live_market_data.clear()
-    live_analysis.clear()
+
+    get_historical_m5.clear()
+
+    live_data.clear()
+
+    run_strategy.clear()
+
+    run_comparison.clear()
 
     st.rerun()
 
@@ -1862,11 +1675,6 @@ if live is None:
 
     st.warning(
         "⚠️ تعذر الحصول على بيانات السوق الحالية."
-    )
-
-    st.info(
-        "إذا ظهر Rate Limit من Twelve Data، "
-        "انتظر دقيقة ثم اضغط تحديث التحليل مرة واحدة."
     )
 
 else:
@@ -1883,80 +1691,68 @@ else:
         f"{live['confidence']}%"
     )
 
-    signal_text = {
+    signal_display = {
         "BUY": "🟢 BUY",
         "SELL": "🔴 SELL",
         "WAIT": "🟡 WAIT"
-    }[
-        live["signal"]
-    ]
+    }
 
     c3.metric(
         "Signal",
-        signal_text
+        signal_display[
+            live["signal"]
+        ]
     )
-
-    # -----------------------------------------------------
-    # Trends
-    # -----------------------------------------------------
 
     st.markdown(
         "### الاتجاهات"
     )
 
-    t1, t2, t3 = st.columns(3)
+    a, b, c = st.columns(3)
 
-    t1.info(
+    a.info(
         f"M5\n\n"
         f"{live['trend5']}\n\n"
         f"Score: {live['score5']}"
     )
 
-    t2.info(
+    b.info(
         f"M15\n\n"
         f"{live['trend15']}\n\n"
         f"Score: {live['score15']}"
     )
 
-    t3.info(
+    c.info(
         f"H1\n\n"
         f"{live['trendh1']}\n\n"
         f"Score: {live['scoreh1']}"
     )
 
-    # -----------------------------------------------------
-    # Levels
-    # -----------------------------------------------------
-
     st.markdown(
         "### المستويات"
     )
 
-    l1, l2, l3, l4 = st.columns(4)
+    a, b, c, d = st.columns(4)
 
-    l1.metric(
+    a.metric(
         "Support M15",
         f"{live['support']:,.2f}"
     )
 
-    l2.metric(
+    b.metric(
         "Resistance M15",
         f"{live['resistance']:,.2f}"
     )
 
-    l3.metric(
+    c.metric(
         "ATR M15",
         f"{live['atr']:,.2f}"
     )
 
-    l4.metric(
+    d.metric(
         "Breakout / Retest",
         live["breakout"]
     )
-
-    # -----------------------------------------------------
-    # Trade levels
-    # -----------------------------------------------------
 
     if live["signal"] != "WAIT":
 
@@ -1964,21 +1760,21 @@ else:
             "### 🎯 مستويات الصفقة"
         )
 
-        p1, p2, p3 = st.columns(3)
+        a, b, c = st.columns(3)
 
-        p1.metric(
+        a.metric(
             "SL",
             f"{live['sl']:,.2f}"
         )
 
-        p2.metric(
+        b.metric(
             "TP1",
             f"{live['tp1']:,.2f}"
         )
 
-        p3.metric(
+        c.metric(
             "TP2",
-            f"{live['tp2']:,.2f}"
+            f"{live['tp2']:,.2f"
         )
 
     else:
@@ -1987,82 +1783,82 @@ else:
             "⛔ لم تتحقق شروط الدخول الكاملة."
         )
 
-    # -----------------------------------------------------
-    # M15 indicators
-    # -----------------------------------------------------
-
     st.markdown(
-        "### المؤشرات M15"
-    )
-
-    ind = pd.DataFrame(
-        {
-            "المؤشر": [
-                "RSI",
-                "ADX",
-                "MACD",
-                "ATR",
-                "Momentum"
-            ],
-            "القيمة": [
-                round(
-                    live["rsi"],
-                    3
-                ),
-                round(
-                    live["adx"],
-                    3
-                ),
-                round(
-                    live["macd"],
-                    3
-                ),
-                round(
-                    live["atr"],
-                    3
-                ),
-                round(
-                    live["m15"][
-                        "momentum"
-                    ].iloc[-1],
-                    3
-                )
-            ]
-        }
+        "### مؤشرات M15"
     )
 
     st.dataframe(
-        ind,
+        pd.DataFrame(
+            {
+                "المؤشر": [
+                    "RSI",
+                    "ADX",
+                    "MACD",
+                    "ATR",
+                    "Momentum"
+                ],
+                "القيمة": [
+                    round(
+                        live["rsi"],
+                        3
+                    ),
+                    round(
+                        live["adx"],
+                        3
+                    ),
+                    round(
+                        live["macd"],
+                        3
+                    ),
+                    round(
+                        live["atr"],
+                        3
+                    ),
+                    round(
+                        live["m15"]
+                        ["momentum"]
+                        .iloc[-1],
+                        3
+                    )
+                ]
+            }
+        ),
         use_container_width=True,
         hide_index=True
     )
 
 
 # =========================================================
-# BACKTEST
+# OOS COMPARISON
 # =========================================================
 
 st.divider()
 
 st.subheader(
-    "📊 Backtest + Out-of-Sample"
+    "📊 مقارنة الاستراتيجيتين — OOS"
 )
 
 st.write(
     """
-الاختبار يستخدم البيانات التاريخية زمنيًا:
-70% In-Sample و30% Out-of-Sample.
-الإشارة تُحسب عند إغلاق M5، والدخول يتم من افتتاح الشمعة التالية.
+A = الاستراتيجية الحالية.
+
+B = نفس الاستراتيجية مع اشتراط
+Breakout + Retest.
+
+كلاهما يستخدم نفس البيانات
+ونفس تقسيم 70% In-Sample
+و30% Out-of-Sample.
 """
 )
 
 st.caption(
-    "Confidence = قوة توافق المؤشرات، وليس احتمال ربح."
+    "الدخول عند افتتاح شمعة M5 التالية بعد إغلاق شمعة الإشارة. "
+    "Confidence ليس احتمال ربح."
 )
 
-bars_option = st.selectbox(
+bars = st.selectbox(
     "حجم البيانات التاريخية",
-    options=[
+    [
         5000,
         10000,
         15000,
@@ -2073,427 +1869,316 @@ bars_option = st.selectbox(
         f"{x:,} شمعة M5"
 )
 
-st.caption(
-    "زيادة البيانات تعني فترة تاريخية أطول وقد تتطلب عدة طلبات من Twelve Data."
-)
-
-run_test = st.button(
-    "🚀 تشغيل اختبار OOS",
+if st.button(
+    "🚀 تشغيل المقارنة",
     use_container_width=True
-)
-
-if run_test:
+):
 
     with st.spinner(
-        "جاري تحميل البيانات وتشغيل الاختبار..."
+        "جاري تحميل البيانات وتشغيل النسختين..."
     ):
 
-        result = run_oos_test(
-            bars_option
+        result = run_comparison(
+            bars
         )
 
     if result is None:
 
         st.error(
-            "لم تتوفر بيانات تاريخية كافية لإجراء الاختبار."
+            "لم تتوفر بيانات تاريخية كافية."
         )
 
     else:
 
-        historical = (
-            result["historical"]
-        )
+        A = result["current"]
 
-        is_metrics = (
-            result["is_metrics"]
-        )
+        B = result["breakout"]
 
-        oos_metrics = (
-            result["oos_metrics"]
-        )
+        raw = A["raw"]
 
         st.success(
-            "تم تشغيل الاختبار بنجاح."
-        )
-
-        start_date = (
-            historical[
-                "datetime"
-            ].min()
-        )
-
-        end_date = (
-            historical[
-                "datetime"
-            ].max()
+            "تم تشغيل النسختين على نفس البيانات."
         )
 
         st.info(
-            f"الفترة المستخدمة: "
-            f"{start_date} → {end_date}"
+            f"الفترة: "
+            f"{raw['datetime'].min()} "
+            f"→ "
+            f"{raw['datetime'].max()}"
         )
 
         st.info(
-            f"نقطة فصل OOS: "
-            f"{result['split_time']}"
+            f"فصل OOS: "
+            f"{A['split_time']}"
         )
 
-        # =================================================
-        # IS
-        # =================================================
+        def comparison_table(
+            metric_a,
+            metric_b
+        ):
 
-        st.markdown(
-            "## 🧪 In-Sample — 70%"
-        )
-
-        a, b, c, d = st.columns(4)
-
-        a.metric(
-            "Trades",
-            is_metrics["trades"]
-        )
-
-        b.metric(
-            "Win Rate",
-            f"{is_metrics['win_rate']:.1f}%"
-        )
-
-        c.metric(
-            "Profit Factor",
-            (
-                f"{is_metrics['profit_factor']:.2f}"
-                if np.isfinite(
-                    is_metrics[
-                        "profit_factor"
-                    ]
-                )
-                else "∞"
-            )
-        )
-
-        d.metric(
-            "Total R",
-            f"{is_metrics['total_r']:.2f}R"
-        )
-
-        e, f, g, h = st.columns(4)
-
-        e.metric(
-            "Average R",
-            f"{is_metrics['average_r']:.3f}R"
-        )
-
-        f.metric(
-            "Max Drawdown",
-            f"{is_metrics['max_drawdown']:.2f}R"
-        )
-
-        g.metric(
-            "BUY",
-            is_metrics["buy_trades"]
-        )
-
-        h.metric(
-            "SELL",
-            is_metrics["sell_trades"]
-        )
-
-        # =================================================
-        # OOS
-        # =================================================
-
-        st.markdown(
-            "## 🔬 Out-of-Sample — 30%"
-        )
-
-        a, b, c, d = st.columns(4)
-
-        a.metric(
-            "Trades",
-            oos_metrics["trades"]
-        )
-
-        b.metric(
-            "Win Rate",
-            f"{oos_metrics['win_rate']:.1f}%"
-        )
-
-        c.metric(
-            "Profit Factor",
-            (
-                f"{oos_metrics['profit_factor']:.2f}"
-                if np.isfinite(
-                    oos_metrics[
-                        "profit_factor"
-                    ]
-                )
-                else "∞"
-            )
-        )
-
-        d.metric(
-            "Total R",
-            f"{oos_metrics['total_r']:.2f}R"
-        )
-
-        e, f, g, h = st.columns(4)
-
-        e.metric(
-            "Average R",
-            f"{oos_metrics['average_r']:.3f}R"
-        )
-
-        f.metric(
-            "Max Drawdown",
-            f"{oos_metrics['max_drawdown']:.2f}R"
-        )
-
-        g.metric(
-            "BUY",
-            oos_metrics["buy_trades"]
-        )
-
-        h.metric(
-            "SELL",
-            oos_metrics["sell_trades"]
-        )
-
-        # =================================================
-        # COMPARISON
-        # =================================================
-
-        st.markdown(
-            "## ⚖️ مقارنة IS / OOS"
-        )
-
-        comparison = pd.DataFrame(
-            {
-                "المقياس": [
-                    "عدد الصفقات",
-                    "Win Rate %",
-                    "Profit Factor",
-                    "Total R",
-                    "Average R",
-                    "Max Drawdown R",
-                    "BUY",
-                    "SELL"
-                ],
-                "In-Sample": [
-                    is_metrics[
-                        "trades"
+            return pd.DataFrame(
+                {
+                    "المقياس": [
+                        "عدد الصفقات",
+                        "Win Rate",
+                        "Profit Factor",
+                        "Total R",
+                        "Average R",
+                        "Max Drawdown",
+                        "BUY",
+                        "SELL"
                     ],
-                    round(
-                        is_metrics[
-                            "win_rate"
+
+                    "A — الحالية": [
+                        metric_a[
+                            "trades"
                         ],
-                        2
-                    ),
-                    (
+
                         round(
-                            is_metrics[
-                                "profit_factor"
+                            metric_a[
+                                "win_rate"
+                            ],
+                            2
+                        ),
+
+                        (
+                            round(
+                                metric_a[
+                                    "profit_factor"
+                                ],
+                                3
+                            )
+                            if np.isfinite(
+                                metric_a[
+                                    "profit_factor"
+                                ]
+                            )
+                            else "∞"
+                        ),
+
+                        round(
+                            metric_a[
+                                "total_r"
                             ],
                             3
-                        )
-                        if np.isfinite(
-                            is_metrics[
-                                "profit_factor"
-                            ]
-                        )
-                        else "∞"
-                    ),
-                    round(
-                        is_metrics[
-                            "total_r"
-                        ],
-                        3
-                    ),
-                    round(
-                        is_metrics[
-                            "average_r"
-                        ],
-                        3
-                    ),
-                    round(
-                        is_metrics[
-                            "max_drawdown"
-                        ],
-                        3
-                    ),
-                    is_metrics[
-                        "buy_trades"
-                    ],
-                    is_metrics[
-                        "sell_trades"
-                    ]
-                ],
-                "Out-of-Sample": [
-                    oos_metrics[
-                        "trades"
-                    ],
-                    round(
-                        oos_metrics[
-                            "win_rate"
-                        ],
-                        2
-                    ),
-                    (
+                        ),
+
                         round(
-                            oos_metrics[
-                                "profit_factor"
+                            metric_a[
+                                "average_r"
                             ],
                             3
-                        )
-                        if np.isfinite(
-                            oos_metrics[
-                                "profit_factor"
-                            ]
-                        )
-                        else "∞"
-                    ),
-                    round(
-                        oos_metrics[
-                            "total_r"
+                        ),
+
+                        round(
+                            metric_a[
+                                "max_drawdown"
+                            ],
+                            3
+                        ),
+
+                        metric_a[
+                            "buy_trades"
                         ],
-                        3
-                    ),
-                    round(
-                        oos_metrics[
-                            "average_r"
-                        ],
-                        3
-                    ),
-                    round(
-                        oos_metrics[
-                            "max_drawdown"
-                        ],
-                        3
-                    ),
-                    oos_metrics[
-                        "buy_trades"
+
+                        metric_a[
+                            "sell_trades"
+                        ]
                     ],
-                    oos_metrics[
-                        "sell_trades"
+
+                    "B — Breakout + Retest": [
+                        metric_b[
+                            "trades"
+                        ],
+
+                        round(
+                            metric_b[
+                                "win_rate"
+                            ],
+                            2
+                        ),
+
+                        (
+                            round(
+                                metric_b[
+                                    "profit_factor"
+                                ],
+                                3
+                            )
+                            if np.isfinite(
+                                metric_b[
+                                    "profit_factor"
+                                ]
+                            )
+                            else "∞"
+                        ),
+
+                        round(
+                            metric_b[
+                                "total_r"
+                            ],
+                            3
+                        ),
+
+                        round(
+                            metric_b[
+                                "average_r"
+                            ],
+                            3
+                        ),
+
+                        round(
+                            metric_b[
+                                "max_drawdown"
+                            ],
+                            3
+                        ),
+
+                        metric_b[
+                            "buy_trades"
+                        ],
+
+                        metric_b[
+                            "sell_trades"
+                        ]
                     ]
-                ]
-            }
+                }
+            )
+
+        st.markdown(
+            "## 🔬 Out-of-Sample — المقارنة الأساسية"
         )
 
         st.dataframe(
-            comparison,
+            comparison_table(
+                A["oos_metrics"],
+                B["oos_metrics"]
+            ),
             use_container_width=True,
             hide_index=True
         )
 
-        # =================================================
-        # OOS EQUITY
-        # =================================================
+        st.markdown(
+            "## 🧪 In-Sample — للمقارنة فقط"
+        )
 
-        if not result[
-            "oos_trades"
-        ].empty:
+        st.dataframe(
+            comparison_table(
+                A["is_metrics"],
+                B["is_metrics"]
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Equity curves
+
+        curves = []
+
+        for label, item in [
+            (
+                "A — الحالية",
+                A
+            ),
+            (
+                "B — Breakout + Retest",
+                B
+            )
+        ]:
+
+            trades = item[
+                "oos_trades"
+            ]
+
+            if not trades.empty:
+
+                curve = trades[
+                    [
+                        "exit_time",
+                        "R"
+                    ]
+                ].copy()
+
+                curve[
+                    "Equity R"
+                ] = curve[
+                    "R"
+                ].cumsum()
+
+                curve = (
+                    curve
+                    .set_index(
+                        "exit_time"
+                    )[
+                        ["Equity R"]
+                    ]
+                    .rename(
+                        columns={
+                            "Equity R":
+                            label
+                        }
+                    )
+                )
+
+                curves.append(
+                    curve
+                )
+
+        if curves:
 
             st.markdown(
-                "## 📈 منحنى OOS Equity"
-            )
-
-            equity = result[
-                "oos_trades"
-            ][
-                [
-                    "exit_time",
-                    "R"
-                ]
-            ].copy()
-
-            equity[
-                "Equity R"
-            ] = (
-                equity["R"]
-                .cumsum()
-            )
-
-            equity = (
-                equity
-                .set_index(
-                    "exit_time"
-                )[
-                    [
-                        "Equity R"
-                    ]
-                ]
+                "## 📈 منحنى OOS"
             )
 
             st.line_chart(
-                equity
+                pd.concat(
+                    curves,
+                    axis=1
+                ).ffill()
             )
 
-        # =================================================
-        # OOS TRADES
-        # =================================================
-
-        st.markdown(
-            "## 📋 صفقات Out-of-Sample"
-        )
-
-        if result[
-            "oos_trades"
-        ].empty:
-
-            st.warning(
-                "لم تظهر أي صفقات في فترة OOS."
-            )
-
-        else:
-
-            display_trades = (
-                result[
-                    "oos_trades"
-                ].copy()
-            )
-
-            display_trades[
-                "R"
-            ] = (
-                display_trades[
-                    "R"
-                ].round(3)
-            )
+        with st.expander(
+            "📋 صفقات OOS — A الحالية"
+        ):
 
             st.dataframe(
-                display_trades,
+                A["oos_trades"],
                 use_container_width=True,
                 hide_index=True
             )
 
-        # =================================================
-        # SAMPLE SIZE
-        # =================================================
-
-        if (
-            oos_metrics[
-                "trades"
-            ]
-            <
-            30
+        with st.expander(
+            "📋 صفقات OOS — B Breakout + Retest"
         ):
 
-            st.warning(
-                "⚠️ عدد صفقات OOS أقل من 30. "
-                "العينة صغيرة جدًا للتحليل الإحصائي."
+            st.dataframe(
+                B["oos_trades"],
+                use_container_width=True,
+                hide_index=True
             )
 
-        elif (
-            oos_metrics[
+        maximum_oos_trades = max(
+            A["oos_metrics"][
+                "trades"
+            ],
+            B["oos_metrics"][
                 "trades"
             ]
-            <
-            100
-        ):
+        )
+
+        if maximum_oos_trades < 30:
 
             st.warning(
-                "⚠️ عدد صفقات OOS بين 30 و99. "
-                "النتيجة مبدئية وتحتاج عينة تاريخية أكبر."
+                "⚠️ عينة OOS أقل من 30 صفقة؛ "
+                "صغيرة جدًا."
+            )
+
+        elif maximum_oos_trades < 100:
+
+            st.warning(
+                "⚠️ عينة OOS بين 30 و99 صفقة؛ "
+                "النتيجة مبدئية وتحتاج بيانات أطول."
             )
 
         else:
@@ -2502,18 +2187,20 @@ if run_test:
                 "حجم عينة OOS تجاوز 100 صفقة."
             )
 
-        # =================================================
-        # COST WARNING
-        # =================================================
-
         st.warning(
-            "هذا الاختبار لا يتضمن Spread أو Slippage أو Commission. "
-            "لذلك لا يمثل صافي الربح الفعلي القابل للتنفيذ."
+            "لا يوجد Spread أو Slippage أو Commission "
+            "في هذا الاختبار، لذلك لا يمثل صافي الربح الفعلي."
         )
 
         st.info(
-            "Breakout/Retest يتم حسابه وعرضه حاليًا، "
-            "لكنه ليس شرط دخول إلزاميًا في الاستراتيجية الحالية."
+            "تعريف B محافظ: يجب أن يحدث كسر لمستوى "
+            "M15 السابق مع إغلاق السعر قرب المستوى "
+            "ضمن 0.5 ATR مع تحقق شروط الاتجاه نفسها."
+        )
+
+        st.info(
+            "لا نستخدم OOS لتحسين المعلمات؛ "
+            "المقارنة اختبار فرضية فقط."
         )
 
 
@@ -2524,7 +2211,8 @@ if run_test:
 st.divider()
 
 st.success(
-    "🟢 PAPER TRADING ONLY — لا يتم إرسال أي أمر شراء أو بيع حقيقي."
+    "🟢 PAPER TRADING ONLY — "
+    "لا يتم إرسال أي أمر شراء أو بيع حقيقي."
 )
 
 st.caption(
