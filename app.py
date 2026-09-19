@@ -11,7 +11,7 @@ import streamlit as st
 
 # ============================================================
 # GOLD AI — XAU/USD Smart Paper Trading
-# Clean single-file research / paper-trading application • v1.4.
+# Clean single-file research / paper-trading application • v1.6.
 # No live broker execution is implemented.
 # ============================================================
 
