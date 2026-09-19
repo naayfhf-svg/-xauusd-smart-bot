@@ -11,7 +11,7 @@ import streamlit as st
 
 # ============================================================
 # GOLD AI — XAU/USD Smart Paper Trading
-# Clean single-file research / paper-trading application • v1.6.
+# Clean single-file research / paper-trading application • v1.8.
 # No live broker execution is implemented.
 # ============================================================
 
@@ -38,7 +38,7 @@ NEWS_SECRET = "NEWS_API_URL"
 API_SECRET = "TWELVE_DATA_API_KEY"
 
 M5_CHUNK_SIZE = 5000
-M5_CHUNKS = 4
+M5_CHUNKS = 8
 
 # --------------------------- UI theme -------------------------
 st.markdown(
@@ -97,6 +97,7 @@ def init_state():
         "kill_switch": False,
         "research_mode": False,
         "auto_refresh": False,
+        "paper_enabled": False,
         "last_signal_candle": None,
         "last_price": np.nan,
     }
@@ -692,7 +693,8 @@ def prepare_mtf_backtest(raw, as_of=None):
     h4 = add_indicators(resample_closed(raw, "4h", as_of=as_of)).dropna().reset_index(drop=True)
 
     if min(len(m5), len(m15), len(h1), len(h4)) < 250:
-        return None, "بيانات غير كافية لاختبار MTF"
+        detail = f"M5={len(m5)} • M15={len(m15)} • H1={len(h1)} • H4={len(h4)}"
+        return None, "بيانات غير كافية لاختبار MTF • " + detail
 
     m5["decision_ts"] = m5["datetime"] + pd.Timedelta(minutes=5)
     prepared = m5[["datetime", "decision_ts", "open", "high", "low", "close", "atr", "rsi", "macd_hist", "momentum", "adx", "ema20", "ema50", "ema100"]].copy()
@@ -1184,11 +1186,11 @@ if st.session_state.last_signal_candle != closed_candle_id:
     st.session_state.decisions.insert(0, decision)
     st.session_state.decisions = st.session_state.decisions[:500]
 
-if analysis["signal"] in ("شراء", "بيع") and st.session_state.position is None:
+if st.session_state.paper_enabled and analysis["signal"] in ("شراء", "بيع") and st.session_state.position is None:
     open_trade(analysis["signal"], reference_price, analysis["snapshots"]["M5"]["atr"], analysis["spread"])
 
 # ---------------------------- dashboard -----------------------
-st.caption("Paper Trading فقط • لا يوجد تنفيذ لدى وسيط • الحالة محفوظة داخل جلسة Streamlit")
+st.caption("Paper Trading فقط • لا يوجد تنفيذ لدى وسيط • الحالة محفوظة داخل جلسة Streamlit • Paper Trading متوقف افتراضيًا")
 st.markdown(
     f"<div class='hero'><div class='kicker'>GOLD AI • SMART TRADING SYSTEM</div><h1 class='gold'>XAU/USD</h1><div class='price'>${reference_price:,.2f}</div><p class='muted'>Market Data • Strategy Engine • Risk Engine • Paper Engine</p></div>",
     unsafe_allow_html=True,
@@ -1242,6 +1244,20 @@ st.subheader("Market")
 st.line_chart(raw.tail(300).set_index("datetime")[["close"]], use_container_width=True)
 
 st.subheader("Paper Trading")
+control_left, control_right = st.columns(2)
+with control_left:
+    if st.session_state.paper_enabled:
+        if st.button("إيقاف Paper Trading", use_container_width=True):
+            st.session_state.paper_enabled = False
+            st.rerun()
+    else:
+        if st.button("تشغيل Paper Trading", use_container_width=True):
+            st.session_state.paper_enabled = True
+            st.rerun()
+with control_right:
+    st.metric("الحالة", "RUNNING" if st.session_state.paper_enabled else "STOPPED")
+
+st.caption("التشغيل الورقي آلي فقط عند اكتمال جميع بوابات الاستراتيجية. لا يوجد تنفيذ لدى وسيط.")
 position = st.session_state.position
 if position:
     current_r = unrealized_r(position, mark)
