@@ -1773,8 +1773,9 @@ else:
         )
 
         c.metric(
-            "TP2",
-            f"{live['tp2']:,.2f"
+    "TP2",
+    f"{live['tp2']:,.2f}"
+)
         )
 
     else:
