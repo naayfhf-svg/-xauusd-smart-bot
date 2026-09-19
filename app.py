@@ -697,7 +697,7 @@ def prepare_mtf_backtest(raw):
     return prepared, None
 
 
-def backtest_mtf(raw, oos_fraction=0.30):
+def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=0.0):
     base, error = prepare_mtf_backtest(raw)
     if base is None:
         return pd.DataFrame(), {"trades": 0, "warning": error}
@@ -811,6 +811,12 @@ def backtest_mtf(raw, oos_fraction=0.30):
                     break
 
         if outcome is not None:
+            # Historical cost model: subtract a user-defined round-trip price cost
+            # plus two-sided slippage from the trade outcome in R. This is an
+            # assumption, not broker-reported historical spread.
+            total_cost = max(0.0, float(round_trip_cost)) + 2.0 * max(0.0, float(slippage_per_side))
+            cost_r = total_cost / distance if distance > 0 else 0.0
+            outcome_after_cost = float(outcome) - cost_r
             trades.append({
                 "الوقت": current.datetime,
                 "النوع": side,
@@ -818,7 +824,8 @@ def backtest_mtf(raw, oos_fraction=0.30):
                 "الوقف": round(entry - distance if side == "شراء" else entry + distance, 2),
                 "TP1": round(tp1, 2),
                 "TP2": round(tp2, 2),
-                "R": round(float(outcome), 3),
+                "R": round(outcome_after_cost, 3),
+                "تكلفة_السعر_R": round(cost_r, 4),
                 "السبب": reason,
                 "OOS": True,
             })
@@ -833,10 +840,17 @@ def backtest_mtf(raw, oos_fraction=0.30):
     equity = 0.0
     peak = 0.0
     max_dd = 0.0
+    equity_curve = []
+    drawdown_curve = []
     for value in result["R"]:
         equity += float(value)
         peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
+        dd = peak - equity
+        max_dd = max(max_dd, dd)
+        equity_curve.append(equity)
+        drawdown_curve.append(dd)
+    result["Equity_R"] = equity_curve
+    result["Drawdown_R"] = drawdown_curve
 
     gross_win = result.loc[result["R"] > 0, "R"].sum()
     gross_loss = abs(result.loc[result["R"] < 0, "R"].sum())
@@ -850,6 +864,59 @@ def backtest_mtf(raw, oos_fraction=0.30):
         "max_dd_r": float(max_dd),
         "warning": "العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result) < 100 else None,
         "oos_start": str(split_ts),
+        "avg_cost_r": float(result["تكلفة_السعر_R"].mean()),
+        "equity_curve": equity_curve,
+        "drawdown_curve": drawdown_curve,
+    }
+
+
+def walk_forward_mtf(raw, windows=4, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=0.0):
+    """Rolling OOS diagnostic. No parameter optimization is performed here.
+    Each window is evaluated independently so results show stability across time.
+    """
+    if raw is None or raw.empty or windows < 2:
+        return pd.DataFrame(), {"windows": 0, "warning": "بيانات غير كافية"}
+    n = len(raw)
+    window_size = max(1000, n // windows)
+    rows = []
+    all_trades = []
+    for w in range(windows):
+        start = w * window_size
+        end = min(n, start + window_size)
+        if end - start < 1000:
+            continue
+        chunk = raw.iloc[start:end].copy()
+        trades, stats = backtest_mtf(chunk, oos_fraction=oos_fraction, round_trip_cost=round_trip_cost, slippage_per_side=slippage_per_side)
+        if not trades.empty:
+            trades = trades.copy()
+            trades["WF_Window"] = w + 1
+            all_trades.append(trades)
+        rows.append({
+            "Window": w + 1,
+            "Trades": int(stats.get("trades", 0)),
+            "Win Rate %": round(float(stats.get("win_rate", 0.0)), 2),
+            "Profit Factor": round(float(stats.get("profit_factor", 0.0)), 3) if math.isfinite(float(stats.get("profit_factor", 0.0))) else None,
+            "Total R": round(float(stats.get("total_r", 0.0)), 3),
+            "Max DD R": round(float(stats.get("max_dd_r", 0.0)), 3),
+        })
+    wf = pd.DataFrame(rows)
+    combined = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    if combined.empty:
+        return wf, {"windows": len(wf), "trades": 0, "warning": "لا توجد صفقات OOS في نوافذ Walk-Forward"}
+    gross_win = combined.loc[combined["R"] > 0, "R"].sum()
+    gross_loss = abs(combined.loc[combined["R"] < 0, "R"].sum())
+    pf = gross_win / gross_loss if gross_loss else math.inf
+    eq = combined["R"].cumsum()
+    dd = eq.cummax() - eq
+    return wf, {
+        "windows": len(wf),
+        "trades": len(combined),
+        "win_rate": float((combined["R"] > 0).mean() * 100),
+        "profit_factor": float(pf),
+        "total_r": float(combined["R"].sum()),
+        "max_dd_r": float(dd.max()),
+        "combined_trades": combined,
+        "warning": "Walk-Forward تشخيص استقرار وليس إثباتاً للربحية" if len(combined) < 100 else None,
     }
 
 # ---------------------- deterministic tests ------------------
@@ -1044,7 +1111,9 @@ with st.expander("تشغيل OOS MTF Backtest"):
     else:
         bars = st.slider("عدد شموع M15 التقريبي", 500, max_m15, min(3000, max_m15), 100)
         raw_window = raw.tail(min(len(raw), bars * 3))
-        trades, stats = backtest_mtf(raw_window)
+        cost = st.number_input("تكلفة السبريد التاريخية المفترضة (دولار/وحدة سعر)", min_value=0.0, max_value=5.0, value=0.0, step=0.05, help="ليست بيانات سبريد فعلية من الوسيط؛ استخدمها فقط كافتراض محافظ.")
+        slip = st.number_input("Slippage لكل جانب (دولار/وحدة سعر)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        trades, stats = backtest_mtf(raw_window, round_trip_cost=cost, slippage_per_side=slip)
         if stats["trades"]:
             metrics([
                 ("OOS Trades", stats["trades"]),
@@ -1053,10 +1122,19 @@ with st.expander("تشغيل OOS MTF Backtest"):
                 ("Total R", f"{stats['total_r']:.2f}R"),
                 ("Max DD", f"{stats['max_dd_r']:.2f}R"),
             ])
-            st.caption("OOS فقط • M5 + M15/H1/H4 مغلقة + B2 + Momentum/ADX. الأخبار والسبريد التاريخيان غير متاحين لذلك لا يدخلان في نتيجة الاختبار.")
+            st.caption("OOS فقط • M5 + M15/H1/H4 مغلقة + B2 + Momentum/ADX. تكاليف السبريد/slippage هنا افتراضات يحددها المستخدم وليست بيانات تاريخية من الوسيط.")
             if stats.get("warning"):
                 st.warning(stats["warning"])
+            if stats.get("equity_curve"):
+                st.line_chart(pd.DataFrame({"Equity R": stats["equity_curve"], "Drawdown R": stats["drawdown_curve"]}))
             st.dataframe(trades.tail(100), hide_index=True, use_container_width=True)
+            st.markdown("### Walk-Forward")
+            wf, wf_stats = walk_forward_mtf(raw_window, windows=4, round_trip_cost=cost, slippage_per_side=slip)
+            if not wf.empty:
+                st.dataframe(wf, hide_index=True, use_container_width=True)
+                metrics([("WF Trades", wf_stats.get("trades", 0)), ("WF Win Rate", f"{wf_stats.get('win_rate', 0):.1f}%"), ("WF PF", f"{wf_stats.get('profit_factor', 0):.2f}"), ("WF Total R", f"{wf_stats.get('total_r', 0):.2f}R"), ("WF Max DD", f"{wf_stats.get('max_dd_r', 0):.2f}R")])
+                if wf_stats.get("warning"):
+                    st.warning(wf_stats["warning"])
         else:
             st.warning(stats.get("warning", "لا توجد نتائج"))
 
