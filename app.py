@@ -38,7 +38,7 @@ NEWS_SECRET = "NEWS_API_URL"
 API_SECRET = "TWELVE_DATA_API_KEY"
 
 M5_CHUNK_SIZE = 5000
-M5_CHUNKS = 8
+M5_CHUNKS = 12
 
 # --------------------------- UI theme -------------------------
 st.markdown(
@@ -692,7 +692,11 @@ def prepare_mtf_backtest(raw, as_of=None):
     h1 = add_indicators(resample_closed(raw, "1h", as_of=as_of)).dropna().reset_index(drop=True)
     h4 = add_indicators(resample_closed(raw, "4h", as_of=as_of)).dropna().reset_index(drop=True)
 
-    if min(len(m5), len(m15), len(h1), len(h4)) < 250:
+    # H4 is the hard MTF gate. 80 closed H4 bars is enough to build the
+    # indicator state; smaller samples are blocked because the OOS test would
+    # be dominated by warm-up/no-trade conditions. A separate warning is
+    # shown later when the sample is still small for statistical confidence.
+    if min(len(m5), len(m15), len(h1)) < 250 or len(h4) < 80:
         detail = f"M5={len(m5)} • M15={len(m15)} • H1={len(h1)} • H4={len(h4)}"
         return None, "بيانات غير كافية لاختبار MTF • " + detail
 
@@ -1288,37 +1292,44 @@ metrics([
 ])
 
 st.subheader("Backtest Lab")
-with st.expander("تشغيل OOS MTF Backtest"):
+with st.expander("تشغيل OOS MTF Backtest", expanded=True):
     max_m15 = len(m15)
     if max_m15 < 500:
         st.warning("بيانات M15 الحالية لا تكفي")
     else:
         bars = st.slider("عدد شموع M15 التقريبي", 500, max_m15, min(3000, max_m15), 100)
-        raw_window = raw.tail(min(len(raw), bars * 3))
         cost = st.number_input("تكلفة السبريد التاريخية المفترضة (دولار/وحدة سعر)", min_value=0.0, max_value=5.0, value=0.0, step=0.05, help="ليست بيانات سبريد فعلية من الوسيط؛ استخدمها فقط كافتراض محافظ.")
         slip = st.number_input("Slippage لكل جانب (دولار/وحدة سعر)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        trades, stats = backtest_mtf(raw_window, spread_per_round_trip=cost, slippage_per_side=slip)
-        if stats["trades"]:
-            metrics([
-                ("OOS Trades", stats["trades"]),
-                ("Win Rate", f"{stats['win_rate']:.1f}%"),
-                ("Profit Factor", f"{stats['profit_factor']:.2f}"),
-                ("Total R", f"{stats['total_r']:.2f}R"),
-                ("Max DD", f"{stats['max_dd_r']:.2f}R"),
-            ])
-            st.caption("OOS فقط • M5 + M15/H1/H4 مغلقة + B2 + Momentum/ADX. تكاليف السبريد/slippage هنا افتراضات يحددها المستخدم وليست بيانات تاريخية من الوسيط.")
-            if stats.get("warning"):
-                st.warning(stats["warning"])
-            if stats.get("equity_curve"):
-                st.line_chart(pd.DataFrame({"Equity R": stats["equity_curve"], "Drawdown R": stats["drawdown_curve"]}))
-            st.dataframe(trades.tail(100), hide_index=True, use_container_width=True)
-            st.markdown("### Walk-Forward")
-            wf, wf_stats = walk_forward_mtf(raw_window, windows=4, spread_per_round_trip=cost, slippage_per_side=slip)
-            if not wf.empty:
-                st.dataframe(wf, hide_index=True, use_container_width=True)
-                metrics([("WF Trades", wf_stats.get("trades", 0)), ("WF Win Rate", f"{wf_stats.get('win_rate', 0):.1f}%"), ("WF PF", f"{wf_stats.get('profit_factor', 0):.2f}"), ("WF Total R", f"{wf_stats.get('total_r', 0):.2f}R"), ("WF Max DD", f"{wf_stats.get('max_dd_r', 0):.2f}R")])
-                if wf_stats.get("warning"):
-                    st.warning(wf_stats["warning"])
+        if st.button("▶ تشغيل Backtest", use_container_width=True, type="primary"):
+            raw_window = raw.tail(min(len(raw), bars * 3)).copy()
+            with st.spinner("جاري تشغيل اختبار MTF على البيانات المغلقة..."):
+                trades, stats = backtest_mtf(raw_window, spread_per_round_trip=cost, slippage_per_side=slip)
+                st.session_state.backtest_result = {"trades": trades, "stats": stats, "raw_window": raw_window, "cost": cost, "slip": slip}
+
+        result = st.session_state.get("backtest_result")
+        if result:
+            trades, stats = result["trades"], result["stats"]
+            if stats.get("trades"):
+                metrics([
+                    ("OOS Trades", stats["trades"]),
+                    ("Win Rate", f"{stats['win_rate']:.1f}%"),
+                    ("Profit Factor", f"{stats['profit_factor']:.2f}"),
+                    ("Total R", f"{stats['total_r']:.2f}R"),
+                    ("Max DD", f"{stats['max_dd_r']:.2f}R"),
+                ])
+                st.caption("OOS فقط • M5 + M15/H1/H4 مغلقة + B2 + Momentum/ADX. تكاليف السبريد/slippage هنا افتراضات يحددها المستخدم وليست بيانات تاريخية من الوسيط.")
+                if stats.get("warning"):
+                    st.warning(stats["warning"])
+                if stats.get("equity_curve"):
+                    st.line_chart(pd.DataFrame({"Equity R": stats["equity_curve"], "Drawdown R": stats["drawdown_curve"]}))
+                st.dataframe(trades.tail(100), hide_index=True, use_container_width=True)
+                st.markdown("### Walk-Forward")
+                wf, wf_stats = walk_forward_mtf(result["raw_window"], windows=4, spread_per_round_trip=result["cost"], slippage_per_side=result["slip"])
+                if not wf.empty:
+                    st.dataframe(wf, hide_index=True, use_container_width=True)
+                    metrics([("WF Trades", wf_stats.get("trades", 0)), ("WF Win Rate", f"{wf_stats.get('win_rate', 0):.1f}%"), ("WF PF", f"{wf_stats.get('profit_factor', 0):.2f}"), ("WF Total R", f"{wf_stats.get('total_r', 0):.2f}R"), ("WF Max DD", f"{wf_stats.get('max_dd_r', 0):.2f}R")])
+                    if wf_stats.get("warning"):
+                        st.warning(wf_stats["warning"])
         else:
             st.warning(stats.get("warning", "لا توجد نتائج"))
 
