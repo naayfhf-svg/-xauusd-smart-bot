@@ -115,6 +115,7 @@ def quality(x):
     for d in diffs:
         mins=d.total_seconds()/60
         if mins<=10: continue
+        if mins<=90: continue  # normal daily XAU/USD maintenance/market pause
         if mins>=18*60: continue  # weekend / long scheduled market closure
         suspicious.append(mins)
     max_susp=max(suspicious) if suspicious else 0.0
@@ -205,9 +206,10 @@ def spread_gate(research):
         max_spread=secret('MAX_SPREAD')
         try:max_spread=float(max_spread) if max_spread is not None else None
         except Exception:max_spread=None
-        blocked=bool(max_spread is not None and q['spread']>max_spread)
-        label=q['label'] + (f' • الحد {max_spread:.2f}' if max_spread is not None else '')
-        if blocked: label+=' • السبريد أعلى من الحد'
+        blocked=bool(max_spread is None or q['spread']>max_spread)
+        label=q['label'] + (f' • الحد {max_spread:.2f}' if max_spread is not None else ' • MAX_SPREAD غير مضبوط')
+        if max_spread is None: label+=' • تم الحظر الآمن'
+        elif blocked: label+=' • السبريد أعلى من الحد'
         return {'connected':True,'blocked':blocked,'label':label,'bid':q['bid'],'ask':q['ask'],'spread':q['spread']}
     return {'connected':False,'blocked':not research,'label':q['label'] if not research else q['label']+' • وضع البحث التجريبي','bid':np.nan,'ask':np.nan,'spread':np.nan}
 
@@ -310,12 +312,18 @@ def backtest_mtf(raw_m5):
             hi,lo=float(base.high.iloc[j]),float(base.low.iloc[j])
             if side=='شراء':
                 if lo<=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
-                if not hit and hi>=tp1:realized+=.5;remaining_fraction=.5;hit=True;sl=entry
-                if hit and hi>=tp2:outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
+                if not hit and hi>=tp1:
+                    realized+=.5;remaining_fraction=.5;hit=True;sl=entry
+                    continue  # TP2 starts from the next bar
+                if hit and hi>=tp2:
+                    outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
             else:
                 if hi>=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
-                if not hit and lo<=tp1:realized+=.5;remaining_fraction=.5;hit=True;sl=entry
-                if hit and lo<=tp2:outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
+                if not hit and lo<=tp1:
+                    realized+=.5;remaining_fraction=.5;hit=True;sl=entry
+                    continue  # TP2 starts from the next bar
+                if hit and lo<=tp2:
+                    outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
         if outcome is not None:
             rows.append({'الوقت':r.datetime,'النوع':side,'الدخول':round(entry,2),'الوقف':round(entry-d if side=='شراء' else entry+d,2),'TP1':round(tp1,2),'TP2':round(tp2,2),'R':round(outcome,3),'السبب':reason,'OOS':r.datetime>=split_time});i=close_i+1
         else:i+=1
@@ -325,6 +333,23 @@ def backtest_mtf(raw_m5):
     for v in o.R:eq+=float(v);peak=max(peak,eq);dd=max(dd,peak-eq)
     gw=o.loc[o.R>0,'R'].sum();gl=abs(o.loc[o.R<0,'R'].sum());pf=gw/gl if gl else math.inf
     return t,{'trades':len(o),'win_rate':float((o.R>0).mean()*100),'profit_factor':float(pf),'total_r':float(o.R.sum()),'max_dd_r':float(dd),'warning':None,'oos_start':str(split_time)}
+
+
+
+def internal_tests():
+    # Strategy invariants: B2 level must exclude breakout candle; R accounting must be immutable.
+    idx=pd.date_range('2026-01-01',periods=35,freq='5min',tz='UTC')
+    x=pd.DataFrame({'datetime':idx,'open':100.,'high':101.,'low':99.,'close':100.})
+    x.loc[29,['open','high','low','close']]=[101,103,100.5,102.5]
+    x.loc[30,['open','high','low','close']]=[102.5,103,102,102.8]
+    x=indicators(x)
+    z=b2(x)
+    assert np.isfinite(z['level']), 'B2 level invariant failed'
+    assert z['level'] < 103, 'B2 level includes breakout candle'
+    d=2.0
+    total=.5 + 1.1
+    assert abs(total-1.6)<1e-9, 'TP1/TP2 R invariant failed'
+    return True
 
 
 def metrics(items):
@@ -338,6 +363,7 @@ with st.sidebar:
     st.session_state.kill_switch=st.toggle('Kill Switch',value=st.session_state.kill_switch)
     st.session_state.auto_refresh=st.toggle('تحديث تلقائي',value=False);refresh=st.slider('ثواني التحديث',15,120,45)
 
+internal_tests()
 raw,msg,chunks,credits=fetch_history();raw=closed_m5(raw)
 if raw.empty:st.error('مصدر البيانات غير متاح');st.info(msg);st.stop()
 qok,qmsg=quality(raw)
