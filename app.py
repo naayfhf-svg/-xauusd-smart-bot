@@ -1038,7 +1038,7 @@ def execution_model_audit():
     tp2_exec = tp2 - adverse
     gross_full = 0.5 * 1.0 + 0.5 * 2.2
     net_full = ((tp1_exec - entry) / d) * 0.5 + ((tp2_exec - entry) / d) * 0.5
-    expected_net = 1.6 - (2.0 * adverse / d)
+    expected_net = 1.6 - (adverse / d)
     assert abs(gross_full - 1.6) < 1e-12
     assert abs(net_full - expected_net) < 1e-12
 
