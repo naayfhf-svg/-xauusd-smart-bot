@@ -791,6 +791,7 @@ def backtest_mtf(
         entry=mid+spread_half+slip if side=="شراء" else mid-spread_half-slip
         distance=max(atr_value*1.4, entry*0.0015)
         stop=entry-distance if side=="شراء" else entry+distance
+        initial_stop=stop
         tp1=entry+distance if side=="شراء" else entry-distance
         tp2=entry+2.2*distance if side=="شراء" else entry-2.2*distance
         realized=0.0; remaining=1.0; tp1_hit=False; exit_price=None; reason=None; exit_i=None
@@ -833,7 +834,7 @@ def backtest_mtf(
 
         if exit_i is not None:
             cost_r=2.0*(spread_half+slip)/distance
-            trades.append({"الوقت":row.datetime,"النوع":side,"الدخول":round(entry,2),"الوقف":round(stop-distance if side=="شراء" else stop+distance,2),"TP1":round(tp1,2),"TP2":round(tp2,2),"الخروج":round(exit_price,2),"R":round(realized,4),"تكلفة_السعر_R":round(cost_r,4),"السبب":reason,"OOS":True})
+            trades.append({"الوقت":row.datetime,"النوع":side,"الدخول":round(entry,2),"الوقف":round(initial_stop,2),"TP1":round(tp1,2),"TP2":round(tp2,2),"الخروج":round(exit_price,2),"R":round(realized,4),"تكلفة_السعر_R":round(cost_r,4),"السبب":reason,"OOS":True})
             i=exit_i+1
         else:
             i += 1
