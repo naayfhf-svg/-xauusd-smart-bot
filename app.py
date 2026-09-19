@@ -107,8 +107,19 @@ def quality(x):
     gaps=x.datetime.diff().dropna().dt.total_seconds().div(60)
     max_gap=float(gaps.max()) if not gaps.empty else 0.0
     dup=int(x.datetime.duplicated().sum())
-    ok=x.datetime.is_monotonic_increasing and dup==0 and age<20 and max_gap<=10
-    return ok,f'آخر شمعة منذ {age:.1f} دقيقة • فجوة قصوى {max_gap:.1f} دقيقة • تكرار {dup}'
+    # Do not treat the normal daily market closure as a data-feed gap.
+    # Flag only gaps that occur inside the active trading week and are not weekend-sized.
+    ts=x.datetime.sort_values()
+    diffs=ts.diff().dropna()
+    suspicious=[]
+    for d in diffs:
+        mins=d.total_seconds()/60
+        if mins<=10: continue
+        if mins>=18*60: continue  # weekend / long scheduled market closure
+        suspicious.append(mins)
+    max_susp=max(suspicious) if suspicious else 0.0
+    ok=x.datetime.is_monotonic_increasing and dup==0 and age<20 and max_susp<=10
+    return ok,f'آخر شمعة منذ {age:.1f} دقيقة • أكبر فجوة مريبة {max_susp:.1f} دقيقة • تكرار {dup}'
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_quote():
@@ -265,18 +276,26 @@ def backtest_mtf(raw_m5):
     m15=resample_closed(raw_m5,'15min'); h1=resample_closed(raw_m5,'1h'); h4=resample_closed(raw_m5,'4h')
     m15=indicators(m15).dropna().reset_index(drop=True); h1=indicators(h1).dropna().reset_index(drop=True); h4=indicators(h4).dropna().reset_index(drop=True)
     if min(len(m5),len(m15),len(h1),len(h4))<250:return pd.DataFrame(),{'trades':0,'warning':'العينة صغيرة'}
-    for df in (m5,m15,h1,h4): df['ts']=df['datetime']
-    base=m5[['datetime','open','high','low','close','ema20','ema50','ema100','rsi','atr','macd_hist','momentum','adx']].copy()
+    # Every higher-timeframe value becomes available only at that candle's CLOSE.
+    # The M5 decision timestamp is also the M5 candle close, so no future HTF data can leak in.
+    m5['decision_ts']=m5['datetime']+pd.Timedelta(minutes=5)
+    for name,df,rule in [('m15',m15,'15min'),('h1',h1,'1h'),('h4',h4,'4h')]:
+        df['ts']=df['datetime']+pd.Timedelta(rule)
+    base=m5[['datetime','decision_ts','open','high','low','close','ema20','ema50','ema100','rsi','atr','macd_hist','momentum','adx']].copy()
     for name,df in [('m15',m15),('h1',h1),('h4',h4)]:
         cols=['ts','close','ema20','ema50','ema100','rsi','adx']
-        base=pd.merge_asof(base.sort_values('datetime'),df[cols].sort_values('ts'),left_on='datetime',right_on='ts',direction='backward',suffixes=('','_'+name))
-    split_time=base.datetime.iloc[int(len(base)*.7)]; rows=[]; i=130
+        base=pd.merge_asof(base.sort_values('decision_ts'),df[cols].sort_values('ts'),left_on='decision_ts',right_on='ts',direction='backward',suffixes=('','_'+name))
+    split_time=base.decision_ts.iloc[int(len(base)*.7)]; rows=[]; i=130
     while i<len(base)-2:
         r=base.iloc[i]
-        if r.datetime>=split_time and i<1: i+=1;continue
+        # OOS entries only. Pre-split rows are used for warm-up but never counted as trades.
+        if r.decision_ts<split_time: i+=1;continue
         av=float(r.atr)
         if not np.isfinite(av) or av<=0:i+=1;continue
-        p=base.iloc[max(0,i-21):i];res=float(p.high.max());sup=float(p.low.min());prev=float(base.close.iloc[i-1])
+        # B2: the previous candle is the breakout candle; the 20 candles BEFORE it define the level.
+        p=base.iloc[max(0,i-21):i-1]
+        if len(p)<20: i+=1;continue
+        res=float(p.high.max());sup=float(p.low.min());prev=float(base.close.iloc[i-1])
         rb=prev>res and r.low<=res+.35*av and r.close>res; rs=prev<sup and r.high>=sup-.35*av and r.close<sup
         def bull(s): return s.close>s.ema20>s.ema50>s.ema100
         def bear(s): return s.close<s.ema20<s.ema50<s.ema100
@@ -286,16 +305,16 @@ def backtest_mtf(raw_m5):
         side='شراء' if rb and bull_mtf and mb else 'بيع' if rs and bear_mtf and ms else None
         if not side:i+=1;continue
         entry=float(r.close);d=max(av*1.4,entry*.0015);sl=entry-d if side=='شراء' else entry+d;tp1=entry+d if side=='شراء' else entry-d;tp2=entry+2.2*d if side=='شراء' else entry-2.2*d
-        realized=0.;rem=.5 if False else 1.;hit=False;outcome=None;reason=None;close_i=None
+        realized=0.;remaining_fraction=1.;hit=False;outcome=None;reason=None;close_i=None
         for j in range(i+1,min(i+100,len(base))):
             hi,lo=float(base.high.iloc[j]),float(base.low.iloc[j])
             if side=='شراء':
-                if lo<=sl:outcome=realized-rem;reason='وقف الخسارة';close_i=j;break
-                if not hit and hi>=tp1:realized+=.5;rem=.5;hit=True;sl=entry
+                if lo<=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
+                if not hit and hi>=tp1:realized+=.5;remaining_fraction=.5;hit=True;sl=entry
                 if hit and hi>=tp2:outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
             else:
-                if hi>=sl:outcome=realized-rem;reason='وقف الخسارة';close_i=j;break
-                if not hit and lo<=tp1:realized+=.5;rem=.5;hit=True;sl=entry
+                if hi>=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
+                if not hit and lo<=tp1:realized+=.5;remaining_fraction=.5;hit=True;sl=entry
                 if hit and lo<=tp2:outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
         if outcome is not None:
             rows.append({'الوقت':r.datetime,'النوع':side,'الدخول':round(entry,2),'الوقف':round(entry-d if side=='شراء' else entry+d,2),'TP1':round(tp1,2),'TP2':round(tp2,2),'R':round(outcome,3),'السبب':reason,'OOS':r.datetime>=split_time});i=close_i+1
