@@ -182,10 +182,10 @@ def daily_loss_pct(price):
 
 def unrealized_r(p,price):
     if not p or not np.isfinite(price):return 0.
-    dist=abs(p.entry-p.sl)
+    dist=abs(p["entry"]-p["sl"])
     if dist<=0:return 0.
-    direction=1 if p.side=="شراء" else -1
-    return direction*(price-p.entry)/dist*p.remaining_fraction+p.realized_r
+    direction=1 if p["side"]=="شراء" else -1
+    return direction*(price-p["entry"])/dist*p["remaining_fraction"]+p["realized_r"]
 
 
 def analyze(m5,m15,h1,h4,research_mode):
