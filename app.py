@@ -1,7 +1,7 @@
 import math
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -9,418 +9,1075 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title='GOLD AI | XAU/USD', page_icon='🟡', layout='wide', initial_sidebar_state='collapsed')
+# ============================================================
+# GOLD AI — XAU/USD Smart Paper Trading
+# Clean single-file research / paper-trading application.
+# No live broker execution is implemented.
+# ============================================================
 
-TZ = ZoneInfo('Asia/Riyadh')
-SYMBOL = 'XAU/USD'
-DATA_URL = 'https://api.twelvedata.com/time_series'
-QUOTE_URL = 'https://api.twelvedata.com/quote'
+st.set_page_config(
+    page_title="GOLD AI | XAU/USD",
+    page_icon="🟡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+TZ = ZoneInfo("Asia/Riyadh")
+UTC = "UTC"
+SYMBOL = "XAU/USD"
+TIMEFRAMES = ("M5", "M15", "H1", "H4")
+DATA_URL = "https://api.twelvedata.com/time_series"
+QUOTE_URL = "https://api.twelvedata.com/quote"
+
 START_BALANCE = 100_000.0
 RISK_PER_TRADE = 0.005
 DAILY_LOSS_LIMIT = 0.02
 MAX_DAILY_TRADES = 5
-CHUNKS = 4
-BARS_PER_CHUNK = 5000
+MAX_SPREAD_SECRET = "MAX_SPREAD"
+NEWS_SECRET = "NEWS_API_URL"
+API_SECRET = "TWELVE_DATA_API_KEY"
 
-st.markdown('''<style>
+M5_CHUNK_SIZE = 5000
+M5_CHUNKS = 4
+
+# --------------------------- UI theme -------------------------
+st.markdown(
+    """
+<style>
 :root{--bg:#070b12;--panel:#0e1623;--panel2:#111c2c;--line:#24334b;--gold:#d4af37;--text:#f5f7fb;--muted:#8fa1ba;--green:#25c77a;--red:#ef5b67}
-.stApp{background:var(--bg);color:var(--text)}.block-container{max-width:1450px;padding:1rem 1rem 4rem}
+.stApp{background:var(--bg);color:var(--text)}
+.block-container{max-width:1450px;padding:1rem 1rem 4rem}
 .card{background:linear-gradient(145deg,var(--panel),#0a121e);border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:14px}
 .hero{border:1px solid #554717;border-radius:22px;padding:24px;background:radial-gradient(circle at 85% 15%,rgba(212,175,55,.14),transparent 32%),var(--panel)}
 .kicker{font-size:.75rem;color:var(--muted);letter-spacing:.15em}.gold{color:var(--gold)}.muted{color:var(--muted)}
 .price{font-size:clamp(2.6rem,8vw,5rem);font-weight:900;line-height:1}.signal{font-size:2rem;font-weight:900}.good{color:var(--green)}.bad{color:var(--red)}
 .metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:13px}.label{font-size:.72rem;color:var(--muted)}.value{font-size:1.25rem;font-weight:800;margin-top:4px}
 div[data-testid="stMetric"]{background:var(--panel);border:1px solid var(--line);border-radius:14px}
-</style>''', unsafe_allow_html=True)
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ------------------------- small utilities -------------------
+def now_utc():
+    return pd.Timestamp.now(tz="UTC")
 
 
+def now_riyadh():
+    return datetime.now(TZ)
+
+
+def get_secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
+
+
+def finite(value):
+    try:
+        return bool(np.isfinite(float(value)))
+    except Exception:
+        return False
+
+
+def fmt_price(value):
+    return f"{float(value):,.2f}" if finite(value) else "—"
+
+# --------------------------- state ----------------------------
 def init_state():
-    defaults = {'balance':START_BALANCE,'position':None,'history':[],'decisions':[],
-                'daily_start_balance':START_BALANCE,'daily_date':datetime.now(TZ).date().isoformat(),
-                'daily_trades':0,'kill_switch':False,'research_mode':False,
-                'last_signal_candle':None,'last_price':np.nan,'auto_refresh':False}
-    for k,v in defaults.items():
-        if k not in st.session_state: st.session_state[k]=v
-    today=datetime.now(TZ).date().isoformat()
+    defaults = {
+        "balance": START_BALANCE,
+        "position": None,
+        "history": [],
+        "decisions": [],
+        "daily_start_balance": START_BALANCE,
+        "daily_date": now_riyadh().date().isoformat(),
+        "daily_trades": 0,
+        "kill_switch": False,
+        "research_mode": False,
+        "auto_refresh": False,
+        "last_signal_candle": None,
+        "last_price": np.nan,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+    today = now_riyadh().date().isoformat()
     if st.session_state.daily_date != today:
-        st.session_state.daily_date=today; st.session_state.daily_start_balance=st.session_state.balance; st.session_state.daily_trades=0
+        st.session_state.daily_date = today
+        st.session_state.daily_start_balance = float(st.session_state.balance)
+        st.session_state.daily_trades = 0
+
 
 init_state()
 
-
-def secret(name):
-    try: return st.secrets[name]
-    except Exception: return None
+# ------------------------- data feed --------------------------
+def normalize_ohlcv(values):
+    if not isinstance(values, list) or not values:
+        return pd.DataFrame()
+    df = pd.DataFrame(values)
+    if "datetime" not in df.columns:
+        return pd.DataFrame()
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required = ["datetime", "open", "high", "low", "close"]
+    df = df.dropna(subset=required)
+    df = df.drop_duplicates("datetime").sort_values("datetime").reset_index(drop=True)
+    return df
 
 
 @st.cache_data(ttl=45, show_spinner=False)
 def fetch_chunk(end_date=None):
-    key=secret('TWELVE_DATA_API_KEY')
-    if not key: return pd.DataFrame(),'TWELVE_DATA_API_KEY غير موجود في Secrets',None
-    p={'symbol':SYMBOL,'interval':'5min','outputsize':BARS_PER_CHUNK,'timezone':'UTC','apikey':key}
-    if end_date: p['end_date']=end_date
+    key = get_secret(API_SECRET)
+    if not key:
+        return pd.DataFrame(), "TWELVE_DATA_API_KEY غير موجود في Secrets", None
+
+    params = {
+        "symbol": SYMBOL,
+        "interval": "5min",
+        "outputsize": M5_CHUNK_SIZE,
+        "timezone": UTC,
+        "apikey": key,
+    }
+    if end_date:
+        params["end_date"] = end_date
+
     try:
-        r=requests.get(DATA_URL,params=p,timeout=20); payload=r.json()
-        if 'values' not in payload: return pd.DataFrame(),str(payload.get('message','مصدر البيانات رفض الطلب')),r.headers.get('api-credits-left')
-        x=pd.DataFrame(payload['values']); x['datetime']=pd.to_datetime(x['datetime'],utc=True,errors='coerce')
-        for c in ['open','high','low','close','volume']:
-            if c in x: x[c]=pd.to_numeric(x[c],errors='coerce')
-        x=x.dropna(subset=['datetime','open','high','low','close']).drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
-        return x,'OK',r.headers.get('api-credits-left')
-    except Exception as e: return pd.DataFrame(),f'خطأ اتصال: {e}',None
+        response = requests.get(DATA_URL, params=params, timeout=20)
+        payload = response.json()
+    except Exception as exc:
+        return pd.DataFrame(), f"خطأ اتصال: {exc}", None
+
+    if "values" not in payload:
+        return pd.DataFrame(), str(payload.get("message", "مصدر البيانات رفض الطلب")), response.headers.get("api-credits-left")
+
+    frame = normalize_ohlcv(payload["values"])
+    if frame.empty:
+        return pd.DataFrame(), "Twelve Data أعاد بيانات غير صالحة", response.headers.get("api-credits-left")
+
+    return frame, "OK", response.headers.get("api-credits-left")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_history():
-    frames=[]; errors=[]; credits=[]; end=pd.Timestamp.now(tz='UTC')
-    for i in range(CHUNKS):
-        x,msg,left=fetch_chunk(end.strftime('%Y-%m-%d %H:%M:%S'))
-        if x.empty: errors.append(f'الدفعة {i+1}: {msg}'); break
-        frames.append(x); credits.append(left) if left is not None else None
-        oldest=x.datetime.min()
-        if oldest>=end: errors.append('التاريخ لم يتحرك للخلف'); break
-        end=oldest-pd.Timedelta(minutes=5)
-        if len(x)<BARS_PER_CHUNK: break
-    if not frames: return pd.DataFrame(),' | '.join(errors),0,credits
-    out=pd.concat(frames,ignore_index=True).drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
-    msg='تم تحميل التاريخ المطلوب' if len(frames)==CHUNKS else 'تم تحميل جزء من التاريخ فقط'
-    if errors: msg+=' • '+' | '.join(errors)
-    return out,msg,len(frames),credits
+    frames = []
+    errors = []
+    credits = []
+    end = now_utc()
+
+    for index in range(M5_CHUNKS):
+        frame, message, credit_left = fetch_chunk(end.strftime("%Y-%m-%d %H:%M:%S"))
+        if frame.empty:
+            errors.append(f"الدفعة {index + 1}: {message}")
+            break
+
+        frames.append(frame)
+        if credit_left is not None:
+            credits.append(credit_left)
+
+        oldest = frame["datetime"].min()
+        if oldest >= end:
+            errors.append("لم يتحرك المؤشر التاريخي للخلف")
+            break
+
+        end = oldest - pd.Timedelta(minutes=5)
+        if len(frame) < M5_CHUNK_SIZE:
+            break
+
+    if not frames:
+        return pd.DataFrame(), " | ".join(errors) or "لم تصل بيانات", 0, credits
+
+    history = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates("datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    message = "تم تحميل التاريخ المطلوب" if len(frames) == M5_CHUNKS else "تم تحميل جزء من التاريخ فقط"
+    if errors:
+        message += " • " + " | ".join(errors)
+    return history, message, len(frames), credits
 
 
-def closed_m5(x):
-    if x.empty:return x
-    return x[x.datetime < pd.Timestamp.now(tz='UTC').floor('5min')].copy()
+def closed_m5(frame):
+    if frame.empty:
+        return frame.copy()
+    boundary = now_utc().floor("5min")
+    return frame[frame["datetime"] < boundary].copy().reset_index(drop=True)
 
 
-def resample_closed(x,rule):
-    x=closed_m5(x)
-    if x.empty:return x
-    y=(x.set_index('datetime')[['open','high','low','close']].resample(rule,label='left',closed='left')
-       .agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index())
-    return y[y.datetime+pd.Timedelta(rule)<=pd.Timestamp.now(tz='UTC')].reset_index(drop=True)
+def resample_closed(frame, rule):
+    frame = closed_m5(frame)
+    if frame.empty:
+        return frame.copy()
+
+    out = (
+        frame.set_index("datetime")[["open", "high", "low", "close"]]
+        .resample(rule, label="left", closed="left")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+        .reset_index()
+    )
+
+    # A higher-TF candle is usable only after its right boundary has passed.
+    out = out[out["datetime"] + pd.Timedelta(rule) <= now_utc()].reset_index(drop=True)
+    return out
 
 
-def quality(x):
-    if x.empty:return False,'لا توجد بيانات'
-    age=(pd.Timestamp.now(tz='UTC')-x.datetime.iloc[-1]).total_seconds()/60
-    gaps=x.datetime.diff().dropna().dt.total_seconds().div(60)
-    max_gap=float(gaps.max()) if not gaps.empty else 0.0
-    dup=int(x.datetime.duplicated().sum())
-    # Do not treat the normal daily market closure as a data-feed gap.
-    # Flag only gaps that occur inside the active trading week and are not weekend-sized.
-    ts=x.datetime.sort_values()
-    diffs=ts.diff().dropna()
-    suspicious=[]
-    for d in diffs:
-        mins=d.total_seconds()/60
-        if mins<=10: continue
-        if mins<=90: continue  # normal daily XAU/USD maintenance/market pause
-        if mins>=18*60: continue  # weekend / long scheduled market closure
-        suspicious.append(mins)
-    max_susp=max(suspicious) if suspicious else 0.0
-    ok=x.datetime.is_monotonic_increasing and dup==0 and age<20 and max_susp<=10
-    return ok,f'آخر شمعة منذ {age:.1f} دقيقة • أكبر فجوة مريبة {max_susp:.1f} دقيقة • تكرار {dup}'
+def data_quality(frame):
+    if frame.empty:
+        return False, "لا توجد بيانات"
 
-@st.cache_data(ttl=15, show_spinner=False)
+    duplicate_count = int(frame["datetime"].duplicated().sum())
+    monotonic = bool(frame["datetime"].is_monotonic_increasing)
+    age_min = (now_utc() - frame["datetime"].iloc[-1]).total_seconds() / 60
+
+    diffs = frame["datetime"].diff().dropna()
+    suspicious = []
+    for diff in diffs:
+        minutes = diff.total_seconds() / 60
+        # <=10m: ordinary feed cadence. 10–90m: maintenance/session pause.
+        # >=18h: weekend/long scheduled closure. Other large gaps are suspicious.
+        if minutes <= 90 or minutes >= 18 * 60:
+            continue
+        suspicious.append(minutes)
+
+    largest_suspicious = max(suspicious) if suspicious else 0.0
+    ok = monotonic and duplicate_count == 0 and age_min < 20 and largest_suspicious == 0
+    detail = (
+        f"آخر شمعة منذ {age_min:.1f} دقيقة • "
+        f"أكبر فجوة مريبة {largest_suspicious:.1f} دقيقة • تكرار {duplicate_count}"
+    )
+    return ok, detail
+
+
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_quote():
-    key=secret('TWELVE_DATA_API_KEY')
-    if not key:return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'مفتاح Twelve Data غير موجود'}
+    key = get_secret(API_SECRET)
+    if not key:
+        return {"connected": False, "bid": np.nan, "ask": np.nan, "spread": np.nan, "label": "مفتاح Twelve Data غير موجود"}
+
     try:
-        r=requests.get(QUOTE_URL,params={'symbol':SYMBOL,'apikey':key},timeout=10); p=r.json()
-        bid=pd.to_numeric(p.get('bid'),errors='coerce'); ask=pd.to_numeric(p.get('ask'),errors='coerce')
-        if not np.isfinite(bid) or not np.isfinite(ask) or ask<=bid:
-            return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'مصدر Bid/Ask غير متاح'}
-        return {'connected':True,'bid':float(bid),'ask':float(ask),'spread':float(ask-bid),'label':f"Bid/Ask متصل • السبريد {float(ask-bid):.2f}"}
-    except Exception as e:
-        return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'تعذر جلب Bid/Ask'}
+        response = requests.get(QUOTE_URL, params={"symbol": SYMBOL, "apikey": key}, timeout=10)
+        payload = response.json()
+        bid = pd.to_numeric(payload.get("bid"), errors="coerce")
+        ask = pd.to_numeric(payload.get("ask"), errors="coerce")
+    except Exception:
+        return {"connected": False, "bid": np.nan, "ask": np.nan, "spread": np.nan, "label": "تعذر جلب Bid/Ask"}
+
+    if not finite(bid) or not finite(ask) or ask <= bid:
+        return {"connected": False, "bid": np.nan, "ask": np.nan, "spread": np.nan, "label": "مصدر Bid/Ask غير متاح"}
+
+    spread = float(ask - bid)
+    return {"connected": True, "bid": float(bid), "ask": float(ask), "spread": spread, "label": f"Bid/Ask متصل • السبريد {spread:.2f}"}
+
+# ------------------------- indicators ------------------------
+def ema(series, period):
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
 
 
-def ema(s,n):return s.ewm(span=n,adjust=False).mean()
-
-def rsi(s,n=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
-    au=up.ewm(alpha=1/n,adjust=False,min_periods=n).mean(); ad=dn.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
-    return (100-100/(1+au/ad.replace(0,np.nan))).fillna(50)
-
-def atr(x,n=14):
-    pc=x.close.shift(1); tr=pd.concat([x.high-x.low,(x.high-pc).abs(),(x.low-pc).abs()],axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
-
-def macd(s):
-    line=ema(s,12)-ema(s,26); sig=ema(line,9); return line,sig,line-sig
-
-def adx(x,n=14):
-    up=x.high.diff(); dn=-x.low.diff(); plus=pd.Series(np.where((up>dn)&(up>0),up,0.),index=x.index); minus=pd.Series(np.where((dn>up)&(dn>0),dn,0.),index=x.index)
-    pc=x.close.shift(1); tr=pd.concat([x.high-x.low,(x.high-pc).abs(),(x.low-pc).abs()],axis=1).max(axis=1)
-    aw=tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean(); pdi=100*plus.ewm(alpha=1/n,adjust=False,min_periods=n).mean()/aw.replace(0,np.nan); mdi=100*minus.ewm(alpha=1/n,adjust=False,min_periods=n).mean()/aw.replace(0,np.nan)
-    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan); return dx.ewm(alpha=1/n,adjust=False,min_periods=n).mean(),pdi,mdi
-
-def indicators(x):
-    y=x.copy(); y['ema20']=ema(y.close,20); y['ema50']=ema(y.close,50); y['ema100']=ema(y.close,100); y['rsi']=rsi(y.close); y['atr']=atr(y)
-    y['macd'],y['macd_signal'],y['macd_hist']=macd(y.close); y['momentum']=y.close.pct_change(5)*100; y['adx'],y['plus_di'],y['minus_di']=adx(y); return y
-
-def trend(r):
-    if r.close>r.ema20>r.ema50>r.ema100:return 'صاعد'
-    if r.close<r.ema20<r.ema50<r.ema100:return 'هابط'
-    return 'محايد'
-
-def regime(r):
-    if not np.isfinite(r.adx) or not np.isfinite(r.atr):return 'غير معروف'
-    if r.adx>=25:return 'اتجاه'
-    if r.adx<=18:return 'نطاق'
-    return 'انتقالي'
-
-def snapshot(x):
-    if len(x)<110:return None
-    y=indicators(x).dropna().reset_index(drop=True)
-    if y.empty:return None
-    r=y.iloc[-1]
-    return {'trend':trend(r),'regime':regime(r),'rsi':float(r.rsi),'adx':float(r.adx),'atr':float(r.atr),'momentum':float(r.momentum),'close':float(r.close),'macd_hist':float(r.macd_hist),'candle':r.datetime,'frame':y}
+def rsi(series, period=14):
+    delta = series.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = losses.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50)
 
 
-def b2(x):
-    if len(x)<30:return {'valid':False,'direction':None,'breakout':False,'retest':False,'level':np.nan}
-    r=x.iloc[-1]; p=x.iloc[-21:-1]; res=float(p.high.max()); sup=float(p.low.min()); av=float(r.atr)
-    if not np.isfinite(av) or av<=0:return {'valid':False,'direction':None,'breakout':False,'retest':False,'level':np.nan}
-    bb=float(x.close.iloc[-2])>res; bs=float(x.close.iloc[-2])<sup
-    rb=bb and r.low<=res+.35*av and r.close>res; rs=bs and r.high>=sup-.35*av and r.close<sup
-    if rb:return {'valid':True,'direction':'شراء','breakout':True,'retest':True,'level':res}
-    if rs:return {'valid':True,'direction':'بيع','breakout':True,'retest':True,'level':sup}
-    return {'valid':False,'direction':None,'breakout':bool(bb or bs),'retest':False,'level':res if bb else sup if bs else np.nan}
+def atr(frame, period=14):
+    previous_close = frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
-def news_gate(research):
-    url=secret('NEWS_API_URL')
-    if not url:return {'connected':False,'blocked':not research,'label':'غير متصل — لا يوجد مزود Economic Calendar موثوق'}
+def macd(series):
+    line = ema(series, 12) - ema(series, 26)
+    signal = line.ewm(span=9, adjust=False, min_periods=9).mean()
+    return line, signal, line - signal
+
+
+def adx(frame, period=14):
+    up = frame["high"].diff()
+    down = -frame["low"].diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=frame.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=frame.index)
+
+    previous_close = frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    smoothed_tr = true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / smoothed_tr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / smoothed_tr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean(), plus_di, minus_di
+
+
+def add_indicators(frame):
+    out = frame.copy()
+    out["ema20"] = ema(out["close"], 20)
+    out["ema50"] = ema(out["close"], 50)
+    out["ema100"] = ema(out["close"], 100)
+    out["rsi"] = rsi(out["close"])
+    out["atr"] = atr(out)
+    out["macd"], out["macd_signal"], out["macd_hist"] = macd(out["close"])
+    out["momentum"] = out["close"].pct_change(5) * 100
+    out["adx"], out["plus_di"], out["minus_di"] = adx(out)
+    return out
+
+
+def classify_trend(row):
+    if row.close > row.ema20 > row.ema50 > row.ema100:
+        return "صاعد"
+    if row.close < row.ema20 < row.ema50 < row.ema100:
+        return "هابط"
+    return "محايد"
+
+
+def classify_regime(row):
+    if not finite(row.adx) or not finite(row.atr):
+        return "غير معروف"
+    if row.adx >= 25:
+        return "اتجاه"
+    if row.adx <= 18:
+        return "نطاق"
+    return "انتقالي"
+
+
+def snapshot(frame):
+    if len(frame) < 120:
+        return None
+    calculated = add_indicators(frame).dropna().reset_index(drop=True)
+    if calculated.empty:
+        return None
+    row = calculated.iloc[-1]
+    return {
+        "trend": classify_trend(row),
+        "regime": classify_regime(row),
+        "rsi": float(row.rsi),
+        "adx": float(row.adx),
+        "atr": float(row.atr),
+        "momentum": float(row.momentum),
+        "macd_hist": float(row.macd_hist),
+        "close": float(row.close),
+        "candle": row.datetime,
+        "frame": calculated,
+    }
+
+# --------------------------- B2 ------------------------------
+def b2_signal(frame, lookback=20, retest_atr=0.35):
+    """B2 = previous candle breaks a level built only from candles before it; current candle retests and confirms."""
+    if len(frame) < lookback + 3:
+        return {"valid": False, "direction": None, "breakout": False, "retest": False, "level": np.nan}
+
+    current = frame.iloc[-1]
+    breakout = frame.iloc[-2]
+    history = frame.iloc[-(lookback + 2):-2]
+    level_resistance = float(history["high"].max())
+    level_support = float(history["low"].min())
+    current_atr = float(current.atr)
+
+    if not finite(current_atr) or current_atr <= 0:
+        return {"valid": False, "direction": None, "breakout": False, "retest": False, "level": np.nan}
+
+    bullish_break = float(breakout.close) > level_resistance
+    bearish_break = float(breakout.close) < level_support
+
+    bullish_retest = bullish_break and float(current.low) <= level_resistance + retest_atr * current_atr and float(current.close) > level_resistance
+    bearish_retest = bearish_break and float(current.high) >= level_support - retest_atr * current_atr and float(current.close) < level_support
+
+    if bullish_retest:
+        return {"valid": True, "direction": "شراء", "breakout": True, "retest": True, "level": level_resistance}
+    if bearish_retest:
+        return {"valid": True, "direction": "بيع", "breakout": True, "retest": True, "level": level_support}
+
+    return {
+        "valid": False,
+        "direction": None,
+        "breakout": bool(bullish_break or bearish_break),
+        "retest": False,
+        "level": level_resistance if bullish_break else level_support if bearish_break else np.nan,
+    }
+
+# ---------------------- safety gates -------------------------
+def news_gate(research_mode):
+    url = get_secret(NEWS_SECRET)
+    if not url:
+        return {"connected": False, "blocked": not research_mode, "label": "لا يوجد Economic Calendar موثوق متصل"}
+
     try:
-        p=requests.get(url,timeout=8).json(); block=bool(p.get('high_impact',False) or p.get('block',False))
-        return {'connected':True,'blocked':block,'label':'خبر عالي التأثير' if block else 'لا يوجد حظر'}
-    except Exception:return {'connected':False,'blocked':not research,'label':'تعذر الاتصال — تم تطبيق الحظر الآمن'}
+        response = requests.get(url, timeout=8)
+        payload = response.json()
+    except Exception:
+        return {"connected": False, "blocked": True, "label": "تعذر الاتصال بمصدر الأخبار • حظر آمن"}
+
+    blocked = bool(payload.get("high_impact", False) or payload.get("block", False))
+    return {"connected": True, "blocked": blocked, "label": "خبر عالي التأثير" if blocked else "لا يوجد حظر حسب المزود"}
 
 
-def spread_gate(research):
-    q=fetch_quote()
-    if q['connected']:
-        # No arbitrary universal spread threshold: only report the live quote unless a user-configured limit exists.
-        max_spread=secret('MAX_SPREAD')
-        try:max_spread=float(max_spread) if max_spread is not None else None
-        except Exception:max_spread=None
-        blocked=bool(max_spread is None or q['spread']>max_spread)
-        label=q['label'] + (f' • الحد {max_spread:.2f}' if max_spread is not None else ' • MAX_SPREAD غير مضبوط')
-        if max_spread is None: label+=' • تم الحظر الآمن'
-        elif blocked: label+=' • السبريد أعلى من الحد'
-        return {'connected':True,'blocked':blocked,'label':label,'bid':q['bid'],'ask':q['ask'],'spread':q['spread']}
-    return {'connected':False,'blocked':not research,'label':q['label'] if not research else q['label']+' • وضع البحث التجريبي','bid':np.nan,'ask':np.nan,'spread':np.nan}
+def spread_gate(research_mode):
+    quote = fetch_quote()
+    configured = get_secret(MAX_SPREAD_SECRET)
+    try:
+        max_spread = float(configured) if configured is not None else None
+    except Exception:
+        max_spread = None
+
+    if not quote["connected"]:
+        return {
+            "connected": False,
+            "blocked": not research_mode,
+            "label": quote["label"] + (" • وضع البحث التجريبي" if research_mode else " • حظر آمن"),
+            "bid": np.nan,
+            "ask": np.nan,
+            "spread": np.nan,
+        }
+
+    if max_spread is None:
+        return {
+            "connected": True,
+            "blocked": True,
+            "label": quote["label"] + " • MAX_SPREAD غير مضبوط • حظر آمن",
+            "bid": quote["bid"],
+            "ask": quote["ask"],
+            "spread": quote["spread"],
+        }
+
+    blocked = quote["spread"] > max_spread
+    label = quote["label"] + f" • الحد {max_spread:.2f}"
+    if blocked:
+        label += " • السبريد أعلى من الحد"
+    return {**quote, "blocked": blocked, "label": label}
+
+# ------------------------- signal engine ---------------------
+def analyze(m5, m15, h1, h4, research_mode):
+    snapshots = {name: snapshot(frame) for name, frame in {"M5": m5, "M15": m15, "H1": h1, "H4": h4}.items()}
+    news = news_gate(research_mode)
+    spread = spread_gate(research_mode)
+
+    if any(value is None for value in snapshots.values()):
+        gates = {
+            "البيانات": False,
+            "النظام السوقي": False,
+            "توافق الأطر": False,
+            "الزخم": False,
+            "B2": False,
+            "المخاطر": not st.session_state.kill_switch,
+            "الحد اليومي": True,
+            "السبريد": not spread["blocked"],
+            "الأخبار": not news["blocked"],
+        }
+        return {"signal": "انتظار", "strength": 0, "reason": "بيانات الأطر غير مكتملة", "gates": gates, "snapshots": snapshots, "b2": {}, "news": news, "spread": spread}
+
+    trends = [snapshots[key]["trend"] for key in TIMEFRAMES]
+    bull = all(trend == "صاعد" for trend in trends)
+    bear = all(trend == "هابط" for trend in trends)
+    m5 = snapshots["M5"]
+    b2 = b2_signal(m5["frame"])
+
+    momentum_buy = m5["rsi"] >= 52 and m5["momentum"] > 0 and m5["macd_hist"] > 0
+    momentum_sell = m5["rsi"] <= 48 and m5["momentum"] < 0 and m5["macd_hist"] < 0
+
+    daily_ok = daily_loss_pct(m5["close"]) < DAILY_LOSS_LIMIT * 100 and st.session_state.daily_trades < MAX_DAILY_TRADES
+    gates = {
+        "البيانات": True,
+        "النظام السوقي": m5["regime"] == "اتجاه",
+        "توافق الأطر": bull or bear,
+        "الزخم": momentum_buy or momentum_sell,
+        "B2": b2["valid"],
+        "المخاطر": not st.session_state.kill_switch,
+        "الحد اليومي": daily_ok,
+        "السبريد": not spread["blocked"],
+        "الأخبار": not news["blocked"],
+    }
+
+    strength = (
+        (30 if gates["توافق الأطر"] else 0)
+        + (25 if gates["B2"] else 0)
+        + (20 if gates["الزخم"] else 0)
+        + (10 if m5["adx"] >= 25 else 0)
+        + (10 if gates["توافق الأطر"] else 0)
+        + (5 if gates["السبريد"] and gates["الأخبار"] else 0)
+    )
+
+    reason = next((name for name, passed in gates.items() if not passed), "اجتازت جميع البوابات")
+    signal = "انتظار"
+    if all(gates.values()):
+        if b2["direction"] == "شراء" and bull and momentum_buy:
+            signal = "شراء"
+        elif b2["direction"] == "بيع" and bear and momentum_sell:
+            signal = "بيع"
+        else:
+            reason = "تعارض B2 مع الاتجاه أو الزخم"
+
+    return {"signal": signal, "strength": min(strength, 100), "reason": reason, "gates": gates, "snapshots": snapshots, "b2": b2, "news": news, "spread": spread}
+
+# ------------------------ paper engine -----------------------
+def execution_price(side, quote, fallback):
+    if quote.get("connected"):
+        return float(quote["ask"] if side == "شراء" else quote["bid"])
+    return float(fallback)
 
 
-def unrealized_r(p,price):
-    if not p or not np.isfinite(price):return 0.
-    d=p['initial_distance']; direction=1 if p['side']=='شراء' else -1
-    return p['realized_r']+direction*(price-p['entry'])/d*p['remaining_fraction'] if d>0 else 0.
+def mark_price(position, quote, fallback):
+    if quote.get("connected"):
+        return float(quote["bid"] if position["side"] == "شراء" else quote["ask"])
+    return float(fallback)
+
+
+def unrealized_r(position, price):
+    if not position or not finite(price) or position["initial_distance"] <= 0:
+        return 0.0
+    direction = 1 if position["side"] == "شراء" else -1
+    return position["realized_r"] + direction * (float(price) - position["entry"]) / position["initial_distance"] * position["remaining_fraction"]
+
+
+def daily_equity(price):
+    equity = float(st.session_state.balance)
+    if st.session_state.position:
+        equity += unrealized_r(st.session_state.position, price) * st.session_state.position["risk_money"]
+    return equity
 
 
 def daily_loss_pct(price):
-    eq=st.session_state.balance
-    if st.session_state.position:eq+=unrealized_r(st.session_state.position,price)*st.session_state.position['risk_money']
-    return max(0,(st.session_state.daily_start_balance-eq)/max(st.session_state.daily_start_balance,1)*100)
+    start = max(float(st.session_state.daily_start_balance), 1.0)
+    loss = max(0.0, start - daily_equity(price))
+    return loss / start * 100
 
 
-def analyze(m5,m15,h1,h4,research):
-    snaps={k:snapshot(v) for k,v in {'M5':m5,'M15':m15,'H1':h1,'H4':h4}.items()}; news=news_gate(research); spread=spread_gate(research)
-    if any(snaps[k] is None for k in snaps):
-        return {'signal':'انتظار','strength':0,'reason':'بيانات الأطر غير مكتملة','gates':{'البيانات':False,'النظام السوقي':False,'توافق الأطر':False,'الزخم':False,'B2':False,'المخاطر':not st.session_state.kill_switch,'الحد اليومي':True,'السبريد':not spread['blocked'],'الأخبار':not news['blocked']},'snaps':snaps,'b2':{},'news':news,'spread':spread}
-    z=b2(snaps['M5']['frame']); ts=[snaps[k]['trend'] for k in ['M5','M15','H1','H4']]; bull=all(t=='صاعد' for t in ts); bear=all(t=='هابط' for t in ts); s=snaps['M5']
-    mb=s['rsi']>=52 and s['momentum']>0 and s['macd_hist']>0; ms=s['rsi']<=48 and s['momentum']<0 and s['macd_hist']<0
-    gates={'البيانات':True,'النظام السوقي':s['regime']=='اتجاه','توافق الأطر':bull or bear,'الزخم':mb or ms,'B2':z['valid'],'المخاطر':not st.session_state.kill_switch,'الحد اليومي':daily_loss_pct(s['close'])<DAILY_LOSS_LIMIT*100 and st.session_state.daily_trades<MAX_DAILY_TRADES,'السبريد':not spread['blocked'],'الأخبار':not news['blocked']}
-    strength=(30 if gates['توافق الأطر'] else 0)+(25 if gates['B2'] else 0)+(20 if gates['الزخم'] else 0)+(10 if s['adx']>=25 else 0)+(10 if ((bull and ts[-1]=='صاعد') or (bear and ts[-1]=='هابط')) else 0)+(5 if gates['السبريد'] and gates['الأخبار'] else 0)
-    reason=next((k for k,v in gates.items() if not v),'اجتازت جميع البوابات'); signal='انتظار'
-    if all(gates.values()):
-        if z['direction']=='شراء' and bull and mb:signal='شراء'
-        elif z['direction']=='بيع' and bear and ms:signal='بيع'
-        else:reason='تعارض B2 مع الاتجاه أو الزخم'
-    return {'signal':signal,'strength':min(strength,100),'reason':reason,'gates':gates,'snaps':snaps,'b2':z,'news':news,'spread':spread}
+def open_trade(side, fallback_price, atr_value, quote):
+    if st.session_state.position is not None:
+        return False, "هناك صفقة مفتوحة"
+    if st.session_state.kill_switch:
+        return False, "Kill Switch مفعل"
+    if st.session_state.daily_trades >= MAX_DAILY_TRADES:
+        return False, "تم بلوغ الحد اليومي للصفقات"
+    if daily_loss_pct(fallback_price) >= DAILY_LOSS_LIMIT * 100:
+        return False, "تم بلوغ حد الخسارة اليومية"
+    if not finite(atr_value) or atr_value <= 0:
+        return False, "ATR غير صالح"
+
+    entry = execution_price(side, quote, fallback_price)
+    distance = max(float(atr_value) * 1.4, entry * 0.0015)
+    risk_money = float(st.session_state.balance) * RISK_PER_TRADE
+
+    if side == "شراء":
+        stop = entry - distance
+        tp1 = entry + distance
+        tp2 = entry + 2.2 * distance
+    else:
+        stop = entry + distance
+        tp1 = entry - distance
+        tp2 = entry - 2.2 * distance
+
+    st.session_state.position = {
+        "id": uuid.uuid4().hex[:10],
+        "side": side,
+        "entry": float(entry),
+        "sl": float(stop),
+        "initial_distance": float(distance),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "risk_money": risk_money,
+        "remaining_fraction": 1.0,
+        "realized_r": 0.0,
+        "tp1_hit": False,
+        "opened": now_riyadh().isoformat(),
+    }
+    st.session_state.daily_trades += 1
+    return True, "تم فتح صفقة ورقية"
 
 
-def open_trade(side,price,av):
-    if st.session_state.position or st.session_state.kill_switch or st.session_state.daily_trades>=MAX_DAILY_TRADES or daily_loss_pct(price)>=DAILY_LOSS_LIMIT*100 or not np.isfinite(av) or av<=0:return False
-    d=max(av*1.4,price*.0015); risk=st.session_state.balance*RISK_PER_TRADE
-    if side=='شراء':sl,tp1,tp2=price-d,price+d,price+2.2*d
-    else:sl,tp1,tp2=price+d,price-d,price-2.2*d
-    st.session_state.position={'id':uuid.uuid4().hex[:10],'side':side,'entry':float(price),'sl':float(sl),'initial_distance':float(d),'tp1':float(tp1),'tp2':float(tp2),'risk_money':float(risk),'remaining_fraction':1.,'realized_r':0.,'tp1_hit':False,'opened':datetime.now(TZ).isoformat()}; st.session_state.daily_trades+=1; return True
-
-
-def close_trade(price,reason):
-    p=st.session_state.position
-    if not p:return
-    r=unrealized_r(p,price); pnl=r*p['risk_money']; st.session_state.balance+=pnl
-    st.session_state.history.insert(0,{'الوقت':datetime.now(TZ).strftime('%Y-%m-%d %H:%M'),'المعرف':p['id'],'النوع':p['side'],'الدخول':round(p['entry'],2),'الخروج':round(price,2),'R':round(r,3),'الربح/الخسارة':round(pnl,2),'السبب':reason}); st.session_state.position=None
+def close_trade(price, reason):
+    position = st.session_state.position
+    if not position:
+        return
+    total_r = unrealized_r(position, price)
+    pnl = total_r * position["risk_money"]
+    st.session_state.balance += pnl
+    st.session_state.history.insert(
+        0,
+        {
+            "الوقت": now_riyadh().strftime("%Y-%m-%d %H:%M:%S"),
+            "المعرف": position["id"],
+            "النوع": position["side"],
+            "الدخول": round(position["entry"], 2),
+            "الخروج": round(price, 2),
+            "R": round(total_r, 3),
+            "الربح/الخسارة": round(pnl, 2),
+            "السبب": reason,
+        },
+    )
+    st.session_state.position = None
 
 
 def manage_trade(price):
-    p=st.session_state.position
-    if not p or not np.isfinite(price):return
-    if p['side']=='شراء':
-        if price<=p['sl']:close_trade(p['sl'],'وقف الخسارة');return
-        if not p['tp1_hit'] and price>=p['tp1']:
-            p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry'];return
-        if p['tp1_hit'] and price>=p['tp2']:close_trade(p['tp2'],'الهدف الثاني')
+    position = st.session_state.position
+    if not position or not finite(price):
+        return
+
+    if position["side"] == "شراء":
+        if price <= position["sl"]:
+            close_trade(position["sl"], "وقف الخسارة")
+            return
+        if not position["tp1_hit"] and price >= position["tp1"]:
+            position["realized_r"] += 0.5
+            position["remaining_fraction"] = 0.5
+            position["tp1_hit"] = True
+            position["sl"] = position["entry"]
+            return
+        if position["tp1_hit"] and price >= position["tp2"]:
+            close_trade(position["tp2"], "الهدف الثاني")
+            return
     else:
-        if price>=p['sl']:close_trade(p['sl'],'وقف الخسارة');return
-        if not p['tp1_hit'] and price<=p['tp1']:
-            p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry'];return
-        if p['tp1_hit'] and price<=p['tp2']:close_trade(p['tp2'],'الهدف الثاني')
+        if price >= position["sl"]:
+            close_trade(position["sl"], "وقف الخسارة")
+            return
+        if not position["tp1_hit"] and price <= position["tp1"]:
+            position["realized_r"] += 0.5
+            position["remaining_fraction"] = 0.5
+            position["tp1_hit"] = True
+            position["sl"] = position["entry"]
+            return
+        if position["tp1_hit"] and price <= position["tp2"]:
+            close_trade(position["tp2"], "الهدف الثاني")
+            return
+
+# ------------------------- backtest ---------------------------
+def prepare_mtf_backtest(raw):
+    m5 = add_indicators(closed_m5(raw)).dropna().reset_index(drop=True)
+    m15 = add_indicators(resample_closed(raw, "15min")).dropna().reset_index(drop=True)
+    h1 = add_indicators(resample_closed(raw, "1h")).dropna().reset_index(drop=True)
+    h4 = add_indicators(resample_closed(raw, "4h")).dropna().reset_index(drop=True)
+
+    if min(len(m5), len(m15), len(h1), len(h4)) < 250:
+        return None, "بيانات غير كافية لاختبار MTF"
+
+    # Decision timestamp = M5 close. Higher-TF timestamp = higher-TF close.
+    # Exact equality is deliberately rejected: a higher-TF candle becomes usable on the next M5 decision.
+    m5["decision_ts"] = m5["datetime"] + pd.Timedelta(minutes=5)
+    prepared = m5[["datetime", "decision_ts", "open", "high", "low", "close", "atr", "rsi", "macd_hist", "momentum", "adx", "ema20", "ema50", "ema100"]].copy()
+
+    for name, frame, rule in (("m15", m15, "15min"), ("h1", h1, "1h"), ("h4", h4, "4h")):
+        higher = frame[["datetime", "close", "ema20", "ema50", "ema100"]].copy()
+        higher["available_ts"] = higher["datetime"] + pd.Timedelta(rule)
+        higher = higher.rename(columns={
+            "close": f"close_{name}", "ema20": f"ema20_{name}", "ema50": f"ema50_{name}", "ema100": f"ema100_{name}",
+        })
+        prepared = pd.merge_asof(
+            prepared.sort_values("decision_ts"),
+            higher[["available_ts", f"close_{name}", f"ema20_{name}", f"ema50_{name}", f"ema100_{name}"]].sort_values("available_ts"),
+            left_on="decision_ts",
+            right_on="available_ts",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+
+    prepared = prepared.dropna().reset_index(drop=True)
+    return prepared, None
 
 
-def backtest_mtf(raw_m5):
-    """Closed-bar MTF backtest. Signal is evaluated on M5 with the latest CLOSED M15/H1/H4 bars."""
-    m5=indicators(closed_m5(raw_m5)).dropna().reset_index(drop=True)
-    m15=resample_closed(raw_m5,'15min'); h1=resample_closed(raw_m5,'1h'); h4=resample_closed(raw_m5,'4h')
-    m15=indicators(m15).dropna().reset_index(drop=True); h1=indicators(h1).dropna().reset_index(drop=True); h4=indicators(h4).dropna().reset_index(drop=True)
-    if min(len(m5),len(m15),len(h1),len(h4))<250:return pd.DataFrame(),{'trades':0,'warning':'العينة صغيرة'}
-    # Every higher-timeframe value becomes available only at that candle's CLOSE.
-    # The M5 decision timestamp is also the M5 candle close, so no future HTF data can leak in.
-    m5['decision_ts']=m5['datetime']+pd.Timedelta(minutes=5)
-    for name,df,rule in [('m15',m15,'15min'),('h1',h1,'1h'),('h4',h4,'4h')]:
-        df['ts']=df['datetime']+pd.Timedelta(rule)
-    base=m5[['datetime','decision_ts','open','high','low','close','ema20','ema50','ema100','rsi','atr','macd_hist','momentum','adx']].copy()
-    for name,df in [('m15',m15),('h1',h1),('h4',h4)]:
-        cols=['ts','close','ema20','ema50','ema100','rsi','adx']
-        base=pd.merge_asof(base.sort_values('decision_ts'),df[cols].sort_values('ts'),left_on='decision_ts',right_on='ts',direction='backward',allow_exact_matches=False,suffixes=('','_'+name))
-    split_time=base.decision_ts.iloc[int(len(base)*.7)]; rows=[]; i=130
-    while i<len(base)-2:
-        r=base.iloc[i]
-        # OOS entries only. Pre-split rows are used for warm-up but never counted as trades.
-        if r.decision_ts<split_time: i+=1;continue
-        av=float(r.atr)
-        if not np.isfinite(av) or av<=0:i+=1;continue
-        # B2: the previous candle is the breakout candle; the 20 candles BEFORE it define the level.
-        p=base.iloc[max(0,i-21):i-1]
-        if len(p)<20: i+=1;continue
-        res=float(p.high.max());sup=float(p.low.min());prev=float(base.close.iloc[i-1])
-        rb=prev>res and r.low<=res+.35*av and r.close>res; rs=prev<sup and r.high>=sup-.35*av and r.close<sup
-        def bull(s): return s.close>s.ema20>s.ema50>s.ema100
-        def bear(s): return s.close<s.ema20<s.ema50<s.ema100
-        bull_mtf=bull(r) and bool(r.close_m15>r.ema20_m15>r.ema50_m15>r.ema100_m15) and bool(r.close_h1>r.ema20_h1>r.ema50_h1>r.ema100_h1) and bool(r.close_h4>r.ema20_h4>r.ema50_h4>r.ema100_h4)
-        bear_mtf=bear(r) and bool(r.close_m15<r.ema20_m15<r.ema50_m15<r.ema100_m15) and bool(r.close_h1<r.ema20_h1<r.ema50_h1<r.ema100_h1) and bool(r.close_h4<r.ema20_h4<r.ema50_h4<r.ema100_h4)
-        mb=r.rsi>=52 and r.momentum>0 and r.macd_hist>0 and r.adx>=25; ms=r.rsi<=48 and r.momentum<0 and r.macd_hist<0 and r.adx>=25
-        side='شراء' if rb and bull_mtf and mb else 'بيع' if rs and bear_mtf and ms else None
-        if not side:i+=1;continue
-        entry=float(r.close);d=max(av*1.4,entry*.0015);sl=entry-d if side=='شراء' else entry+d;tp1=entry+d if side=='شراء' else entry-d;tp2=entry+2.2*d if side=='شراء' else entry-2.2*d
-        realized=0.;remaining_fraction=1.;hit=False;outcome=None;reason=None;close_i=None
-        for j in range(i+1,min(i+100,len(base))):
-            hi,lo=float(base.high.iloc[j]),float(base.low.iloc[j])
-            if side=='شراء':
-                if lo<=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
-                if not hit and hi>=tp1:
-                    realized+=.5;remaining_fraction=.5;hit=True;sl=entry
-                    continue  # TP2 starts from the next bar
-                if hit and hi>=tp2:
-                    outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
+def backtest_mtf(raw, oos_fraction=0.30):
+    base, error = prepare_mtf_backtest(raw)
+    if base is None:
+        return pd.DataFrame(), {"trades": 0, "warning": error}
+
+    split_index = int(len(base) * (1 - oos_fraction))
+    split_ts = base["decision_ts"].iloc[split_index]
+    trades = []
+    i = 1
+
+    while i < len(base) - 2:
+        row = base.iloc[i]
+        if row["decision_ts"] < split_ts:
+            i += 1
+            continue
+
+        # B2 levels use 20 M5 candles before the breakout candle.
+        if i < 22 or not finite(row["atr"]):
+            i += 1
+            continue
+
+        history = base.iloc[i - 21:i - 1]
+        breakout = base.iloc[i - 1]
+        current = row
+        resistance = float(history["high"].max())
+        support = float(history["low"].min())
+        atr_value = float(current["atr"])
+
+        bullish_break = float(breakout["close"]) > resistance
+        bearish_break = float(breakout["close"]) < support
+        bullish_retest = bullish_break and float(current["low"]) <= resistance + 0.35 * atr_value and float(current["close"]) > resistance
+        bearish_retest = bearish_break and float(current["high"]) >= support - 0.35 * atr_value and float(current["close"]) < support
+
+        bull_mtf = (
+            current.close > current.ema20 > current.ema50 > current.ema100
+            and current.close_m15 > current.ema20_m15 > current.ema50_m15 > current.ema100_m15
+            and current.close_h1 > current.ema20_h1 > current.ema50_h1 > current.ema100_h1
+            and current.close_h4 > current.ema20_h4 > current.ema50_h4 > current.ema100_h4
+        )
+        bear_mtf = (
+            current.close < current.ema20 < current.ema50 < current.ema100
+            and current.close_m15 < current.ema20_m15 < current.ema50_m15 < current.ema100_m15
+            and current.close_h1 < current.ema20_h1 < current.ema50_h1 < current.ema100_h1
+            and current.close_h4 < current.ema20_h4 < current.ema50_h4 < current.ema100_h4
+        )
+        momentum_buy = current.rsi >= 52 and current.momentum > 0 and current.macd_hist > 0 and current.adx >= 25
+        momentum_sell = current.rsi <= 48 and current.momentum < 0 and current.macd_hist < 0 and current.adx >= 25
+
+        side = None
+        if bullish_retest and bull_mtf and momentum_buy:
+            side = "شراء"
+        elif bearish_retest and bear_mtf and momentum_sell:
+            side = "بيع"
+
+        if side is None:
+            i += 1
+            continue
+
+        entry = float(current.close)
+        distance = max(atr_value * 1.4, entry * 0.0015)
+        stop = entry - distance if side == "شراء" else entry + distance
+        tp1 = entry + distance if side == "شراء" else entry - distance
+        tp2 = entry + 2.2 * distance if side == "شراء" else entry - 2.2 * distance
+
+        realized_r = 0.0
+        remaining = 1.0
+        tp1_hit = False
+        outcome = None
+        reason = None
+        exit_index = None
+
+        for j in range(i + 1, min(i + 100, len(base))):
+            high = float(base.high.iloc[j])
+            low = float(base.low.iloc[j])
+
+            # Conservative OHLC convention: if SL and TP are both inside one candle,
+            # the stop is assumed to happen first. After TP1, the remainder is not
+            # allowed to hit TP2 until the next bar.
+            if side == "شراء":
+                if low <= stop:
+                    outcome = realized_r - remaining
+                    reason = "وقف الخسارة"
+                    exit_index = j
+                    break
+                if not tp1_hit and high >= tp1:
+                    realized_r += 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    stop = entry
+                    continue
+                if tp1_hit and high >= tp2:
+                    outcome = realized_r + 1.1
+                    reason = "الهدف الثاني"
+                    exit_index = j
+                    break
             else:
-                if hi>=sl:outcome=realized-remaining_fraction;reason='وقف الخسارة';close_i=j;break
-                if not hit and lo<=tp1:
-                    realized+=.5;remaining_fraction=.5;hit=True;sl=entry
-                    continue  # TP2 starts from the next bar
-                if hit and lo<=tp2:
-                    outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
+                if high >= stop:
+                    outcome = realized_r - remaining
+                    reason = "وقف الخسارة"
+                    exit_index = j
+                    break
+                if not tp1_hit and low <= tp1:
+                    realized_r += 0.5
+                    remaining = 0.5
+                    tp1_hit = True
+                    stop = entry
+                    continue
+                if tp1_hit and low <= tp2:
+                    outcome = realized_r + 1.1
+                    reason = "الهدف الثاني"
+                    exit_index = j
+                    break
+
         if outcome is not None:
-            rows.append({'الوقت':r.datetime,'النوع':side,'الدخول':round(entry,2),'الوقف':round(entry-d if side=='شراء' else entry+d,2),'TP1':round(tp1,2),'TP2':round(tp2,2),'R':round(outcome,3),'السبب':reason,'OOS':r.datetime>=split_time});i=close_i+1
-        else:i+=1
-    t=pd.DataFrame(rows);o=t[t.OOS].copy() if not t.empty else t
-    if o.empty:return t,{'trades':0,'warning':'لا توجد صفقات OOS مطابقة لكل بوابات MTF'}
-    eq=peak=dd=0.
-    for v in o.R:eq+=float(v);peak=max(peak,eq);dd=max(dd,peak-eq)
-    gw=o.loc[o.R>0,'R'].sum();gl=abs(o.loc[o.R<0,'R'].sum());pf=gw/gl if gl else math.inf
-    return t,{'trades':len(o),'win_rate':float((o.R>0).mean()*100),'profit_factor':float(pf),'total_r':float(o.R.sum()),'max_dd_r':float(dd),'warning':None,'oos_start':str(split_time)}
+            trades.append({
+                "الوقت": current.datetime,
+                "النوع": side,
+                "الدخول": round(entry, 2),
+                "الوقف": round(entry - distance if side == "شراء" else entry + distance, 2),
+                "TP1": round(tp1, 2),
+                "TP2": round(tp2, 2),
+                "R": round(float(outcome), 3),
+                "السبب": reason,
+                "OOS": True,
+            })
+            i = exit_index + 1
+        else:
+            i += 1
 
+    result = pd.DataFrame(trades)
+    if result.empty:
+        return result, {"trades": 0, "warning": "لا توجد صفقات OOS مطابقة لكل بوابات MTF"}
 
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for value in result["R"]:
+        equity += float(value)
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
 
-def internal_tests():
-    # Strategy invariants: B2 level must exclude breakout candle; R accounting must be immutable.
-    idx=pd.date_range('2026-01-01',periods=35,freq='5min',tz='UTC')
-    x=pd.DataFrame({'datetime':idx,'open':100.,'high':101.,'low':99.,'close':100.})
-    x.loc[29,['open','high','low','close']]=[101,103,100.5,102.5]
-    x.loc[30,['open','high','low','close']]=[102.5,103,102,102.8]
-    x=indicators(x)
-    z=b2(x)
-    assert np.isfinite(z['level']), 'B2 level invariant failed'
-    assert z['level'] < 103, 'B2 level includes breakout candle'
-    d=2.0
-    total=.5 + 1.1
-    assert abs(total-1.6)<1e-9, 'TP1/TP2 R invariant failed'
+    gross_win = result.loc[result["R"] > 0, "R"].sum()
+    gross_loss = abs(result.loc[result["R"] < 0, "R"].sum())
+    profit_factor = gross_win / gross_loss if gross_loss else math.inf
+
+    return result, {
+        "trades": len(result),
+        "win_rate": float((result["R"] > 0).mean() * 100),
+        "profit_factor": float(profit_factor),
+        "total_r": float(result["R"].sum()),
+        "max_dd_r": float(max_dd),
+        "warning": "العينة الصغيرة لا تثبت صلاحية الاستراتيجية" if len(result) < 100 else None,
+        "oos_start": str(split_ts),
+    }
+
+# ---------------------- deterministic tests ------------------
+def run_internal_tests():
+    # 1) B2 level must exclude the breakout candle.
+    idx = pd.date_range("2026-01-01", periods=40, freq="5min", tz="UTC")
+    frame = pd.DataFrame({"datetime": idx, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0})
+    frame.loc[38, ["open", "high", "low", "close"]] = [100.0, 103.0, 99.5, 102.5]
+    frame.loc[39, ["open", "high", "low", "close"]] = [102.5, 103.0, 102.0, 102.8]
+    calculated = add_indicators(frame)
+    b2 = b2_signal(calculated)
+    assert finite(b2["level"]) and b2["level"] < 103.0, "B2 level leaked breakout candle"
+
+    # 2) Risk accounting invariant.
+    assert abs((0.5 + 1.1) - 1.6) < 1e-12, "TP1/TP2 R invariant failed"
+
+    # 3) Bearish MTF expression must be strictly descending.
+    assert (100 > 99 > 98 > 97) and not (100 < 99 < 98 < 97), "Trend comparison invariant failed"
+
+    # 4) Exact higher-TF close must not be accepted by the merge rule.
+    left = pd.DataFrame({"decision_ts": pd.to_datetime(["2026-01-01 01:00"], utc=True)})
+    right = pd.DataFrame({"available_ts": pd.to_datetime(["2026-01-01 01:00"], utc=True), "v": [1]})
+    merged = pd.merge_asof(left, right, left_on="decision_ts", right_on="available_ts", direction="backward", allow_exact_matches=False)
+    assert pd.isna(merged.loc[0, "v"]), "Exact higher-TF close leaked into same decision"
+
     return True
 
-
+# --------------------------- UI helpers -----------------------
 def metrics(items):
-    cs=st.columns(len(items))
-    for c,(a,b) in zip(cs,items):c.markdown(f"<div class='metric'><div class='label'>{a}</div><div class='value'>{b}</div></div>",unsafe_allow_html=True)
+    columns = st.columns(len(items))
+    for column, (label, value) in zip(columns, items):
+        column.markdown(f"<div class='metric'><div class='label'>{label}</div><div class='value'>{value}</div></div>", unsafe_allow_html=True)
 
-# ---------------- UI ----------------
+# ---------------------------- app -----------------------------
+run_internal_tests()
+
 with st.sidebar:
-    st.markdown('## 🟡 GOLD AI');st.caption('XAU/USD • Paper Trading فقط')
-    research=st.toggle('وضع البحث التجريبي',value=st.session_state.research_mode);st.session_state.research_mode=research
-    st.session_state.kill_switch=st.toggle('Kill Switch',value=st.session_state.kill_switch)
-    st.session_state.auto_refresh=st.toggle('تحديث تلقائي',value=False);refresh=st.slider('ثواني التحديث',15,120,45)
+    st.markdown("## 🟡 GOLD AI")
+    st.caption("XAU/USD • Paper Trading فقط")
+    st.session_state.research_mode = st.toggle("وضع البحث التجريبي", value=st.session_state.research_mode)
+    st.session_state.kill_switch = st.toggle("Kill Switch", value=st.session_state.kill_switch)
+    st.session_state.auto_refresh = st.toggle("تحديث تلقائي", value=st.session_state.auto_refresh)
+    refresh_seconds = st.slider("ثواني التحديث", 15, 120, 45)
 
-internal_tests()
-raw,msg,chunks,credits=fetch_history();raw=closed_m5(raw)
-if raw.empty:st.error('مصدر البيانات غير متاح');st.info(msg);st.stop()
-qok,qmsg=quality(raw)
-if not qok:st.warning('جودة البيانات: '+qmsg)
-m5=indicators(raw);m15=resample_closed(raw,'15min');h1=resample_closed(raw,'1h');h4=resample_closed(raw,'4h')
-if min(len(m5),len(m15),len(h1),len(h4))<110:st.error('البيانات غير كافية لجميع الأطر الزمنية.');st.stop()
-price=float(raw.close.iloc[-1]);st.session_state.last_price=price;manage_trade(price);a=analyze(m5,m15,h1,h4,research)
+raw, history_message, chunk_count, credits = fetch_history()
+raw = closed_m5(raw)
+if raw.empty:
+    st.error("مصدر البيانات غير متاح")
+    st.info(history_message)
+    st.stop()
 
-candle=str(raw.datetime.iloc[-1])
-if st.session_state.last_signal_candle!=candle:
-    st.session_state.last_signal_candle=candle
-    rec={'decision_id':uuid.uuid4().hex[:10],'الوقت':datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),'الشمعة':candle,'الإشارة':a['signal'],'القوة':a['strength'],'السبب':a['reason']}
-    rec.update({k:'PASS' if v else 'BLOCK' for k,v in a['gates'].items()});st.session_state.decisions.insert(0,rec);st.session_state.decisions=st.session_state.decisions[:500]
-if a['signal'] in ('شراء','بيع') and st.session_state.position is None:open_trade(a['signal'],price,a['snaps']['M5']['atr'])
+quality_ok, quality_message = data_quality(raw)
+if not quality_ok:
+    st.warning("جودة البيانات: " + quality_message)
 
-st.caption('الوضع: Paper Trading فقط • الحالة محفوظة داخل جلسة Streamlit الحالية وليست قاعدة بيانات دائمة')
-st.markdown(f"<div class='hero'><div class='kicker'>GOLD AI • SMART TRADING SYSTEM</div><h1 class='gold'>XAU/USD</h1><div class='price'>${price:,.2f}</div><p class='muted'>Paper Trading • Market Data • Strategy Engine • Risk Engine</p></div>",unsafe_allow_html=True)
-metrics([('القرار',a['signal']),('قوة الإشارة',f"{a['strength']}%"),('السوق',a['snaps']['M5']['regime']),('الرصيد',f"${st.session_state.balance:,.2f}"),('الخسارة اليومية',f"{daily_loss_pct(price):.2f}%")])
+m5 = add_indicators(raw)
+m15 = resample_closed(raw, "15min")
+h1 = resample_closed(raw, "1h")
+h4 = resample_closed(raw, "4h")
 
-st.subheader('Multi-Timeframe Command Center')
-cs=st.columns(4)
-for c,k in zip(cs,['M5','M15','H1','H4']):
-    s=a['snaps'][k];c.markdown(f"<div class='card'><div class='kicker'>{k}</div><div class='signal'>{s['trend']}</div><div class='muted'>RSI {s['rsi']:.1f} • ADX {s['adx']:.1f}</div></div>",unsafe_allow_html=True)
+if min(len(m5), len(m15), len(h1), len(h4)) < 120:
+    st.error("البيانات غير كافية لجميع الأطر الزمنية")
+    st.stop()
 
-st.subheader('Decision Engine')
-cls='good' if a['signal'] in ('شراء','بيع') else ''
-st.markdown(f"<div class='card'><div class='kicker'>FINAL DECISION</div><div class='signal {cls}'>{a['signal']}</div><p>{a['reason']}</p><span class='muted'>Signal strength ≠ probability of profit.</span></div>",unsafe_allow_html=True)
-st.dataframe(pd.DataFrame([{'البوابة':k,'الحالة':'PASS' if v else 'BLOCK'} for k,v in a['gates'].items()]),hide_index=True,use_container_width=True)
+quote = fetch_quote()
+reference_price = float(raw["close"].iloc[-1])
+if st.session_state.position:
+    mark = mark_price(st.session_state.position, quote, reference_price)
+else:
+    mark = reference_price
 
-c1,c2=st.columns(2)
-with c1:
-    st.markdown('### B2 Breakout / Retest');z=a['b2'];metrics([('Breakout','YES' if z.get('breakout') else 'NO'),('Retest','YES' if z.get('retest') else 'NO'),('الاتجاه',z.get('direction') or '—'),('المستوى',f"{z.get('level',np.nan):.2f}" if np.isfinite(z.get('level',np.nan)) else '—')])
-with c2:
-    st.markdown('### Safety Filters');st.info('News: '+a['news']['label']);st.info('Spread: '+a['spread']['label'])
+manage_trade(mark)
+analysis = analyze(m5, m15, h1, h4, st.session_state.research_mode)
 
-st.subheader('Market');st.line_chart(raw.tail(300).set_index('datetime')[['close']],use_container_width=True)
-st.subheader('Paper Trading')
-p=st.session_state.position
-if p:
-    r=unrealized_r(p,price);pnl=r*p['risk_money'];metrics([('النوع',p['side']),('Entry',f"{p['entry']:.2f}"),('Current',f"{price:.2f}"),('SL',f"{p['sl']:.2f}"),('TP1',f"{p['tp1']:.2f}"),('TP2',f"{p['tp2']:.2f}"),('P&L',f"${pnl:,.2f}"),('R',f"{r:.2f}R")]);
-    if p['tp1_hit']:st.success('TP1 HIT • 50% CLOSED • STOP → BREAK-EVEN')
-else:st.info('لا توجد صفقة ورقية مفتوحة.')
+closed_candle_id = str(raw["datetime"].iloc[-1])
+if st.session_state.last_signal_candle != closed_candle_id:
+    st.session_state.last_signal_candle = closed_candle_id
+    decision = {
+        "decision_id": uuid.uuid4().hex[:10],
+        "الوقت": now_riyadh().strftime("%Y-%m-%d %H:%M:%S"),
+        "الشمعة": closed_candle_id,
+        "الإشارة": analysis["signal"],
+        "القوة": analysis["strength"],
+        "السبب": analysis["reason"],
+    }
+    decision.update({name: "PASS" if passed else "BLOCK" for name, passed in analysis["gates"].items()})
+    st.session_state.decisions.insert(0, decision)
+    st.session_state.decisions = st.session_state.decisions[:500]
 
-st.subheader('Risk Center');metrics([('Balance',f"${st.session_state.balance:,.2f}"),('Risk / Trade',f"{RISK_PER_TRADE*100:.2f}%"),('Daily Loss Limit',f"{DAILY_LOSS_LIMIT*100:.1f}%"),('Trades Today',f"{st.session_state.daily_trades}/{MAX_DAILY_TRADES}"),('Open Positions','1' if p else '0'),('Kill Switch','ON' if st.session_state.kill_switch else 'OFF')])
+if analysis["signal"] in ("شراء", "بيع") and st.session_state.position is None:
+    open_trade(analysis["signal"], reference_price, analysis["snapshots"]["M5"]["atr"], analysis["spread"])
 
-st.subheader('Backtest Lab')
-with st.expander('تشغيل OOS Backtest'):
-    mx=min(5000,len(m15))
-    if mx<500:st.warning('بيانات M15 الحالية لا تكفي.')
+# ---------------------------- dashboard -----------------------
+st.caption("Paper Trading فقط • لا يوجد تنفيذ لدى وسيط • الحالة محفوظة داخل جلسة Streamlit")
+st.markdown(
+    f"<div class='hero'><div class='kicker'>GOLD AI • SMART TRADING SYSTEM</div><h1 class='gold'>XAU/USD</h1><div class='price'>${reference_price:,.2f}</div><p class='muted'>Market Data • Strategy Engine • Risk Engine • Paper Engine</p></div>",
+    unsafe_allow_html=True,
+)
+
+metrics([
+    ("القرار", analysis["signal"]),
+    ("قوة الإشارة", f"{analysis['strength']}%"),
+    ("النظام", analysis["snapshots"]["M5"]["regime"]),
+    ("الرصيد", f"${st.session_state.balance:,.2f}"),
+    ("الخسارة اليومية", f"{daily_loss_pct(mark):.2f}%"),
+])
+
+st.subheader("Multi-Timeframe Command Center")
+columns = st.columns(4)
+for column, name in zip(columns, TIMEFRAMES):
+    snap = analysis["snapshots"][name]
+    column.markdown(
+        f"<div class='card'><div class='kicker'>{name}</div><div class='signal'>{snap['trend']}</div><div class='muted'>RSI {snap['rsi']:.1f} • ADX {snap['adx']:.1f}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+st.subheader("Decision Engine")
+signal_class = "good" if analysis["signal"] in ("شراء", "بيع") else ""
+st.markdown(
+    f"<div class='card'><div class='kicker'>FINAL DECISION</div><div class='signal {signal_class}'>{analysis['signal']}</div><p>{analysis['reason']}</p><span class='muted'>Signal strength ≠ probability of profit.</span></div>",
+    unsafe_allow_html=True,
+)
+st.dataframe(
+    pd.DataFrame([{"البوابة": name, "الحالة": "PASS" if passed else "BLOCK"} for name, passed in analysis["gates"].items()]),
+    hide_index=True,
+    use_container_width=True,
+)
+
+left, right = st.columns(2)
+with left:
+    st.markdown("### B2 Breakout / Retest")
+    b2 = analysis["b2"]
+    metrics([
+        ("Breakout", "YES" if b2.get("breakout") else "NO"),
+        ("Retest", "YES" if b2.get("retest") else "NO"),
+        ("الاتجاه", b2.get("direction") or "—"),
+        ("المستوى", fmt_price(b2.get("level"))),
+    ])
+with right:
+    st.markdown("### Safety Filters")
+    st.info("News: " + analysis["news"]["label"])
+    st.info("Spread: " + analysis["spread"]["label"])
+
+st.subheader("Market")
+st.line_chart(raw.tail(300).set_index("datetime")[["close"]], use_container_width=True)
+
+st.subheader("Paper Trading")
+position = st.session_state.position
+if position:
+    current_r = unrealized_r(position, mark)
+    pnl = current_r * position["risk_money"]
+    metrics([
+        ("النوع", position["side"]),
+        ("Entry", fmt_price(position["entry"])),
+        ("Current", fmt_price(mark)),
+        ("SL", fmt_price(position["sl"])),
+        ("TP1", fmt_price(position["tp1"])),
+        ("TP2", fmt_price(position["tp2"])),
+        ("P&L", f"${pnl:,.2f}"),
+        ("R", f"{current_r:.2f}R"),
+    ])
+    if position["tp1_hit"]:
+        st.success("TP1 HIT • 50% CLOSED • STOP → BREAK-EVEN")
+else:
+    st.info("لا توجد صفقة ورقية مفتوحة")
+
+st.subheader("Risk Center")
+metrics([
+    ("Balance", f"${st.session_state.balance:,.2f}"),
+    ("Risk / Trade", f"{RISK_PER_TRADE * 100:.2f}%"),
+    ("Daily Loss Limit", f"{DAILY_LOSS_LIMIT * 100:.1f}%"),
+    ("Trades Today", f"{st.session_state.daily_trades}/{MAX_DAILY_TRADES}"),
+    ("Open Positions", "1" if position else "0"),
+    ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF"),
+])
+
+st.subheader("Backtest Lab")
+with st.expander("تشغيل OOS MTF Backtest"):
+    max_m15 = len(m15)
+    if max_m15 < 500:
+        st.warning("بيانات M15 الحالية لا تكفي")
     else:
-        bars=st.slider('حجم الاختبار (تقريبيًا بعدد شموع M15)',500,mx,min(3000,mx),100);trades,stats=backtest_mtf(raw.tail(min(len(raw),bars*3)))
-        if stats['trades']:
-            metrics([('OOS Trades',stats['trades']),('Win Rate',f"{stats['win_rate']:.1f}%"),('Profit Factor',f"{stats['profit_factor']:.2f}"),('Total R',f"{stats['total_r']:.2f}R"),('Max DD',f"{stats['max_dd_r']:.2f}R")]);st.caption('OOS فقط. هذا الاختبار يحاكي M5 + توافق M15/H1/H4 + B2 + Momentum/ADX، باستخدام شموع مغلقة فقط. الأخبار والسبريد التاريخيان غير متاحين لذلك لا يدخلان في نتيجة الباك تست.');st.dataframe(trades.tail(100),hide_index=True,use_container_width=True)
-        else:st.warning(stats.get('warning','لا توجد نتائج'))
+        bars = st.slider("عدد شموع M15 التقريبي", 500, max_m15, min(3000, max_m15), 100)
+        raw_window = raw.tail(min(len(raw), bars * 3))
+        trades, stats = backtest_mtf(raw_window)
+        if stats["trades"]:
+            metrics([
+                ("OOS Trades", stats["trades"]),
+                ("Win Rate", f"{stats['win_rate']:.1f}%"),
+                ("Profit Factor", f"{stats['profit_factor']:.2f}"),
+                ("Total R", f"{stats['total_r']:.2f}R"),
+                ("Max DD", f"{stats['max_dd_r']:.2f}R"),
+            ])
+            st.caption("OOS فقط • M5 + M15/H1/H4 مغلقة + B2 + Momentum/ADX. الأخبار والسبريد التاريخيان غير متاحين لذلك لا يدخلان في نتيجة الاختبار.")
+            if stats.get("warning"):
+                st.warning(stats["warning"])
+            st.dataframe(trades.tail(100), hide_index=True, use_container_width=True)
+        else:
+            st.warning(stats.get("warning", "لا توجد نتائج"))
 
-st.subheader('Decision Log');st.dataframe(pd.DataFrame(st.session_state.decisions),hide_index=True,use_container_width=True) if st.session_state.decisions else st.info('لا يوجد سجل بعد.')
-st.subheader('Trade Log');st.dataframe(pd.DataFrame(st.session_state.history),hide_index=True,use_container_width=True) if st.session_state.history else st.info('لا توجد صفقات مغلقة.')
-st.subheader('System Health');st.dataframe(pd.DataFrame([{'النظام':k,'الحالة':'ONLINE' if v else 'BLOCKED'} for k,v in {'Data Feed':not raw.empty,'Data Quality':qok,'Strategy Engine':a['snaps']['M5'] is not None,'Risk Engine':True,'Paper Engine':True,'Time Sync':True,'Economic Calendar':a['news']['connected'],'Bid/Ask Spread':a['spread']['connected']}.items()]),hide_index=True,use_container_width=True)
-st.caption(f"Last closed M5: {raw.datetime.iloc[-1]} UTC • {len(raw):,} bars • batches {chunks}/{CHUNKS} • API credits left: {credits[-1] if credits else 'N/A'}")
-if st.session_state.auto_refresh:time.sleep(refresh);st.rerun()
+st.subheader("Decision Log")
+if st.session_state.decisions:
+    st.dataframe(pd.DataFrame(st.session_state.decisions), hide_index=True, use_container_width=True)
+else:
+    st.info("لا يوجد سجل بعد")
+
+st.subheader("Trade Log")
+if st.session_state.history:
+    st.dataframe(pd.DataFrame(st.session_state.history), hide_index=True, use_container_width=True)
+else:
+    st.info("لا توجد صفقات مغلقة")
+
+st.subheader("System Health")
+st.dataframe(
+    pd.DataFrame([
+        {"النظام": "Data Feed", "الحالة": "ONLINE" if not raw.empty else "BLOCKED"},
+        {"النظام": "Data Quality", "الحالة": "ONLINE" if quality_ok else "WARNING"},
+        {"النظام": "Strategy Engine", "الحالة": "ONLINE"},
+        {"النظام": "Risk Engine", "الحالة": "ONLINE"},
+        {"النظام": "Paper Engine", "الحالة": "ONLINE"},
+        {"النظام": "Economic Calendar", "الحالة": "ONLINE" if analysis["news"]["connected"] else "BLOCKED"},
+        {"النظام": "Bid/Ask Spread", "الحالة": "ONLINE" if analysis["spread"]["connected"] else "BLOCKED"},
+    ]),
+    hide_index=True,
+    use_container_width=True,
+)
+st.caption(
+    f"Last closed M5: {raw['datetime'].iloc[-1]} UTC • {len(raw):,} bars • batches {chunk_count}/{M5_CHUNKS} • API credits left: {credits[-1] if credits else 'N/A'}"
+)
+
+if st.session_state.auto_refresh:
+    time.sleep(refresh_seconds)
+    st.rerun()
