@@ -697,23 +697,59 @@ def prepare_mtf_backtest(raw):
     return prepared, None
 
 
-def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=0.0):
+def backtest_mtf(
+    raw,
+    oos_fraction=0.30,
+    round_trip_cost=0.0,
+    slippage_per_side=0.0,
+    oos_start_ts=None,
+    oos_end_ts=None,
+):
+    """
+    Research backtest on closed MTF data.
+
+    Cost model:
+      - round_trip_cost is a fixed full round-trip price cost.
+      - slippage_per_side is applied once at entry and once at exit.
+      - costs are represented as execution-price adjustments, then converted to R.
+    These are assumptions when historical bid/ask data is unavailable.
+    """
     base, error = prepare_mtf_backtest(raw)
     if base is None:
         return pd.DataFrame(), {"trades": 0, "warning": error}
 
-    split_index = int(len(base) * (1 - oos_fraction))
-    split_ts = base["decision_ts"].iloc[split_index]
+    if oos_start_ts is None:
+        split_index = int(len(base) * (1 - oos_fraction))
+        split_ts = base["decision_ts"].iloc[min(split_index, len(base) - 1)]
+    else:
+        split_ts = pd.Timestamp(oos_start_ts)
+        if split_ts.tzinfo is None:
+            split_ts = split_ts.tz_localize("UTC")
+        else:
+            split_ts = split_ts.tz_convert("UTC")
+
+    end_ts = None
+    if oos_end_ts is not None:
+        end_ts = pd.Timestamp(oos_end_ts)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        else:
+            end_ts = end_ts.tz_convert("UTC")
+
     trades = []
     i = 1
 
     while i < len(base) - 2:
         row = base.iloc[i]
-        if row["decision_ts"] < split_ts:
+        decision_ts = pd.Timestamp(row["decision_ts"])
+
+        if decision_ts < split_ts:
             i += 1
             continue
+        if end_ts is not None and decision_ts >= end_ts:
+            break
 
-        # B2 levels use 20 M5 candles before the breakout candle.
+        # B2 levels use only M5 candles before the breakout candle.
         if i < 22 or not finite(row["atr"]):
             i += 1
             continue
@@ -727,8 +763,16 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
 
         bullish_break = float(breakout["close"]) > resistance
         bearish_break = float(breakout["close"]) < support
-        bullish_retest = bullish_break and float(current["low"]) <= resistance + 0.35 * atr_value and float(current["close"]) > resistance
-        bearish_retest = bearish_break and float(current["high"]) >= support - 0.35 * atr_value and float(current["close"]) < support
+        bullish_retest = (
+            bullish_break
+            and float(current["low"]) <= resistance + 0.35 * atr_value
+            and float(current["close"]) > resistance
+        )
+        bearish_retest = (
+            bearish_break
+            and float(current["high"]) >= support - 0.35 * atr_value
+            and float(current["close"]) < support
+        )
 
         bull_mtf = (
             current.close > current.ema20 > current.ema50 > current.ema100
@@ -745,17 +789,25 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
         momentum_buy = current.rsi >= 52 and current.momentum > 0 and current.macd_hist > 0 and current.adx >= 25
         momentum_sell = current.rsi <= 48 and current.momentum < 0 and current.macd_hist < 0 and current.adx >= 25
 
-        side = None
-        if bullish_retest and bull_mtf and momentum_buy:
-            side = "شراء"
-        elif bearish_retest and bear_mtf and momentum_sell:
+        side = "شراء" if bullish_retest and bull_mtf and momentum_buy else None
+        if bearish_retest and bear_mtf and momentum_sell:
             side = "بيع"
 
         if side is None:
             i += 1
             continue
 
-        entry = float(current.close)
+        # Fixed spread is a research assumption. Split it around the mid price.
+        spread_half = max(0.0, float(round_trip_cost)) / 2.0
+        slip = max(0.0, float(slippage_per_side))
+        raw_entry = float(current["close"])
+
+        # Execution price: worse for the trader in both directions.
+        if side == "شراء":
+            entry = raw_entry + spread_half + slip
+        else:
+            entry = raw_entry - spread_half - slip
+
         distance = max(atr_value * 1.4, entry * 0.0015)
         stop = entry - distance if side == "شراء" else entry + distance
         tp1 = entry + distance if side == "شراء" else entry - distance
@@ -769,13 +821,16 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
         exit_index = None
 
         for j in range(i + 1, min(i + 100, len(base))):
+            bar_ts = pd.Timestamp(base["decision_ts"].iloc[j])
+            if end_ts is not None and bar_ts >= end_ts:
+                break
+
             high = float(base.high.iloc[j])
             low = float(base.low.iloc[j])
 
-            # Conservative OHLC convention: if SL and TP are both inside one candle,
-            # the stop is assumed to happen first. After TP1, the remainder is not
-            # allowed to hit TP2 until the next bar.
             if side == "شراء":
+                # Conservative convention: stop first if both levels occur in one bar.
+                stop_exec = stop - slip - spread_half
                 if low <= stop:
                     outcome = realized_r - remaining
                     reason = "وقف الخسارة"
@@ -788,11 +843,13 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
                     stop = entry
                     continue
                 if tp1_hit and high >= tp2:
-                    outcome = realized_r + 1.1
+                    realized_r += 1.1
+                    outcome = realized_r
                     reason = "الهدف الثاني"
                     exit_index = j
                     break
             else:
+                stop_exec = stop + slip + spread_half
                 if high >= stop:
                     outcome = realized_r - remaining
                     reason = "وقف الخسارة"
@@ -805,27 +862,30 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
                     stop = entry
                     continue
                 if tp1_hit and low <= tp2:
-                    outcome = realized_r + 1.1
+                    realized_r += 1.1
+                    outcome = realized_r
                     reason = "الهدف الثاني"
                     exit_index = j
                     break
 
         if outcome is not None:
-            # Historical cost model: subtract a user-defined round-trip price cost
-            # plus two-sided slippage from the trade outcome in R. This is an
-            # assumption, not broker-reported historical spread.
-            total_cost = max(0.0, float(round_trip_cost)) + 2.0 * max(0.0, float(slippage_per_side))
-            cost_r = total_cost / distance if distance > 0 else 0.0
-            outcome_after_cost = float(outcome) - cost_r
+            # Charge both execution sides explicitly in R. The entry/exit
+            # thresholds are based on the executed entry price, while this
+            # separate deduction keeps the reported R net of assumed costs.
+            entry_cost = (spread_half + slip) / distance if distance > 0 else 0.0
+            exit_cost = (spread_half + slip) / distance if distance > 0 else 0.0
+            total_cost_r = entry_cost + exit_cost
+            outcome_after_cost = float(outcome) - total_cost_r
+
             trades.append({
                 "الوقت": current.datetime,
                 "النوع": side,
                 "الدخول": round(entry, 2),
-                "الوقف": round(entry - distance if side == "شراء" else entry + distance, 2),
+                "الوقف": round(stop - distance if side == "شراء" else stop + distance, 2),
                 "TP1": round(tp1, 2),
                 "TP2": round(tp2, 2),
                 "R": round(outcome_after_cost, 3),
-                "تكلفة_السعر_R": round(cost_r, 4),
+                "تكلفة_السعر_R": round(total_cost_r, 4),
                 "السبب": reason,
                 "OOS": True,
             })
@@ -849,6 +909,7 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
         max_dd = max(max_dd, dd)
         equity_curve.append(equity)
         drawdown_curve.append(dd)
+
     result["Equity_R"] = equity_curve
     result["Drawdown_R"] = drawdown_curve
 
@@ -870,44 +931,73 @@ def backtest_mtf(raw, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=
     }
 
 
-def walk_forward_mtf(raw, windows=4, oos_fraction=0.30, round_trip_cost=0.0, slippage_per_side=0.0):
-    """Rolling OOS diagnostic. No parameter optimization is performed here.
-    Each window is evaluated independently so results show stability across time.
+def walk_forward_mtf(raw, windows=4, train_fraction=0.50, test_fraction=0.15, round_trip_cost=0.0, slippage_per_side=0.0):
+    """
+    True rolling walk-forward diagnostic:
+      train -> unseen OOS test -> roll forward -> repeat.
+    No parameters are optimized in the training segment yet; it exists to
+    enforce temporal separation and prevent using future observations.
     """
     if raw is None or raw.empty or windows < 2:
         return pd.DataFrame(), {"windows": 0, "warning": "بيانات غير كافية"}
+
     n = len(raw)
-    window_size = max(1000, n // windows)
+    train_size = int(n * train_fraction)
+    test_size = int(n * test_fraction)
+    if train_size < 1000 or test_size < 200:
+        return pd.DataFrame(), {"windows": 0, "warning": "بيانات غير كافية لنوافذ Walk-Forward"}
+
     rows = []
     all_trades = []
     for w in range(windows):
-        start = w * window_size
-        end = min(n, start + window_size)
-        if end - start < 1000:
-            continue
-        chunk = raw.iloc[start:end].copy()
-        trades, stats = backtest_mtf(chunk, oos_fraction=oos_fraction, round_trip_cost=round_trip_cost, slippage_per_side=slippage_per_side)
+        train_end = train_size + w * test_size
+        test_end = train_end + test_size
+        if test_end > n:
+            break
+
+        train_start_ts = pd.Timestamp(raw["datetime"].iloc[0])
+        test_start_ts = pd.Timestamp(raw["datetime"].iloc[train_end])
+        test_end_ts = pd.Timestamp(raw["datetime"].iloc[test_end - 1])
+
+        # Include all historical bars through the OOS endpoint so indicators
+        # have warm-up data, while backtest_mtf permits trades only in OOS.
+        chunk = raw.iloc[:test_end].copy()
+        trades, stats = backtest_mtf(
+            chunk,
+            oos_start_ts=test_start_ts,
+            oos_end_ts=test_end_ts + pd.Timedelta(minutes=5),
+            round_trip_cost=round_trip_cost,
+            slippage_per_side=slippage_per_side,
+        )
+
         if not trades.empty:
             trades = trades.copy()
             trades["WF_Window"] = w + 1
             all_trades.append(trades)
+
         rows.append({
             "Window": w + 1,
+            "Train Start": str(train_start_ts),
+            "OOS Start": str(test_start_ts),
+            "OOS End": str(test_end_ts),
             "Trades": int(stats.get("trades", 0)),
             "Win Rate %": round(float(stats.get("win_rate", 0.0)), 2),
             "Profit Factor": round(float(stats.get("profit_factor", 0.0)), 3) if math.isfinite(float(stats.get("profit_factor", 0.0))) else None,
             "Total R": round(float(stats.get("total_r", 0.0)), 3),
             "Max DD R": round(float(stats.get("max_dd_r", 0.0)), 3),
         })
+
     wf = pd.DataFrame(rows)
     combined = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     if combined.empty:
         return wf, {"windows": len(wf), "trades": 0, "warning": "لا توجد صفقات OOS في نوافذ Walk-Forward"}
+
     gross_win = combined.loc[combined["R"] > 0, "R"].sum()
     gross_loss = abs(combined.loc[combined["R"] < 0, "R"].sum())
     pf = gross_win / gross_loss if gross_loss else math.inf
     eq = combined["R"].cumsum()
     dd = eq.cummax() - eq
+
     return wf, {
         "windows": len(wf),
         "trades": len(combined),
