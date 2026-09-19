@@ -11,7 +11,7 @@ import streamlit as st
 
 # ============================================================
 # GOLD AI — XAU/USD Smart Paper Trading
-# Clean single-file research / paper-trading application.
+# Clean single-file research / paper-trading application • v1.1.
 # No live broker execution is implemented.
 # ============================================================
 
@@ -497,8 +497,9 @@ def analyze(m5, m15, h1, h4, research_mode):
     momentum_sell = m5["rsi"] <= 48 and m5["momentum"] < 0 and m5["macd_hist"] < 0
 
     daily_ok = daily_loss_pct(m5["close"]) < DAILY_LOSS_LIMIT * 100 and st.session_state.daily_trades < MAX_DAILY_TRADES
+    data_ok = bool(st.session_state.get("data_quality_ok", False))
     gates = {
-        "البيانات": True,
+        "البيانات": data_ok,
         "النظام السوقي": m5["regime"] == "اتجاه",
         "توافق الأطر": bull or bear,
         "الزخم": momentum_buy or momentum_sell,
@@ -509,12 +510,13 @@ def analyze(m5, m15, h1, h4, research_mode):
         "الأخبار": not news["blocked"],
     }
 
+    # Independent 100-point score; MTF alignment is counted once.
     strength = (
         (30 if gates["توافق الأطر"] else 0)
         + (25 if gates["B2"] else 0)
         + (20 if gates["الزخم"] else 0)
         + (10 if m5["adx"] >= 25 else 0)
-        + (10 if gates["توافق الأطر"] else 0)
+        + (10 if m5["rsi"] >= 55 or m5["rsi"] <= 45 else 0)
         + (5 if gates["السبريد"] and gates["الأخبار"] else 0)
     )
 
@@ -900,8 +902,9 @@ if raw.empty:
     st.stop()
 
 quality_ok, quality_message = data_quality(raw)
+st.session_state.data_quality_ok = quality_ok
 if not quality_ok:
-    st.warning("جودة البيانات: " + quality_message)
+    st.warning("جودة البيانات: " + quality_message + " • التداول الورقي محظور حتى تتحسن البيانات")
 
 m5 = add_indicators(raw)
 m15 = resample_closed(raw, "15min")
@@ -925,6 +928,7 @@ analysis = analyze(m5, m15, h1, h4, st.session_state.research_mode)
 closed_candle_id = str(raw["datetime"].iloc[-1])
 if st.session_state.last_signal_candle != closed_candle_id:
     st.session_state.last_signal_candle = closed_candle_id
+    m5_audit = analysis["snapshots"].get("M5") or {}
     decision = {
         "decision_id": uuid.uuid4().hex[:10],
         "الوقت": now_riyadh().strftime("%Y-%m-%d %H:%M:%S"),
@@ -932,6 +936,14 @@ if st.session_state.last_signal_candle != closed_candle_id:
         "الإشارة": analysis["signal"],
         "القوة": analysis["strength"],
         "السبب": analysis["reason"],
+        "M5 Trend": m5_audit.get("trend", "—"),
+        "M15 Trend": (analysis["snapshots"].get("M15") or {}).get("trend", "—"),
+        "H1 Trend": (analysis["snapshots"].get("H1") or {}).get("trend", "—"),
+        "H4 Trend": (analysis["snapshots"].get("H4") or {}).get("trend", "—"),
+        "RSI": round(m5_audit.get("rsi", np.nan), 2) if finite(m5_audit.get("rsi", np.nan)) else None,
+        "ADX": round(m5_audit.get("adx", np.nan), 2) if finite(m5_audit.get("adx", np.nan)) else None,
+        "Spread": round(analysis["spread"].get("spread", np.nan), 3) if finite(analysis["spread"].get("spread", np.nan)) else None,
+        "B2 Level": round(analysis["b2"].get("level", np.nan), 2) if finite(analysis["b2"].get("level", np.nan)) else None,
     }
     decision.update({name: "PASS" if passed else "BLOCK" for name, passed in analysis["gates"].items()})
     st.session_state.decisions.insert(0, decision)
@@ -1064,7 +1076,7 @@ st.subheader("System Health")
 st.dataframe(
     pd.DataFrame([
         {"النظام": "Data Feed", "الحالة": "ONLINE" if not raw.empty else "BLOCKED"},
-        {"النظام": "Data Quality", "الحالة": "ONLINE" if quality_ok else "WARNING"},
+        {"النظام": "Data Quality", "الحالة": "ONLINE" if quality_ok else "BLOCKED"},
         {"النظام": "Strategy Engine", "الحالة": "ONLINE"},
         {"النظام": "Risk Engine", "الحالة": "ONLINE"},
         {"النظام": "Paper Engine", "الحالة": "ONLINE"},
