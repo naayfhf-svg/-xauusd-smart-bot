@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import io
-import time
 from datetime import datetime, timezone
 
 # ============================================================
@@ -120,7 +118,6 @@ for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-
 # ============================================================
 # API KEY
 # ============================================================
@@ -136,7 +133,9 @@ except Exception:
 
 def log_event(event, details="", level="INFO"):
     row = {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
         "level": level,
         "event": event,
         "details": details,
@@ -144,9 +143,10 @@ def log_event(event, details="", level="INFO"):
 
     st.session_state.decision_log.append(row)
 
-    # Keep memory controlled
     if len(st.session_state.decision_log) > 1000:
-        st.session_state.decision_log = st.session_state.decision_log[-1000:]
+        st.session_state.decision_log = (
+            st.session_state.decision_log[-1000:]
+        )
 
 
 def safe_float(value, default=np.nan):
@@ -157,27 +157,31 @@ def safe_float(value, default=np.nan):
 
 
 def clean_ohlc(df):
-    """
-    تنظيف بيانات Twelve Data بدون الاعتماد على volume.
-    """
-
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
 
-    # Normalize column names
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    df.columns = [
+        str(c).strip().lower()
+        for c in df.columns
+    ]
 
-    # Volume is OPTIONAL for XAU/USD
+    # Twelve Data may not return volume for XAU/USD
     if "volume" not in df.columns:
         df["volume"] = 0.0
     else:
         df["volume"] = pd.to_numeric(
-            df["volume"], errors="coerce"
+            df["volume"],
+            errors="coerce"
         ).fillna(0.0)
 
-    required = ["open", "high", "low", "close"]
+    required = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
 
     for col in required:
         if col not in df.columns:
@@ -186,17 +190,22 @@ def clean_ohlc(df):
             )
 
         df[col] = pd.to_numeric(
-            df[col], errors="coerce"
+            df[col],
+            errors="coerce"
         )
 
     df = df.dropna(
-        subset=["open", "high", "low", "close"]
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
     )
 
     if df.empty:
         return df
 
-    # Remove impossible OHLC rows
     df = df[
         (df["high"] >= df["low"]) &
         (df["high"] >= df["open"]) &
@@ -205,10 +214,13 @@ def clean_ohlc(df):
         (df["low"] <= df["close"])
     ]
 
-    df = df[~df.index.duplicated(keep="last")]
-    df = df.sort_index()
+    df = df[
+        ~df.index.duplicated(
+            keep="last"
+        )
+    ]
 
-    return df
+    return df.sort_index()
 
 
 # ============================================================
@@ -216,10 +228,14 @@ def clean_ohlc(df):
 # ============================================================
 
 @st.cache_data(ttl=60)
-def get_candles(interval="5min", outputsize=500):
+def get_candles(
+    interval="5min",
+    outputsize=500
+):
     if not API_KEY:
         raise RuntimeError(
-            "لم يتم العثور على TWELVE_DATA_API_KEY داخل Streamlit Secrets."
+            "لم يتم العثور على TWELVE_DATA_API_KEY "
+            "داخل Streamlit Secrets."
         )
 
     params = {
@@ -249,9 +265,13 @@ def get_candles(interval="5min", outputsize=500):
 
     data = response.json()
 
-    if "status" in data and data["status"] == "error":
-        message = data.get("message", "خطأ غير معروف")
-        raise RuntimeError(message)
+    if data.get("status") == "error":
+        raise RuntimeError(
+            data.get(
+                "message",
+                "خطأ غير معروف من Twelve Data"
+            )
+        )
 
     values = data.get("values")
 
@@ -273,7 +293,10 @@ def get_candles(interval="5min", outputsize=500):
         utc=True,
     )
 
-    df = df.dropna(subset=["datetime"])
+    df = df.dropna(
+        subset=["datetime"]
+    )
+
     df = df.set_index("datetime")
 
     df = clean_ohlc(df)
@@ -294,7 +317,12 @@ def resample_ohlc(df, rule):
     if df is None or df.empty:
         return pd.DataFrame()
 
-    result = df.resample(rule).agg({
+    result = df.resample(
+        rule,
+        label="right",
+        closed="left",
+        origin="start_day",
+    ).agg({
         "open": "first",
         "high": "max",
         "low": "min",
@@ -303,7 +331,12 @@ def resample_ohlc(df, rule):
     })
 
     result = result.dropna(
-        subset=["open", "high", "low", "close"]
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
     )
 
     return result
@@ -323,8 +356,13 @@ def ema(series, period):
 def rsi(series, period=14):
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / period,
@@ -336,9 +374,18 @@ def rsi(series, period=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
 
-    result = 100 - (100 / (1 + rs))
+    result = (
+        100 -
+        (100 / (1 + rs))
+    )
 
     return result.fillna(50)
 
@@ -346,9 +393,20 @@ def rsi(series, period=14):
 def atr(df, period=14):
     prev_close = df["close"].shift(1)
 
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
+    tr1 = (
+        df["high"] -
+        df["low"]
+    )
+
+    tr2 = (
+        df["high"] -
+        prev_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        prev_close
+    ).abs()
 
     tr = pd.concat(
         [tr1, tr2, tr3],
@@ -362,14 +420,30 @@ def atr(df, period=14):
 
 
 def macd(series):
-    fast = ema(series, 12)
-    slow = ema(series, 26)
+    fast = ema(
+        series,
+        12
+    )
+
+    slow = ema(
+        series,
+        26
+    )
 
     line = fast - slow
-    signal = ema(line, 9)
+
+    signal = ema(
+        line,
+        9
+    )
+
     hist = line - signal
 
-    return line, signal, hist
+    return (
+        line,
+        signal,
+        hist,
+    )
 
 
 def adx(df, period=14):
@@ -382,18 +456,24 @@ def adx(df, period=14):
 
     plus_dm = pd.Series(
         np.where(
-            (up_move > down_move) & (up_move > 0),
+            (
+                (up_move > down_move) &
+                (up_move > 0)
+            ),
             up_move,
-            0.0
+            0.0,
         ),
         index=df.index,
     )
 
     minus_dm = pd.Series(
         np.where(
-            (down_move > up_move) & (down_move > 0),
+            (
+                (down_move > up_move) &
+                (down_move > 0)
+            ),
             down_move,
-            0.0
+            0.0,
         ),
         index=df.index,
     )
@@ -419,8 +499,11 @@ def adx(df, period=14):
         plus_dm.ewm(
             alpha=1 / period,
             adjust=False
-        ).mean()
-        / atr_value.replace(0, np.nan)
+        ).mean() /
+        atr_value.replace(
+            0,
+            np.nan
+        )
     )
 
     minus_di = (
@@ -428,14 +511,23 @@ def adx(df, period=14):
         minus_dm.ewm(
             alpha=1 / period,
             adjust=False
-        ).mean()
-        / atr_value.replace(0, np.nan)
+        ).mean() /
+        atr_value.replace(
+            0,
+            np.nan
+        )
     )
 
     dx = (
         100 *
-        (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(0, np.nan)
+        (plus_di - minus_di).abs() /
+        (
+            plus_di +
+            minus_di
+        ).replace(
+            0,
+            np.nan
+        )
     )
 
     adx_value = dx.ewm(
@@ -453,27 +545,51 @@ def adx(df, period=14):
 def add_indicators(df):
     df = df.copy()
 
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["ema100"] = ema(df["close"], 100)
+    df["ema20"] = ema(
+        df["close"],
+        20
+    )
 
-    df["rsi"] = rsi(df["close"], 14)
+    df["ema50"] = ema(
+        df["close"],
+        50
+    )
+
+    df["ema100"] = ema(
+        df["close"],
+        100
+    )
+
+    df["rsi"] = rsi(
+        df["close"],
+        14
+    )
 
     (
         df["macd"],
         df["macd_signal"],
         df["macd_hist"],
-    ) = macd(df["close"])
+    ) = macd(
+        df["close"]
+    )
 
-    df["atr"] = atr(df, 14)
+    df["atr"] = atr(
+        df,
+        14
+    )
 
     (
         df["adx"],
         df["plus_di"],
         df["minus_di"],
-    ) = adx(df, 14)
+    ) = adx(
+        df,
+        14
+    )
 
-    df["momentum"] = df["close"].diff(10)
+    df["momentum"] = (
+        df["close"].diff(10)
+    )
 
     return df
 
@@ -486,13 +602,15 @@ def calculate_score(row):
     score = 0
 
     if (
-        row["ema20"] > row["ema50"] >
+        row["ema20"] >
+        row["ema50"] >
         row["ema100"]
     ):
         score += 3
 
     elif (
-        row["ema20"] < row["ema50"] <
+        row["ema20"] <
+        row["ema50"] <
         row["ema100"]
     ):
         score -= 3
@@ -502,32 +620,48 @@ def calculate_score(row):
     else:
         score -= 1
 
-    if 52 <= row["rsi"] <= 68:
+    if (
+        52 <= row["rsi"] <= 68
+    ):
         score += 2
-    elif 32 <= row["rsi"] < 48:
+
+    elif (
+        32 <= row["rsi"] < 48
+    ):
         score -= 2
 
     if (
-        row["macd"] > row["macd_signal"]
+        row["macd"] >
+        row["macd_signal"]
         and row["macd_hist"] > 0
     ):
         score += 2
 
     elif (
-        row["macd"] < row["macd_signal"]
+        row["macd"] <
+        row["macd_signal"]
         and row["macd_hist"] < 0
     ):
         score -= 2
 
     if row["momentum"] > 0:
         score += 1
+
     elif row["momentum"] < 0:
         score -= 1
 
     if row["adx"] >= 25:
-        if row["plus_di"] > row["minus_di"]:
+
+        if (
+            row["plus_di"] >
+            row["minus_di"]
+        ):
             score += 2
-        elif row["minus_di"] > row["plus_di"]:
+
+        elif (
+            row["minus_di"] >
+            row["plus_di"]
+        ):
             score -= 2
 
     return score
@@ -560,32 +694,42 @@ def add_scores(df):
 # SUPPORT / RESISTANCE
 # ============================================================
 
-def get_support_resistance(df, lookback=40):
-    recent = df.tail(lookback)
+def get_support_resistance(
+    df,
+    lookback=40
+):
+    recent = df.tail(
+        lookback
+    )
 
     if recent.empty:
-        return np.nan, np.nan
+        return (
+            np.nan,
+            np.nan
+        )
 
-    support = recent["low"].min()
-    resistance = recent["high"].max()
-
-    return support, resistance
+    return (
+        recent["low"].min(),
+        recent["high"].max(),
+    )
 
 
 # ============================================================
-# TRUE BREAKOUT + RETEST
+# TRUE BREAKOUT + RETEST B2
 # ============================================================
 
 def detect_breakout_retest(
     df,
     lookback=20,
     tolerance_atr=0.35,
+    max_retest_bars=6,
 ):
     """
     B2:
-    - breakout must happen first
-    - retest must happen later
-    - no future candle is used for the current signal
+    1. Breakout occurs first.
+    2. Retest may happen 1-6 M15 candles later.
+    3. No future candle is used.
+    4. Retest must hold the breakout level.
     """
 
     df = df.copy()
@@ -595,65 +739,174 @@ def detect_breakout_retest(
     df["retest_buy"] = False
     df["retest_sell"] = False
 
-    for i in range(lookback, len(df)):
+    active_up = None
+    active_down = None
+
+    for i in range(
+        lookback,
+        len(df)
+    ):
         row = df.iloc[i]
 
         previous = df.iloc[
             i - lookback:i
         ]
 
-        resistance = previous["high"].max()
-        support = previous["low"].min()
+        resistance = (
+            previous["high"].max()
+        )
 
-        current_atr = row["atr"]
+        support = (
+            previous["low"].min()
+        )
 
-        if not np.isfinite(current_atr):
+        current_atr = safe_float(
+            row["atr"]
+        )
+
+        if (
+            not np.isfinite(
+                current_atr
+            )
+            or current_atr <= 0
+        ):
             continue
 
-        # Breakout
-        if row["close"] > resistance:
-            df.iloc[
-                i,
-                df.columns.get_loc("breakout_up")
+        # ----------------------------------------
+        # Detect new breakout
+        # ----------------------------------------
+
+        breakout_up = (
+            row["close"] >
+            resistance
+        )
+
+        breakout_down = (
+            row["close"] <
+            support
+        )
+
+        if breakout_up:
+            df.loc[
+                df.index[i],
+                "breakout_up"
             ] = True
 
-        if row["close"] < support:
-            df.iloc[
-                i,
-                df.columns.get_loc("breakout_down")
+            active_up = {
+                "index": i,
+                "level": float(
+                    resistance
+                ),
+            }
+
+            active_down = None
+
+        if breakout_down:
+            df.loc[
+                df.index[i],
+                "breakout_down"
             ] = True
 
-        # Retest of previous breakout level
-        if i >= 1:
-            prev_row = df.iloc[i - 1]
+            active_down = {
+                "index": i,
+                "level": float(
+                    support
+                ),
+            }
 
-            if prev_row["breakout_up"]:
+            active_up = None
+
+        # ----------------------------------------
+        # Buy retest
+        # ----------------------------------------
+
+        if active_up is not None:
+
+            bars_since = (
+                i -
+                active_up["index"]
+            )
+
+            if (
+                1 <= bars_since <=
+                max_retest_bars
+            ):
+
+                level = (
+                    active_up["level"]
+                )
+
                 distance = abs(
-                    row["low"] - resistance
+                    row["low"] -
+                    level
                 )
 
                 if (
-                    distance <= current_atr * tolerance_atr
-                    and row["close"] >= resistance
+                    distance <=
+                    current_atr *
+                    tolerance_atr
+                    and
+                    row["close"] >=
+                    level
                 ):
-                    df.iloc[
-                        i,
-                        df.columns.get_loc("retest_buy")
+                    df.loc[
+                        df.index[i],
+                        "retest_buy"
                     ] = True
 
-            if prev_row["breakout_down"]:
+                    active_up = None
+
+            elif (
+                bars_since >
+                max_retest_bars
+            ):
+                active_up = None
+
+        # ----------------------------------------
+        # Sell retest
+        # ----------------------------------------
+
+        if active_down is not None:
+
+            bars_since = (
+                i -
+                active_down["index"]
+            )
+
+            if (
+                1 <= bars_since <=
+                max_retest_bars
+            ):
+
+                level = (
+                    active_down["level"]
+                )
+
                 distance = abs(
-                    row["high"] - support
+                    row["high"] -
+                    level
                 )
 
                 if (
-                    distance <= current_atr * tolerance_atr
-                    and row["close"] <= support
+                    distance <=
+                    current_atr *
+                    tolerance_atr
+                    and
+                    row["close"] <=
+                    level
                 ):
-                    df.iloc[
-                        i,
-                        df.columns.get_loc("retest_sell")
+                    df.loc[
+                        df.index[i],
+                        "retest_sell"
                     ] = True
+
+                    active_down = None
+
+            elif (
+                bars_since >
+                max_retest_bars
+            ):
+                active_down = None
 
     return df
 
@@ -663,31 +916,73 @@ def detect_breakout_retest(
 # ============================================================
 
 def build_timeframes(m5):
-    m5 = add_indicators(m5)
-    m5 = add_scores(m5)
+    m5 = add_indicators(
+        m5
+    )
 
-    m15 = resample_ohlc(m5, "15min")
-    h1 = resample_ohlc(m5, "1h")
-    h4 = resample_ohlc(m5, "4h")
+    m5 = add_scores(
+        m5
+    )
 
-    m15 = add_indicators(m15)
-    h1 = add_indicators(h1)
-    h4 = add_indicators(h4)
+    m15 = resample_ohlc(
+        m5,
+        "15min"
+    )
 
-    m15 = add_scores(m15)
-    h1 = add_scores(h1)
-    h4 = add_scores(h4)
+    h1 = resample_ohlc(
+        m5,
+        "1h"
+    )
 
-    m15 = detect_breakout_retest(m15)
+    h4 = resample_ohlc(
+        m5,
+        "4h"
+    )
 
-    return m5, m15, h1, h4
+    m15 = add_indicators(
+        m15
+    )
+
+    h1 = add_indicators(
+        h1
+    )
+
+    h4 = add_indicators(
+        h4
+    )
+
+    m15 = add_scores(
+        m15
+    )
+
+    h1 = add_scores(
+        h1
+    )
+
+    h4 = add_scores(
+        h4
+    )
+
+    m15 = detect_breakout_retest(
+        m15
+    )
+
+    return (
+        m5,
+        m15,
+        h1,
+        h4,
+    )
 
 
 # ============================================================
-# ALIGN HIGHER TIMEFRAMES
+# HIGHER TIMEFRAME ALIGNMENT
 # ============================================================
 
-def latest_before(df, timestamp):
+def latest_before(
+    df,
+    timestamp
+):
     if df.empty:
         return None
 
@@ -705,17 +1000,55 @@ def latest_before(df, timestamp):
 # LIVE ANALYSIS
 # ============================================================
 
+def get_completed_m5(m5):
+    """
+    Keep only M5 candles that are fully closed.
+    """
+
+    now_utc = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    completed_mask = (
+        m5.index +
+        pd.Timedelta(minutes=5)
+        <= now_utc
+    )
+
+    completed = m5.loc[
+        completed_mask
+    ].copy()
+
+    return completed
+
+
 def analyze_live(m5):
-    m5, m15, h1, h4 = build_timeframes(m5)
+    # ----------------------------------------
+    # Only completed M5 candles
+    # ----------------------------------------
+
+    m5 = get_completed_m5(
+        m5
+    )
 
     if len(m5) < 120:
         raise RuntimeError(
-            "بيانات M5 غير كافية للتحليل."
+            "لا توجد شموع M5 مكتملة كافية للتحليل."
         )
+
+    (
+        m5,
+        m15,
+        h1,
+        h4,
+    ) = build_timeframes(
+        m5
+    )
 
     current_time = m5.index[-1]
     current = m5.iloc[-1]
 
+    # The M5 timestamp represents its close
     row15 = latest_before(
         m15,
         current_time
@@ -740,10 +1073,21 @@ def analyze_live(m5):
             "تعذر محاذاة الفريمات."
         )
 
-    score5 = float(current["score"])
-    score15 = float(row15["score"])
-    score1h = float(row1h["score"])
-    score4h = float(row4h["score"])
+    score5 = float(
+        current["score"]
+    )
+
+    score15 = float(
+        row15["score"]
+    )
+
+    score1h = float(
+        row1h["score"]
+    )
+
+    score4h = float(
+        row4h["score"]
+    )
 
     total = (
         score5 +
@@ -752,35 +1096,49 @@ def analyze_live(m5):
         score4h
     )
 
+    # Maximum possible score:
+    # 11 points per timeframe x 4 = 44
     strength = min(
         100,
-        abs(total) / 42 * 100
+        abs(total) / 44 * 100
     )
 
     signal = "WAIT"
+    strategy = "NONE"
 
-    # Strategy A
+    # ========================================================
+    # STRATEGY A
+    # ========================================================
+
     buy_a = (
-        score5 >= 5 and
-        score15 >= 5 and
-        score1h >= 5 and
-        row15["adx"] >= 20 and
-        row15["rsi"] >= 50 and
-        row15["macd"] > 0
+        score5 >= 5
+        and score15 >= 5
+        and score1h >= 5
+        and row15["adx"] >= 20
+        and row15["rsi"] >= 50
+        and row15["macd"] > 0
     )
 
     sell_a = (
-        score5 <= -5 and
-        score15 <= -5 and
-        score1h <= -5 and
-        row15["adx"] >= 20 and
-        row15["rsi"] <= 50 and
-        row15["macd"] < 0
+        score5 <= -5
+        and score15 <= -5
+        and score1h <= -5
+        and row15["adx"] >= 20
+        and row15["rsi"] <= 50
+        and row15["macd"] < 0
     )
 
-    # Strategy B2
+    # ========================================================
+    # STRATEGY B2
+    # ========================================================
+
     buy_b = (
-        row15.get("retest_buy", False)
+        bool(
+            row15.get(
+                "retest_buy",
+                False
+            )
+        )
         and score5 >= 5
         and score15 >= 5
         and score1h >= 5
@@ -790,7 +1148,12 @@ def analyze_live(m5):
     )
 
     sell_b = (
-        row15.get("retest_sell", False)
+        bool(
+            row15.get(
+                "retest_sell",
+                False
+            )
+        )
         and score5 <= -5
         and score15 <= -5
         and score1h <= -5
@@ -802,45 +1165,85 @@ def analyze_live(m5):
     if buy_b:
         signal = "BUY"
         strategy = "B2"
+
     elif sell_b:
         signal = "SELL"
         strategy = "B2"
+
     elif buy_a:
         signal = "BUY"
         strategy = "A"
+
     elif sell_a:
         signal = "SELL"
         strategy = "A"
-    else:
-        strategy = "NONE"
 
-    atr_value = float(row15["atr"])
+    atr_value = safe_float(
+        row15["atr"]
+    )
 
-    entry = float(current["close"])
+    # Signal is generated from the completed candle.
+    # Entry is the NEXT M5 candle open.
+    next_entry = (
+        m5["open"].iloc[-1]
+        if len(m5) >= 1
+        else current["close"]
+    )
 
-    if np.isfinite(atr_value) and atr_value > 0:
+    entry = safe_float(
+        next_entry
+    )
+
+    if (
+        np.isfinite(atr_value)
+        and atr_value > 0
+        and signal in [
+            "BUY",
+            "SELL",
+        ]
+    ):
+
         if signal == "BUY":
-            sl = entry - (1.5 * atr_value)
-            tp1 = entry + (1.5 * atr_value)
-            tp2 = entry + (2.5 * atr_value)
+            sl = (
+                entry -
+                1.5 * atr_value
+            )
 
-        elif signal == "SELL":
-            sl = entry + (1.5 * atr_value)
-            tp1 = entry - (1.5 * atr_value)
-            tp2 = entry - (2.5 * atr_value)
+            tp1 = (
+                entry +
+                1.5 * atr_value
+            )
+
+            tp2 = (
+                entry +
+                2.5 * atr_value
+            )
 
         else:
-            sl = np.nan
-            tp1 = np.nan
-            tp2 = np.nan
+            sl = (
+                entry +
+                1.5 * atr_value
+            )
+
+            tp1 = (
+                entry -
+                1.5 * atr_value
+            )
+
+            tp2 = (
+                entry -
+                2.5 * atr_value
+            )
 
     else:
         sl = np.nan
         tp1 = np.nan
         tp2 = np.nan
 
-    support, resistance = get_support_resistance(
-        m15
+    support, resistance = (
+        get_support_resistance(
+            m15
+        )
     )
 
     regime = "محايد"
@@ -859,7 +1262,9 @@ def analyze_live(m5):
 
     return {
         "time": current_time,
-        "price": entry,
+        "price": float(
+            current["close"]
+        ),
         "signal": signal,
         "strategy": strategy,
         "strength": strength,
@@ -872,8 +1277,12 @@ def analyze_live(m5):
         "trend1h": row1h["trend"],
         "trend4h": row4h["trend"],
         "regime": regime,
-        "rsi": float(row15["rsi"]),
-        "adx": float(row15["adx"]),
+        "rsi": float(
+            row15["rsi"]
+        ),
+        "adx": float(
+            row15["adx"]
+        ),
         "atr": atr_value,
         "support": support,
         "resistance": resistance,
@@ -882,23 +1291,266 @@ def analyze_live(m5):
         "tp1": tp1,
         "tp2": tp2,
         "breakout_buy": bool(
-            row15.get("retest_buy", False)
+            row15.get(
+                "retest_buy",
+                False
+            )
         ),
         "breakout_sell": bool(
-            row15.get("retest_sell", False)
+            row15.get(
+                "retest_sell",
+                False
+            )
         ),
     }
 
 
 # ============================================================
-# BACKTEST
+# PAPER TRADING
+# ============================================================
+
+def open_paper_trade(
+    live,
+    risk_percent
+):
+    if (
+        live["signal"]
+        not in [
+            "BUY",
+            "SELL",
+        ]
+    ):
+        return
+
+    if (
+        not np.isfinite(
+            live["entry"]
+        )
+        or not np.isfinite(
+            live["sl"]
+        )
+        or not np.isfinite(
+            live["tp2"]
+        )
+    ):
+        return
+
+    if (
+        st.session_state.paper_trade
+        is not None
+    ):
+        return
+
+    balance = float(
+        st.session_state.paper_balance
+    )
+
+    risk_amount = (
+        balance *
+        risk_percent /
+        100
+    )
+
+    risk_distance = abs(
+        live["entry"] -
+        live["sl"]
+    )
+
+    if (
+        risk_distance <= 0
+        or not np.isfinite(
+            risk_distance
+        )
+    ):
+        return
+
+    trade = {
+        "opened_at": datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "signal_time": str(
+            live["time"]
+        ),
+        "side": live["signal"],
+        "strategy": live["strategy"],
+        "entry": float(
+            live["entry"]
+        ),
+        "sl": float(
+            live["sl"]
+        ),
+        "tp1": float(
+            live["tp1"]
+        ),
+        "tp2": float(
+            live["tp2"]
+        ),
+        "risk_percent": float(
+            risk_percent
+        ),
+        "risk_amount": float(
+            risk_amount
+        ),
+        "risk_distance": float(
+            risk_distance
+        ),
+    }
+
+    st.session_state.paper_trade = (
+        trade
+    )
+
+    log_event(
+        "PAPER_OPEN",
+        (
+            f"{live['signal']} | "
+            f"Strategy={live['strategy']} | "
+            f"Entry={live['entry']:.2f} | "
+            f"SL={live['sl']:.2f} | "
+            f"TP2={live['tp2']:.2f}"
+        ),
+        "INFO",
+    )
+
+
+def update_paper_trade(
+    candle
+):
+    trade = (
+        st.session_state.paper_trade
+    )
+
+    if trade is None:
+        return
+
+    high = float(
+        candle["high"]
+    )
+
+    low = float(
+        candle["low"]
+    )
+
+    close = float(
+        candle["close"]
+    )
+
+    side = trade["side"]
+
+    result_r = None
+    exit_price = None
+    exit_reason = None
+
+    if side == "BUY":
+
+        # Conservative assumption:
+        # SL gets priority if both are hit
+        if low <= trade["sl"]:
+            exit_price = (
+                trade["sl"]
+            )
+            exit_reason = "SL"
+            result_r = -1.0
+
+        elif high >= trade["tp2"]:
+            exit_price = (
+                trade["tp2"]
+            )
+            exit_reason = "TP2"
+            result_r = 2.5
+
+    elif side == "SELL":
+
+        if high >= trade["sl"]:
+            exit_price = (
+                trade["sl"]
+            )
+            exit_reason = "SL"
+            result_r = -1.0
+
+        elif low <= trade["tp2"]:
+            exit_price = (
+                trade["tp2"]
+            )
+            exit_reason = "TP2"
+            result_r = 2.5
+
+    if result_r is None:
+        return
+
+    pnl = (
+        trade["risk_amount"] *
+        result_r
+    )
+
+    st.session_state.paper_balance += (
+        pnl
+    )
+
+    history_row = {
+        "opened_at": trade[
+            "opened_at"
+        ],
+        "closed_at": datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "side": side,
+        "strategy": trade[
+            "strategy"
+        ],
+        "entry": trade[
+            "entry"
+        ],
+        "exit": exit_price,
+        "SL": trade[
+            "sl"
+        ],
+        "TP2": trade[
+            "tp2"
+        ],
+        "result": exit_reason,
+        "R": result_r,
+        "PnL": pnl,
+        "balance": (
+            st.session_state.paper_balance
+        ),
+    }
+
+    st.session_state.paper_history.append(
+        history_row
+    )
+
+    log_event(
+        "PAPER_CLOSE",
+        (
+            f"{side} | "
+            f"{exit_reason} | "
+            f"R={result_r:+.2f} | "
+            f"PnL=${pnl:+.2f}"
+        ),
+        "INFO",
+    )
+
+    st.session_state.paper_trade = None
+
+
+# ============================================================
+# BACKTEST PREPARATION
 # ============================================================
 
 def prepare_backtest_data(m5):
-    m5, m15, h1, h4 = build_timeframes(m5)
+    return build_timeframes(
+        m5
+    )
 
-    return m5, m15, h1, h4
 
+# ============================================================
+# BACKTEST
+# ============================================================
 
 def simulate_strategy(
     m5,
@@ -911,212 +1563,293 @@ def simulate_strategy(
 ):
     trades = []
 
-    if start is None:
+    if (
+        start is None
+    ):
         start = m5.index[0]
 
-    if end is None:
+    if (
+        end is None
+    ):
         end = m5.index[-1]
 
     m5_slice = m5.loc[
         (m5.index >= start) &
         (m5.index <= end)
-    ]
+    ].copy()
 
     if m5_slice.empty:
         return pd.DataFrame()
 
     open_trade = None
 
-    for i in range(len(m5_slice)):
-        timestamp = m5_slice.index[i]
+    for i in range(
+        len(m5_slice)
+    ):
+        timestamp = (
+            m5_slice.index[i]
+        )
+
         row = m5_slice.iloc[i]
 
-        # ----------------------------------------------------
-        # Manage open trade
-        # ----------------------------------------------------
+        # ====================================================
+        # MANAGE OPEN TRADE
+        # ====================================================
 
         if open_trade is not None:
 
-            side = open_trade["side"]
-            sl = open_trade["sl"]
-            tp = open_trade["tp"]
+            side = open_trade[
+                "side"
+            ]
 
-            high = float(row["high"])
-            low = float(row["low"])
+            sl = open_trade[
+                "sl"
+            ]
+
+            tp = open_trade[
+                "tp"
+            ]
+
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
 
             exit_price = None
-            exit_reason = None
+            result_r = None
+            reason = None
 
             if side == "BUY":
 
                 if low <= sl:
                     exit_price = sl
-                    exit_reason = "SL"
+                    result_r = -1.0
+                    reason = "SL"
 
                 elif high >= tp:
                     exit_price = tp
-                    exit_reason = "TP"
+                    result_r = 2.5
+                    reason = "TP2"
 
             else:
 
                 if high >= sl:
                     exit_price = sl
-                    exit_reason = "SL"
+                    result_r = -1.0
+                    reason = "SL"
 
                 elif low <= tp:
                     exit_price = tp
-                    exit_reason = "TP"
+                    result_r = 2.5
+                    reason = "TP2"
 
-            if exit_price is not None:
-
-                risk = abs(
-                    open_trade["entry"]
-                    - open_trade["sl"]
-                )
-
-                if risk <= 0:
-                    r = 0
-                else:
-                    if side == "BUY":
-                        r = (
-                            exit_price
-                            - open_trade["entry"]
-                        ) / risk
-                    else:
-                        r = (
-                            open_trade["entry"]
-                            - exit_price
-                        ) / risk
+            if result_r is not None:
 
                 trades.append({
-                    "entry_time": open_trade["entry_time"],
-                    "exit_time": timestamp,
+                    "entry_time":
+                        open_trade[
+                            "entry_time"
+                        ],
+                    "exit_time":
+                        timestamp,
                     "side": side,
-                    "strategy": open_trade["strategy"],
-                    "entry": open_trade["entry"],
-                    "sl": open_trade["sl"],
-                    "tp": open_trade["tp"],
-                    "exit": exit_price,
-                    "result_r": r,
-                    "result": exit_reason,
+                    "strategy":
+                        open_trade[
+                            "strategy"
+                        ],
+                    "entry":
+                        open_trade[
+                            "entry"
+                        ],
+                    "exit":
+                        exit_price,
+                    "sl": sl,
+                    "tp":
+                        open_trade[
+                            "tp"
+                        ],
+                    "result_r":
+                        result_r,
+                    "reason": reason,
                 })
 
                 open_trade = None
 
                 continue
 
-        # ----------------------------------------------------
-        # Generate signal
-        # ----------------------------------------------------
+        # ====================================================
+        # NEED NEXT CANDLE FOR ENTRY
+        # ====================================================
+
+        if (
+            i + 1 >=
+            len(m5_slice)
+        ):
+            continue
+
+        # Signal is generated on current completed M5.
+        # Entry is next M5 OPEN.
+        signal_time = timestamp
+
+        signal_row = row
 
         row15 = latest_before(
             m15,
-            timestamp
+            signal_time
         )
 
         row1h = latest_before(
             h1,
-            timestamp
+            signal_time
         )
 
         row4h = latest_before(
             h4,
-            timestamp
+            signal_time
         )
 
         if (
-            row15 is None
-            or row1h is None
-            or row4h is None
+            row15 is None or
+            row1h is None or
+            row4h is None
         ):
             continue
 
-        score5 = float(row["score"])
-        score15 = float(row15["score"])
-        score1h = float(row1h["score"])
+        score5 = float(
+            signal_row["score"]
+        )
+
+        score15 = float(
+            row15["score"]
+        )
+
+        score1h = float(
+            row1h["score"]
+        )
+
+        score4h = float(
+            row4h["score"]
+        )
+
+        atr_value = safe_float(
+            row15["atr"]
+        )
+
+        if (
+            not np.isfinite(
+                atr_value
+            )
+            or atr_value <= 0
+        ):
+            continue
+
+        buy_a = (
+            score5 >= 5
+            and score15 >= 5
+            and score1h >= 5
+            and row15["adx"] >= 20
+            and row15["rsi"] >= 50
+            and row15["macd"] > 0
+        )
+
+        sell_a = (
+            score5 <= -5
+            and score15 <= -5
+            and score1h <= -5
+            and row15["adx"] >= 20
+            and row15["rsi"] <= 50
+            and row15["macd"] < 0
+        )
+
+        buy_b = (
+            bool(
+                row15.get(
+                    "retest_buy",
+                    False
+                )
+            )
+            and score5 >= 5
+            and score15 >= 5
+            and score1h >= 5
+            and row15["adx"] >= 20
+            and row15["rsi"] >= 50
+            and row15["macd"] > 0
+        )
+
+        sell_b = (
+            bool(
+                row15.get(
+                    "retest_sell",
+                    False
+                )
+            )
+            and score5 <= -5
+            and score15 <= -5
+            and score1h <= -5
+            and row15["adx"] >= 20
+            and row15["rsi"] <= 50
+            and row15["macd"] < 0
+        )
 
         signal = None
 
         if strategy == "A":
 
-            if (
-                score5 >= 5
-                and score15 >= 5
-                and score1h >= 5
-                and row15["adx"] >= 20
-                and row15["rsi"] >= 50
-                and row15["macd"] > 0
-            ):
+            if buy_a:
                 signal = "BUY"
 
-            elif (
-                score5 <= -5
-                and score15 <= -5
-                and score1h <= -5
-                and row15["adx"] >= 20
-                and row15["rsi"] <= 50
-                and row15["macd"] < 0
-            ):
+            elif sell_a:
                 signal = "SELL"
 
         elif strategy == "B2":
 
-            if (
-                bool(row15.get("retest_buy", False))
-                and score5 >= 5
-                and score15 >= 5
-                and score1h >= 5
-                and row15["adx"] >= 20
-                and row15["rsi"] >= 50
-                and row15["macd"] > 0
-            ):
+            if buy_b:
                 signal = "BUY"
 
-            elif (
-                bool(row15.get("retest_sell", False))
-                and score5 <= -5
-                and score15 <= -5
-                and score1h <= -5
-                and row15["adx"] >= 20
-                and row15["rsi"] <= 50
-                and row15["macd"] < 0
-            ):
+            elif sell_b:
                 signal = "SELL"
 
         if signal is None:
             continue
 
-        # ----------------------------------------------------
-        # Entry is next M5 candle
-        # ----------------------------------------------------
+        next_row = (
+            m5_slice.iloc[i + 1]
+        )
 
-        if i + 1 >= len(m5_slice):
-            continue
-
-        next_timestamp = m5_slice.index[i + 1]
-        next_row = m5_slice.iloc[i + 1]
-
-        entry = float(next_row["open"])
-        atr_value = float(row15["atr"])
-
-        if (
-            not np.isfinite(atr_value)
-            or atr_value <= 0
-        ):
-            continue
+        entry = float(
+            next_row["open"]
+        )
 
         if signal == "BUY":
 
-            sl = entry - 1.5 * atr_value
-            tp = entry + 2.5 * atr_value
+            sl = (
+                entry -
+                1.5 * atr_value
+            )
+
+            tp = (
+                entry +
+                2.5 * atr_value
+            )
 
         else:
 
-            sl = entry + 1.5 * atr_value
-            tp = entry - 2.5 * atr_value
+            sl = (
+                entry +
+                1.5 * atr_value
+            )
+
+            tp = (
+                entry -
+                2.5 * atr_value
+            )
 
         open_trade = {
-            "entry_time": next_timestamp,
+            "entry_time":
+                m5_slice.index[i + 1],
             "side": signal,
             "strategy": strategy,
             "entry": entry,
@@ -1124,60 +1857,92 @@ def simulate_strategy(
             "tp": tp,
         }
 
-    # --------------------------------------------------------
-    # Close remaining trade at final close
-    # --------------------------------------------------------
+    # ========================================================
+    # CLOSE REMAINING TRADE AT LAST CLOSE
+    # ========================================================
 
     if open_trade is not None:
 
-        final_time = m5_slice.index[-1]
-        final_price = float(
-            m5_slice.iloc[-1]["close"]
+        final_time = (
+            m5_slice.index[-1]
         )
 
-        risk = abs(
-            open_trade["entry"]
-            - open_trade["sl"]
+        final_close = float(
+            m5_slice.iloc[-1][
+                "close"
+            ]
         )
 
-        if risk > 0:
+        side = open_trade[
+            "side"
+        ]
 
-            if open_trade["side"] == "BUY":
-                r = (
-                    final_price
-                    - open_trade["entry"]
-                ) / risk
-            else:
-                r = (
-                    open_trade["entry"]
-                    - final_price
-                ) / risk
+        entry = open_trade[
+            "entry"
+        ]
+
+        risk_distance = abs(
+            entry -
+            open_trade["sl"]
+        )
+
+        if side == "BUY":
+            result_r = (
+                final_close -
+                entry
+            ) / risk_distance
 
         else:
-            r = 0
+            result_r = (
+                entry -
+                final_close
+            ) / risk_distance
 
         trades.append({
-            "entry_time": open_trade["entry_time"],
-            "exit_time": final_time,
-            "side": open_trade["side"],
-            "strategy": open_trade["strategy"],
-            "entry": open_trade["entry"],
-            "sl": open_trade["sl"],
-            "tp": open_trade["tp"],
-            "exit": final_price,
-            "result_r": r,
-            "result": "END",
+            "entry_time":
+                open_trade[
+                    "entry_time"
+                ],
+            "exit_time":
+                final_time,
+            "side": side,
+            "strategy":
+                open_trade[
+                    "strategy"
+                ],
+            "entry": entry,
+            "exit": final_close,
+            "sl":
+                open_trade[
+                    "sl"
+                ],
+            "tp":
+                open_trade[
+                    "tp"
+                ],
+            "result_r":
+                float(
+                    result_r
+                ),
+            "reason": "END",
         })
 
-    return pd.DataFrame(trades)
+    return pd.DataFrame(
+        trades
+    )
 
 
 # ============================================================
 # METRICS
 # ============================================================
 
-def calculate_metrics(trades):
-    if trades is None or trades.empty:
+def calculate_metrics(
+    trades
+):
+    if (
+        trades is None
+        or trades.empty
+    ):
         return {
             "trades": 0,
             "win_rate": 0.0,
@@ -1185,316 +1950,86 @@ def calculate_metrics(trades):
             "total_r": 0.0,
             "avg_r": 0.0,
             "max_dd": 0.0,
-            "buy": 0,
-            "sell": 0,
         }
 
-    r = trades["result_r"].astype(float)
+    result = trades[
+        "result_r"
+    ].astype(float)
 
-    wins = r[r > 0]
-    losses = r[r < 0]
+    wins = result[
+        result > 0
+    ]
 
-    win_rate = (
-        (r > 0).mean() * 100
+    losses = result[
+        result < 0
+    ]
+
+    gross_profit = (
+        wins.sum()
     )
 
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
+    gross_loss = abs(
+        losses.sum()
+    )
 
     if gross_loss > 0:
-        pf = gross_profit / gross_loss
+        profit_factor = (
+            gross_profit /
+            gross_loss
+        )
+
+    elif gross_profit > 0:
+        profit_factor = np.inf
+
     else:
-        pf = np.inf
+        profit_factor = 0.0
 
-    equity = r.cumsum()
+    equity = result.cumsum()
 
-    running_max = equity.cummax()
+    running_max = (
+        equity.cummax()
+    )
 
-    drawdown = running_max - equity
+    drawdown = (
+        running_max -
+        equity
+    )
 
-    max_dd = drawdown.max()
+    max_dd = (
+        drawdown.max()
+        if not drawdown.empty
+        else 0.0
+    )
 
     return {
-        "trades": len(trades),
-        "win_rate": win_rate,
-        "profit_factor": pf,
-        "total_r": r.sum(),
-        "avg_r": r.mean(),
-        "max_dd": max_dd,
-        "buy": int(
-            (trades["side"] == "BUY").sum()
+        "trades": len(
+            trades
         ),
-        "sell": int(
-            (trades["side"] == "SELL").sum()
+        "win_rate": (
+            result.gt(0).mean()
+            * 100
         ),
+        "profit_factor":
+            float(
+                profit_factor
+            ),
+        "total_r":
+            float(
+                result.sum()
+            ),
+        "avg_r":
+            float(
+                result.mean()
+            ),
+        "max_dd":
+            float(
+                max_dd
+            ),
     }
 
 
 # ============================================================
-# PAPER TRADING
-# ============================================================
-
-def daily_realized_r():
-    history = st.session_state.paper_history
-
-    if not history:
-        return 0.0
-
-    today = datetime.now().date()
-
-    total = 0.0
-
-    for trade in history:
-
-        try:
-            exit_time = pd.to_datetime(
-                trade["exit_time"]
-            )
-
-            if exit_time.date() == today:
-                total += float(
-                    trade["result_r"]
-                )
-
-        except Exception:
-            continue
-
-    return total
-
-
-def open_paper_trade(live, risk_percent=1.0):
-    if st.session_state.kill_switch:
-        return
-
-    if live["signal"] not in ["BUY", "SELL"]:
-        return
-
-    if st.session_state.paper_trade is not None:
-        return
-
-    entry = live["entry"]
-    sl = live["sl"]
-    tp2 = live["tp2"]
-
-    if not np.isfinite(sl):
-        return
-
-    risk_amount = (
-        st.session_state.paper_balance
-        * risk_percent
-        / 100
-    )
-
-    trade = {
-        "id": int(time.time()),
-        "entry_time": str(live["time"]),
-        "side": live["signal"],
-        "strategy": live["strategy"],
-        "entry": entry,
-        "sl": sl,
-        "tp1": live["tp1"],
-        "tp2": tp2,
-        "risk_amount": risk_amount,
-        "result_r": 0.0,
-    }
-
-    st.session_state.paper_trade = trade
-
-    log_event(
-        "PAPER_OPEN",
-        f"{trade['side']} @ {entry:.2f}"
-    )
-
-
-def update_paper_trade(
-    completed_candle,
-):
-    trade = st.session_state.paper_trade
-
-    if trade is None:
-        return
-
-    if st.session_state.kill_switch:
-        return
-
-    high = float(
-        completed_candle["high"]
-    )
-
-    low = float(
-        completed_candle["low"]
-    )
-
-    side = trade["side"]
-
-    exit_price = None
-    reason = None
-
-    # TP2 / SL
-    if side == "BUY":
-
-        if low <= trade["sl"]:
-            exit_price = trade["sl"]
-            reason = "SL"
-
-        elif high >= trade["tp2"]:
-            exit_price = trade["tp2"]
-            reason = "TP2"
-
-    else:
-
-        if high >= trade["sl"]:
-            exit_price = trade["sl"]
-            reason = "SL"
-
-        elif low <= trade["tp2"]:
-            exit_price = trade["tp2"]
-            reason = "TP2"
-
-    if exit_price is None:
-        return
-
-    risk = abs(
-        trade["entry"]
-        - trade["sl"]
-    )
-
-    if risk <= 0:
-        result_r = 0.0
-
-    elif side == "BUY":
-        result_r = (
-            exit_price
-            - trade["entry"]
-        ) / risk
-
-    else:
-        result_r = (
-            trade["entry"]
-            - exit_price
-        ) / risk
-
-    pnl = (
-        result_r
-        * trade["risk_amount"]
-    )
-
-    st.session_state.paper_balance += pnl
-
-    closed = trade.copy()
-
-    closed["exit_time"] = str(
-        completed_candle.name
-    )
-
-    closed["exit"] = exit_price
-    closed["result_r"] = result_r
-    closed["pnl"] = pnl
-    closed["result"] = reason
-
-    st.session_state.paper_history.append(
-        closed
-    )
-
-    log_event(
-        "PAPER_CLOSE",
-        f"{side} {reason} | {result_r:+.2f}R | ${pnl:+.2f}"
-    )
-
-    st.session_state.paper_trade = None
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.markdown("## ⚙️ الإعدادات")
-
-    risk_percent = st.number_input(
-        "المخاطرة لكل صفقة %",
-        min_value=0.1,
-        max_value=5.0,
-        value=1.0,
-        step=0.1,
-    )
-
-    max_daily_loss = st.number_input(
-        "الحد اليومي للخسارة R",
-        min_value=0.5,
-        max_value=10.0,
-        value=3.0,
-        step=0.5,
-    )
-
-    st.markdown("---")
-
-    st.markdown(
-        "### 🛡️ Paper Trading"
-    )
-
-    st.write(
-        "الرصيد الافتراضي: "
-        f"${st.session_state.paper_balance:,.2f}"
-    )
-
-    daily_r = daily_realized_r()
-
-    st.write(
-        f"نتيجة اليوم: {daily_r:+.2f}R"
-    )
-
-    if daily_r <= -max_daily_loss:
-        st.session_state.kill_switch = True
-        log_event(
-            "KILL_SWITCH",
-            "تم تفعيل الإيقاف بسبب تجاوز الخسارة اليومية.",
-            "WARNING",
-        )
-
-    if st.button(
-        "🛑 Kill Switch",
-        use_container_width=True,
-    ):
-        st.session_state.kill_switch = True
-
-        log_event(
-            "KILL_SWITCH",
-            "تم التفعيل يدويًا.",
-            "WARNING",
-        )
-
-    if st.button(
-        "▶️ إعادة تشغيل Paper Trading",
-        use_container_width=True,
-    ):
-        st.session_state.kill_switch = False
-
-        log_event(
-            "SYSTEM",
-            "تم إلغاء Kill Switch.",
-        )
-
-    if st.button(
-        "🔄 تصفير Paper Trading",
-        use_container_width=True,
-    ):
-        st.session_state.paper_balance = (
-            st.session_state.paper_start_balance
-        )
-
-        st.session_state.paper_trade = None
-        st.session_state.paper_history = []
-
-        log_event(
-            "SYSTEM",
-            "تم تصفير Paper Trading.",
-        )
-
-
-# ============================================================
-# HEADER
+# UI HEADER
 # ============================================================
 
 st.markdown(
@@ -1504,33 +2039,91 @@ st.markdown(
 
 st.markdown(
     '<div class="sub-title">'
-    'Multi-Timeframe • Confluence • Breakout & Retest • Paper Trading'
+    'Multi-Timeframe Smart Paper Trading System'
     '</div>',
     unsafe_allow_html=True,
 )
 
-if not API_KEY:
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-    st.error(
-        "لم يتم العثور على TWELVE_DATA_API_KEY في Streamlit Secrets."
+with st.sidebar:
+
+    st.markdown(
+        "## ⚙️ إعدادات البوت"
     )
 
-    st.stop()
+    risk_percent = st.slider(
+        "المخاطرة لكل صفقة %",
+        min_value=0.25,
+        max_value=2.0,
+        value=1.0,
+        step=0.25,
+    )
 
+    st.markdown("---")
+
+    if st.button(
+        "🔄 تحديث البيانات",
+        use_container_width=True,
+    ):
+        get_candles.clear()
+        st.rerun()
+
+    if st.button(
+        "🛑 Kill Switch",
+        use_container_width=True,
+    ):
+        st.session_state.kill_switch = True
+
+        log_event(
+            "KILL_SWITCH",
+            "تم إيقاف Paper Trading يدويًا.",
+            "WARNING",
+        )
+
+    if st.button(
+        "▶️ تشغيل البوت",
+        use_container_width=True,
+    ):
+        st.session_state.kill_switch = False
+
+        log_event(
+            "BOT_RESUMED",
+            "تم تشغيل Paper Trading.",
+            "INFO",
+        )
+
+    st.markdown("---")
+
+    if st.session_state.kill_switch:
+        st.error(
+            "🛑 البوت متوقف"
+        )
+    else:
+        st.success(
+            "🟢 البوت يعمل"
+        )
+
+    st.caption(
+        "Paper Trading فقط — لا توجد أوامر حقيقية."
+    )
 
 # ============================================================
 # TABS
 # ============================================================
 
-tab_live, tab_paper, tab_backtest, tab_logs = st.tabs(
-    [
-        "📊 Live",
-        "💰 Paper Trading",
-        "🧪 Backtest",
-        "📋 Logs",
-    ]
+tab_live, tab_paper, tab_backtest, tab_logs = (
+    st.tabs(
+        [
+            "📡 Live Analysis",
+            "💰 Paper Trading",
+            "🧪 Backtest",
+            "📋 Logs",
+        ]
+    )
 )
-
 
 # ============================================================
 # LIVE TAB
@@ -1538,51 +2131,50 @@ tab_live, tab_paper, tab_backtest, tab_logs = st.tabs(
 
 with tab_live:
 
-    col_refresh, col_info = st.columns(
-        [1, 3]
+    st.markdown(
+        "## 📡 التحليل المباشر"
     )
-
-    with col_refresh:
-
-        if st.button(
-            "🔄 تحديث",
-            use_container_width=True,
-        ):
-            get_candles.clear()
-
-            st.rerun()
-
-    with col_info:
-
-        st.caption(
-            "مصدر البيانات: Twelve Data | XAU/USD | M5"
-        )
 
     try:
 
-        m5 = get_candles(
+        m5_raw = get_candles(
             "5min",
-            500,
+            500
         )
 
-        live = analyze_live(m5)
+        live = analyze_live(
+            m5_raw
+        )
 
-        # Update paper trade using LAST COMPLETED candle
-        if len(m5) >= 3:
+        # ====================================================
+        # PAPER UPDATE
+        # ====================================================
 
-            completed = m5.iloc[-2]
+        completed_m5 = get_completed_m5(
+            m5_raw
+        )
 
-            completed.name = m5.index[-2]
-
-            update_paper_trade(
-                completed
+        if (
+            not completed_m5.empty
+            and
+            st.session_state.paper_trade
+            is not None
+        ):
+            last_completed = (
+                completed_m5.iloc[-1]
             )
 
-        # ----------------------------------------------------
-        # Main metrics
-        # ----------------------------------------------------
+            update_paper_trade(
+                last_completed
+            )
 
-        c1, c2, c3, c4 = st.columns(4)
+        # ====================================================
+        # HEADER METRICS
+        # ====================================================
+
+        c1, c2, c3, c4 = (
+            st.columns(4)
+        )
 
         with c1:
             st.metric(
@@ -1591,12 +2183,15 @@ with tab_live:
             )
 
         with c2:
+
             if live["signal"] == "BUY":
-                text = "شراء"
+                text = "🟢 BUY"
+
             elif live["signal"] == "SELL":
-                text = "بيع"
+                text = "🔴 SELL"
+
             else:
-                text = "انتظار"
+                text = "⚪ WAIT"
 
             st.metric(
                 "الإشارة",
@@ -1615,9 +2210,9 @@ with tab_live:
                 live["regime"]
             )
 
-        # ----------------------------------------------------
-        # Signal
-        # ----------------------------------------------------
+        # ====================================================
+        # SIGNAL
+        # ====================================================
 
         if live["signal"] == "BUY":
 
@@ -1642,16 +2237,24 @@ with tab_live:
 
         st.caption(
             f"Strategy: {live['strategy']} | "
-            f"آخر تحديث: {live['time']}"
+            f"آخر شمعة مكتملة: {live['time']}"
         )
 
-        # ----------------------------------------------------
-        # Levels
-        # ----------------------------------------------------
+        st.caption(
+            "التحديث: بيانات جديدة كل 60 ثانية أثناء فتح الصفحة."
+        )
 
-        st.markdown("### 🎯 مستويات الصفقة")
+        # ====================================================
+        # LEVELS
+        # ====================================================
 
-        l1, l2, l3, l4 = st.columns(4)
+        st.markdown(
+            "### 🎯 مستويات الصفقة"
+        )
+
+        l1, l2, l3, l4 = (
+            st.columns(4)
+        )
 
         l1.metric(
             "Entry",
@@ -1660,37 +2263,67 @@ with tab_live:
 
         l2.metric(
             "SL",
-            f"{live['sl']:,.2f}"
-            if np.isfinite(live["sl"])
-            else "-"
+            (
+                f"{live['sl']:,.2f}"
+                if np.isfinite(
+                    live["sl"]
+                )
+                else "-"
+            )
         )
 
         l3.metric(
             "TP1",
-            f"{live['tp1']:,.2f}"
-            if np.isfinite(live["tp1"])
-            else "-"
+            (
+                f"{live['tp1']:,.2f}"
+                if np.isfinite(
+                    live["tp1"]
+                )
+                else "-"
+            )
         )
 
         l4.metric(
             "TP2",
-            f"{live['tp2']:,.2f}"
-            if np.isfinite(live["tp2"])
-            else "-"
+            (
+                f"{live['tp2']:,.2f}"
+                if np.isfinite(
+                    live["tp2"]
+                )
+                else "-"
+            )
         )
 
-        # ----------------------------------------------------
-        # Timeframes
-        # ----------------------------------------------------
+        # ====================================================
+        # TIMEFRAMES
+        # ====================================================
 
-        st.markdown("### 🧭 تحليل الفريمات")
+        st.markdown(
+            "### 🧭 تحليل الفريمات"
+        )
 
         tf = pd.DataFrame(
             [
-                ["M5", live["trend5"], live["score5"]],
-                ["M15", live["trend15"], live["score15"]],
-                ["H1", live["trend1h"], live["score1h"]],
-                ["H4", live["trend4h"], live["score4h"]],
+                [
+                    "M5",
+                    live["trend5"],
+                    live["score5"],
+                ],
+                [
+                    "M15",
+                    live["trend15"],
+                    live["score15"],
+                ],
+                [
+                    "H1",
+                    live["trend1h"],
+                    live["score1h"],
+                ],
+                [
+                    "H4",
+                    live["trend4h"],
+                    live["score4h"],
+                ],
             ],
             columns=[
                 "Timeframe",
@@ -1705,13 +2338,17 @@ with tab_live:
             hide_index=True,
         )
 
-        # ----------------------------------------------------
-        # Indicators
-        # ----------------------------------------------------
+        # ====================================================
+        # INDICATORS
+        # ====================================================
 
-        st.markdown("### 📐 المؤشرات")
+        st.markdown(
+            "### 📐 المؤشرات"
+        )
 
-        i1, i2, i3, i4 = st.columns(4)
+        i1, i2, i3, i4 = (
+            st.columns(4)
+        )
 
         i1.metric(
             "RSI M15",
@@ -1728,16 +2365,25 @@ with tab_live:
             f"{live['atr']:.2f}"
         )
 
-        i4.metric(
-            "Confluence",
-            f"{live['score5'] + live['score15'] + live['score1h'] + live['score4h']:+.0f}"
+        total_score = (
+            live["score5"] +
+            live["score15"] +
+            live["score1h"] +
+            live["score4h"]
         )
 
-        # ----------------------------------------------------
-        # Support Resistance
-        # ----------------------------------------------------
+        i4.metric(
+            "Confluence",
+            f"{total_score:+.0f}"
+        )
 
-        s1, s2 = st.columns(2)
+        # ====================================================
+        # SUPPORT / RESISTANCE
+        # ====================================================
+
+        s1, s2 = (
+            st.columns(2)
+        )
 
         s1.metric(
             "Support",
@@ -1749,38 +2395,111 @@ with tab_live:
             f"{live['resistance']:,.2f}"
         )
 
-        # ----------------------------------------------------
-        # Paper Auto Open
-        # ----------------------------------------------------
+        # ====================================================
+        # PAPER AUTO OPEN
+        # ====================================================
 
         if (
-            live["signal"] in ["BUY", "SELL"]
-            and not st.session_state.kill_switch
-            and st.session_state.paper_trade is None
+            live["signal"]
+            in [
+                "BUY",
+                "SELL",
+            ]
+            and not
+            st.session_state.kill_switch
+            and
+            st.session_state.paper_trade
+            is None
         ):
 
-            open_paper_trade(
-                live,
-                risk_percent,
+            # Prevent repeatedly opening the same signal
+            signal_time = str(
+                live["time"]
             )
 
-        # ----------------------------------------------------
-        # Chart
-        # ----------------------------------------------------
+            if (
+                st.session_state.last_signal_time
+                != signal_time
+            ):
 
-        st.markdown("### 📈 حركة XAU/USD")
+                open_paper_trade(
+                    live,
+                    risk_percent,
+                )
 
-        chart_df = m5[
-            ["close"]
-        ].tail(150)
+                st.session_state.last_signal_time = (
+                    signal_time
+                )
+
+        # ====================================================
+        # CURRENT PAPER POSITION
+        # ====================================================
+
+        if (
+            st.session_state.paper_trade
+            is not None
+        ):
+
+            trade = (
+                st.session_state.paper_trade
+            )
+
+            st.markdown(
+                "### 📌 Paper Trade الحالية"
+            )
+
+            open_df = pd.DataFrame(
+                [
+                    {
+                        "Side":
+                            trade["side"],
+                        "Strategy":
+                            trade["strategy"],
+                        "Entry":
+                            trade["entry"],
+                        "SL":
+                            trade["sl"],
+                        "TP1":
+                            trade["tp1"],
+                        "TP2":
+                            trade["tp2"],
+                        "Risk $":
+                            trade["risk_amount"],
+                    }
+                ]
+            )
+
+            st.dataframe(
+                open_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ====================================================
+        # CHART
+        # ====================================================
+
+        st.markdown(
+            "### 📈 حركة XAU/USD"
+        )
+
+        chart_df = (
+            completed_m5[
+                ["close"]
+            ].tail(150)
+        )
 
         st.line_chart(
             chart_df,
             use_container_width=True,
         )
 
+        # ====================================================
+        # INFO
+        # ====================================================
+
         st.info(
-            "تنبيه: قوة التوافق ليست احتمال ربح. "
+            "تنبيه: قوة التوافق مؤشر فني وليست احتمال ربح. "
             "النظام تجريبي Paper Trading فقط ولا ينفذ أوامر حقيقية."
         )
 
@@ -1796,21 +2515,24 @@ with tab_live:
             f"خطأ في البيانات: {e}"
         )
 
-
 # ============================================================
 # PAPER TRADING TAB
 # ============================================================
 
 with tab_paper:
 
-    st.markdown("## 💰 Paper Trading")
-
-    pnl = (
-        st.session_state.paper_balance
-        - st.session_state.paper_start_balance
+    st.markdown(
+        "## 💰 Paper Trading"
     )
 
-    p1, p2, p3, p4 = st.columns(4)
+    pnl = (
+        st.session_state.paper_balance -
+        st.session_state.paper_start_balance
+    )
+
+    p1, p2, p3, p4 = (
+        st.columns(4)
+    )
 
     p1.metric(
         "الرصيد",
@@ -1824,7 +2546,9 @@ with tab_paper:
 
     p3.metric(
         "Trades",
-        len(st.session_state.paper_history)
+        len(
+            st.session_state.paper_history
+        )
     )
 
     status = (
@@ -1838,22 +2562,36 @@ with tab_paper:
         status
     )
 
-    if st.session_state.paper_trade:
+    if (
+        st.session_state.paper_trade
+        is not None
+    ):
 
-        trade = st.session_state.paper_trade
+        trade = (
+            st.session_state.paper_trade
+        )
 
-        st.markdown("### 📌 الصفقة المفتوحة")
+        st.markdown(
+            "### 📌 الصفقة المفتوحة"
+        )
 
         open_df = pd.DataFrame(
             [
                 {
-                    "Side": trade["side"],
-                    "Strategy": trade["strategy"],
-                    "Entry": trade["entry"],
-                    "SL": trade["sl"],
-                    "TP1": trade["tp1"],
-                    "TP2": trade["tp2"],
-                    "Risk $": trade["risk_amount"],
+                    "Side":
+                        trade["side"],
+                    "Strategy":
+                        trade["strategy"],
+                    "Entry":
+                        trade["entry"],
+                    "SL":
+                        trade["sl"],
+                    "TP1":
+                        trade["tp1"],
+                    "TP2":
+                        trade["tp2"],
+                    "Risk $":
+                        trade["risk_amount"],
                 }
             ]
         )
@@ -1872,7 +2610,9 @@ with tab_paper:
 
     if st.session_state.paper_history:
 
-        st.markdown("### 📚 سجل الصفقات")
+        st.markdown(
+            "### 📚 سجل الصفقات"
+        )
 
         history = pd.DataFrame(
             st.session_state.paper_history
@@ -1896,18 +2636,24 @@ with tab_paper:
             use_container_width=True,
         )
 
-
 # ============================================================
 # BACKTEST TAB
 # ============================================================
 
 with tab_backtest:
 
-    st.markdown("## 🧪 Backtest")
+    st.markdown(
+        "## 🧪 Backtest"
+    )
 
     bars = st.selectbox(
         "عدد شموع M5",
-        [5000, 10000, 15000, 30000],
+        [
+            5000,
+            10000,
+            15000,
+            30000,
+        ],
         index=0,
     )
 
@@ -1935,10 +2681,13 @@ with tab_backtest:
                         "عدد البيانات أقل من المطلوب لاختبار قوي."
                     )
 
-                m5_bt, m15_bt, h1_bt, h4_bt = (
-                    prepare_backtest_data(
-                        historical
-                    )
+                (
+                    m5_bt,
+                    m15_bt,
+                    h1_bt,
+                    h4_bt,
+                ) = prepare_backtest_data(
+                    historical
                 )
 
                 split_index = int(
@@ -1946,16 +2695,31 @@ with tab_backtest:
                 )
 
                 split_time = (
-                    m5_bt.index[split_index]
+                    m5_bt.index[
+                        split_index
+                    ]
                 )
 
-                is_start = m5_bt.index[0]
-                is_end = split_time
+                is_start = (
+                    m5_bt.index[0]
+                )
 
-                oos_start = split_time
-                oos_end = m5_bt.index[-1]
+                is_end = (
+                    split_time
+                )
 
+                oos_start = (
+                    split_time
+                )
+
+                oos_end = (
+                    m5_bt.index[-1]
+                )
+
+                # =================================================
                 # Strategy A
+                # =================================================
+
                 is_a = simulate_strategy(
                     m5_bt,
                     m15_bt,
@@ -1976,7 +2740,10 @@ with tab_backtest:
                     end=oos_end,
                 )
 
+                # =================================================
                 # Strategy B2
+                # =================================================
+
                 is_b = simulate_strategy(
                     m5_bt,
                     m15_bt,
@@ -1997,27 +2764,43 @@ with tab_backtest:
                     end=oos_end,
                 )
 
-                is_a_m = calculate_metrics(is_a)
-                oos_a_m = calculate_metrics(oos_a)
+                is_a_m = calculate_metrics(
+                    is_a
+                )
 
-                is_b_m = calculate_metrics(is_b)
-                oos_b_m = calculate_metrics(oos_b)
+                oos_a_m = calculate_metrics(
+                    oos_a
+                )
+
+                is_b_m = calculate_metrics(
+                    is_b
+                )
+
+                oos_b_m = calculate_metrics(
+                    oos_b
+                )
 
                 st.success(
-                    f"الفترة: {m5_bt.index[0]} → {m5_bt.index[-1]}"
+                    f"الفترة: "
+                    f"{m5_bt.index[0]} → "
+                    f"{m5_bt.index[-1]}"
                 )
 
                 st.info(
                     f"OOS يبدأ: {split_time}"
                 )
 
-                # ------------------------------------------------
-                # A
-                # ------------------------------------------------
+                # =================================================
+                # A RESULTS
+                # =================================================
 
-                st.markdown("### A — Trend Confluence")
+                st.markdown(
+                    "### A — Trend Confluence"
+                )
 
-                a1, a2, a3, a4, a5 = st.columns(5)
+                a1, a2, a3, a4, a5 = (
+                    st.columns(5)
+                )
 
                 a1.metric(
                     "OOS Trades",
@@ -2032,9 +2815,12 @@ with tab_backtest:
                 pf_text = (
                     "∞"
                     if np.isinf(
-                        oos_a_m["profit_factor"]
+                        oos_a_m[
+                            "profit_factor"
+                        ]
                     )
-                    else f"{oos_a_m['profit_factor']:.2f}"
+                    else
+                    f"{oos_a_m['profit_factor']:.2f}"
                 )
 
                 a3.metric(
@@ -2052,15 +2838,17 @@ with tab_backtest:
                     f"{oos_a_m['max_dd']:.2f}R"
                 )
 
-                # ------------------------------------------------
-                # B2
-                # ------------------------------------------------
+                # =================================================
+                # B2 RESULTS
+                # =================================================
 
                 st.markdown(
                     "### B2 — True Breakout + Retest"
                 )
 
-                b1, b2, b3, b4, b5 = st.columns(5)
+                b1, b2, b3, b4, b5 = (
+                    st.columns(5)
+                )
 
                 b1.metric(
                     "OOS Trades",
@@ -2075,9 +2863,12 @@ with tab_backtest:
                 pf_text_b = (
                     "∞"
                     if np.isinf(
-                        oos_b_m["profit_factor"]
+                        oos_b_m[
+                            "profit_factor"
+                        ]
                     )
-                    else f"{oos_b_m['profit_factor']:.2f}"
+                    else
+                    f"{oos_b_m['profit_factor']:.2f}"
                 )
 
                 b3.metric(
@@ -2095,9 +2886,9 @@ with tab_backtest:
                     f"{oos_b_m['max_dd']:.2f}R"
                 )
 
-                # ------------------------------------------------
-                # Comparison
-                # ------------------------------------------------
+                # =================================================
+                # COMPARISON
+                # =================================================
 
                 st.markdown(
                     "### 📊 مقارنة الاختبار"
@@ -2106,52 +2897,84 @@ with tab_backtest:
                 comparison = pd.DataFrame(
                     [
                         {
-                            "Strategy": "A",
-                            "IS Trades": is_a_m["trades"],
-                            "IS Win Rate": f"{is_a_m['win_rate']:.1f}%",
-                            "IS PF": (
-                                "∞"
-                                if np.isinf(
-                                    is_a_m["profit_factor"]
-                                )
-                                else f"{is_a_m['profit_factor']:.2f}"
-                            ),
-                            "IS Total R": f"{is_a_m['total_r']:+.2f}",
-                            "OOS Trades": oos_a_m["trades"],
-                            "OOS Win Rate": f"{oos_a_m['win_rate']:.1f}%",
-                            "OOS PF": (
-                                "∞"
-                                if np.isinf(
-                                    oos_a_m["profit_factor"]
-                                )
-                                else f"{oos_a_m['profit_factor']:.2f}"
-                            ),
-                            "OOS Total R": f"{oos_a_m['total_r']:+.2f}",
-                            "OOS Max DD": f"{oos_a_m['max_dd']:.2f}",
+                            "Strategy":
+                                "A",
+                            "IS Trades":
+                                is_a_m["trades"],
+                            "IS Win Rate":
+                                f"{is_a_m['win_rate']:.1f}%",
+                            "IS PF":
+                                (
+                                    "∞"
+                                    if np.isinf(
+                                        is_a_m[
+                                            "profit_factor"
+                                        ]
+                                    )
+                                    else
+                                    f"{is_a_m['profit_factor']:.2f}"
+                                ),
+                            "IS Total R":
+                                f"{is_a_m['total_r']:+.2f}",
+                            "OOS Trades":
+                                oos_a_m["trades"],
+                            "OOS Win Rate":
+                                f"{oos_a_m['win_rate']:.1f}%",
+                            "OOS PF":
+                                (
+                                    "∞"
+                                    if np.isinf(
+                                        oos_a_m[
+                                            "profit_factor"
+                                        ]
+                                    )
+                                    else
+                                    f"{oos_a_m['profit_factor']:.2f}"
+                                ),
+                            "OOS Total R":
+                                f"{oos_a_m['total_r']:+.2f}",
+                            "OOS Max DD":
+                                f"{oos_a_m['max_dd']:.2f}",
                         },
                         {
-                            "Strategy": "B2",
-                            "IS Trades": is_b_m["trades"],
-                            "IS Win Rate": f"{is_b_m['win_rate']:.1f}%",
-                            "IS PF": (
-                                "∞"
-                                if np.isinf(
-                                    is_b_m["profit_factor"]
-                                )
-                                else f"{is_b_m['profit_factor']:.2f}"
-                            ),
-                            "IS Total R": f"{is_b_m['total_r']:+.2f}",
-                            "OOS Trades": oos_b_m["trades"],
-                            "OOS Win Rate": f"{oos_b_m['win_rate']:.1f}%",
-                            "OOS PF": (
-                                "∞"
-                                if np.isinf(
-                                    oos_b_m["profit_factor"]
-                                )
-                                else f"{oos_b_m['profit_factor']:.2f}"
-                            ),
-                            "OOS Total R": f"{oos_b_m['total_r']:+.2f}",
-                            "OOS Max DD": f"{oos_b_m['max_dd']:.2f}",
+                            "Strategy":
+                                "B2",
+                            "IS Trades":
+                                is_b_m["trades"],
+                            "IS Win Rate":
+                                f"{is_b_m['win_rate']:.1f}%",
+                            "IS PF":
+                                (
+                                    "∞"
+                                    if np.isinf(
+                                        is_b_m[
+                                            "profit_factor"
+                                        ]
+                                    )
+                                    else
+                                    f"{is_b_m['profit_factor']:.2f}"
+                                ),
+                            "IS Total R":
+                                f"{is_b_m['total_r']:+.2f}",
+                            "OOS Trades":
+                                oos_b_m["trades"],
+                            "OOS Win Rate":
+                                f"{oos_b_m['win_rate']:.1f}%",
+                            "OOS PF":
+                                (
+                                    "∞"
+                                    if np.isinf(
+                                        oos_b_m[
+                                            "profit_factor"
+                                        ]
+                                    )
+                                    else
+                                    f"{oos_b_m['profit_factor']:.2f}"
+                                ),
+                            "OOS Total R":
+                                f"{oos_b_m['total_r']:+.2f}",
+                            "OOS Max DD":
+                                f"{oos_b_m['max_dd']:.2f}",
                         },
                     ]
                 )
@@ -2162,36 +2985,44 @@ with tab_backtest:
                     hide_index=True,
                 )
 
-                # ------------------------------------------------
-                # Equity
-                # ------------------------------------------------
+                # =================================================
+                # EQUITY
+                # =================================================
 
                 st.markdown(
                     "### 📈 OOS Equity"
                 )
 
                 eq_a = (
-                    oos_a["result_r"]
-                    .cumsum()
+                    oos_a[
+                        "result_r"
+                    ].cumsum()
                     if not oos_a.empty
-                    else pd.Series(dtype=float)
+                    else pd.Series(
+                        dtype=float
+                    )
                 )
 
                 eq_b = (
-                    oos_b["result_r"]
-                    .cumsum()
+                    oos_b[
+                        "result_r"
+                    ].cumsum()
                     if not oos_b.empty
-                    else pd.Series(dtype=float)
+                    else pd.Series(
+                        dtype=float
+                    )
                 )
 
                 equity = pd.DataFrame(
                     {
-                        "A": eq_a.reset_index(
-                            drop=True
-                        ),
-                        "B2": eq_b.reset_index(
-                            drop=True
-                        ),
+                        "A":
+                            eq_a.reset_index(
+                                drop=True
+                            ),
+                        "B2":
+                            eq_b.reset_index(
+                                drop=True
+                            ),
                     }
                 )
 
@@ -2200,30 +3031,36 @@ with tab_backtest:
                     use_container_width=True,
                 )
 
-                # ------------------------------------------------
-                # Warnings
-                # ------------------------------------------------
+                # =================================================
+                # WARNINGS
+                # =================================================
 
-                if oos_a_m["trades"] < 100:
+                if (
+                    oos_a_m["trades"] <
+                    100
+                ):
                     st.warning(
                         "OOS Strategy A أقل من 100 صفقة: "
                         "العينة محدودة."
                     )
 
-                if oos_b_m["trades"] < 100:
+                if (
+                    oos_b_m["trades"] <
+                    100
+                ):
                     st.warning(
                         "OOS Strategy B2 أقل من 100 صفقة: "
                         "لا تعتبر النتيجة إثباتًا نهائيًا."
                     )
 
                 st.caption(
-                    "هذا الاختبار لا يحاكي تنفيذ الوسيط الحقيقي، "
+                    "الاختبار لا يحاكي تنفيذ الوسيط الحقيقي، "
                     "ولا يشمل حاليًا السبريد والعمولة والانزلاق السعري."
                 )
 
-                # ------------------------------------------------
-                # Trade tables
-                # ------------------------------------------------
+                # =================================================
+                # TRADE TABLES
+                # =================================================
 
                 with st.expander(
                     "عرض صفقات OOS — A"
@@ -2233,6 +3070,7 @@ with tab_backtest:
                         st.info(
                             "لا توجد صفقات."
                         )
+
                     else:
                         st.dataframe(
                             oos_a,
@@ -2248,6 +3086,7 @@ with tab_backtest:
                         st.info(
                             "لا توجد صفقات."
                         )
+
                     else:
                         st.dataframe(
                             oos_b,
@@ -2266,7 +3105,6 @@ with tab_backtest:
                 st.error(
                     f"خطأ في Backtest: {e}"
                 )
-
 
 # ============================================================
 # LOGS TAB
@@ -2307,7 +3145,6 @@ with tab_logs:
             mime="text/csv",
             use_container_width=True,
         )
-
 
 # ============================================================
 # FOOTER
