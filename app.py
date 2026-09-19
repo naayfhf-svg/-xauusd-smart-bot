@@ -14,6 +14,7 @@ st.set_page_config(page_title='GOLD AI | XAU/USD', page_icon='🟡', layout='wid
 TZ = ZoneInfo('Asia/Riyadh')
 SYMBOL = 'XAU/USD'
 DATA_URL = 'https://api.twelvedata.com/time_series'
+QUOTE_URL = 'https://api.twelvedata.com/quote'
 START_BALANCE = 100_000.0
 RISK_PER_TRADE = 0.005
 DAILY_LOSS_LIMIT = 0.02
@@ -103,8 +104,24 @@ def resample_closed(x,rule):
 def quality(x):
     if x.empty:return False,'لا توجد بيانات'
     age=(pd.Timestamp.now(tz='UTC')-x.datetime.iloc[-1]).total_seconds()/60
-    ok=x.datetime.is_monotonic_increasing and x.datetime.duplicated().sum()==0 and age<20
-    return ok,f'آخر شمعة منذ {age:.1f} دقيقة • تكرار {int(x.datetime.duplicated().sum())}'
+    gaps=x.datetime.diff().dropna().dt.total_seconds().div(60)
+    max_gap=float(gaps.max()) if not gaps.empty else 0.0
+    dup=int(x.datetime.duplicated().sum())
+    ok=x.datetime.is_monotonic_increasing and dup==0 and age<20 and max_gap<=10
+    return ok,f'آخر شمعة منذ {age:.1f} دقيقة • فجوة قصوى {max_gap:.1f} دقيقة • تكرار {dup}'
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_quote():
+    key=secret('TWELVE_DATA_API_KEY')
+    if not key:return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'مفتاح Twelve Data غير موجود'}
+    try:
+        r=requests.get(QUOTE_URL,params={'symbol':SYMBOL,'apikey':key},timeout=10); p=r.json()
+        bid=pd.to_numeric(p.get('bid'),errors='coerce'); ask=pd.to_numeric(p.get('ask'),errors='coerce')
+        if not np.isfinite(bid) or not np.isfinite(ask) or ask<=bid:
+            return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'مصدر Bid/Ask غير متاح'}
+        return {'connected':True,'bid':float(bid),'ask':float(ask),'spread':float(ask-bid),'label':f"Bid/Ask متصل • السبريد {float(ask-bid):.2f}"}
+    except Exception as e:
+        return {'connected':False,'bid':np.nan,'ask':np.nan,'spread':np.nan,'label':'تعذر جلب Bid/Ask'}
 
 
 def ema(s,n):return s.ewm(span=n,adjust=False).mean()
@@ -163,7 +180,7 @@ def b2(x):
 
 def news_gate(research):
     url=secret('NEWS_API_URL')
-    if not url:return {'connected':False,'blocked':not research,'label':'غير متصل — لا يوجد مزود أخبار اقتصادي'}
+    if not url:return {'connected':False,'blocked':not research,'label':'غير متصل — لا يوجد مزود Economic Calendar موثوق'}
     try:
         p=requests.get(url,timeout=8).json(); block=bool(p.get('high_impact',False) or p.get('block',False))
         return {'connected':True,'blocked':block,'label':'خبر عالي التأثير' if block else 'لا يوجد حظر'}
@@ -171,7 +188,17 @@ def news_gate(research):
 
 
 def spread_gate(research):
-    return {'connected':False,'blocked':not research,'label':'غير متصل — بيانات Bid/Ask غير متاحة' if not research else 'غير متاح — وضع البحث التجريبي'}
+    q=fetch_quote()
+    if q['connected']:
+        # No arbitrary universal spread threshold: only report the live quote unless a user-configured limit exists.
+        max_spread=secret('MAX_SPREAD')
+        try:max_spread=float(max_spread) if max_spread is not None else None
+        except Exception:max_spread=None
+        blocked=bool(max_spread is not None and q['spread']>max_spread)
+        label=q['label'] + (f' • الحد {max_spread:.2f}' if max_spread is not None else '')
+        if blocked: label+=' • السبريد أعلى من الحد'
+        return {'connected':True,'blocked':blocked,'label':label,'bid':q['bid'],'ask':q['ask'],'spread':q['spread']}
+    return {'connected':False,'blocked':not research,'label':q['label'] if not research else q['label']+' • وضع البحث التجريبي','bid':np.nan,'ask':np.nan,'spread':np.nan}
 
 
 def unrealized_r(p,price):
@@ -222,29 +249,46 @@ def manage_trade(price):
     if not p or not np.isfinite(price):return
     if p['side']=='شراء':
         if price<=p['sl']:close_trade(p['sl'],'وقف الخسارة');return
-        if not p['tp1_hit'] and price>=p['tp1']:p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry']
+        if not p['tp1_hit'] and price>=p['tp1']:
+            p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry'];return
         if p['tp1_hit'] and price>=p['tp2']:close_trade(p['tp2'],'الهدف الثاني')
     else:
         if price>=p['sl']:close_trade(p['sl'],'وقف الخسارة');return
-        if not p['tp1_hit'] and price<=p['tp1']:p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry']
+        if not p['tp1_hit'] and price<=p['tp1']:
+            p['realized_r']+=.5;p['remaining_fraction']=.5;p['tp1_hit']=True;p['sl']=p['entry'];return
         if p['tp1_hit'] and price<=p['tp2']:close_trade(p['tp2'],'الهدف الثاني')
 
 
-def backtest_b2(x):
-    y=indicators(x).dropna().reset_index(drop=True)
-    if len(y)<350:return pd.DataFrame(),{'trades':0,'warning':'العينة صغيرة'}
-    split=int(len(y)*.7); rows=[]; i=120
-    while i<len(y)-2:
-        r=y.iloc[i]; p=y.iloc[i-21:i]; res,sup=float(p.high.max()),float(p.low.min()); av=float(r.atr)
+def backtest_mtf(raw_m5):
+    """Closed-bar MTF backtest. Signal is evaluated on M5 with the latest CLOSED M15/H1/H4 bars."""
+    m5=indicators(closed_m5(raw_m5)).dropna().reset_index(drop=True)
+    m15=resample_closed(raw_m5,'15min'); h1=resample_closed(raw_m5,'1h'); h4=resample_closed(raw_m5,'4h')
+    m15=indicators(m15).dropna().reset_index(drop=True); h1=indicators(h1).dropna().reset_index(drop=True); h4=indicators(h4).dropna().reset_index(drop=True)
+    if min(len(m5),len(m15),len(h1),len(h4))<250:return pd.DataFrame(),{'trades':0,'warning':'العينة صغيرة'}
+    for df in (m5,m15,h1,h4): df['ts']=df['datetime']
+    base=m5[['datetime','open','high','low','close','ema20','ema50','ema100','rsi','atr','macd_hist','momentum','adx']].copy()
+    for name,df in [('m15',m15),('h1',h1),('h4',h4)]:
+        cols=['ts','close','ema20','ema50','ema100','rsi','adx']
+        base=pd.merge_asof(base.sort_values('datetime'),df[cols].sort_values('ts'),left_on='datetime',right_on='ts',direction='backward',suffixes=('','_'+name))
+    split_time=base.datetime.iloc[int(len(base)*.7)]; rows=[]; i=130
+    while i<len(base)-2:
+        r=base.iloc[i]
+        if r.datetime>=split_time and i<1: i+=1;continue
+        av=float(r.atr)
         if not np.isfinite(av) or av<=0:i+=1;continue
-        prev=float(y.close.iloc[i-1]); rb=prev>res and r.low<=res+.35*av and r.close>res; rs=prev<sup and r.high>=sup-.35*av and r.close<sup
-        buy=r.close>r.ema20>r.ema50>r.ema100 and r.rsi>=52 and r.momentum>0 and r.macd_hist>0 and r.adx>=25; sell=r.close<r.ema20<r.ema50<r.ema100 and r.rsi<=48 and r.momentum<0 and r.macd_hist<0 and r.adx>=25
-        side='شراء' if rb and buy else 'بيع' if rs and sell else None
+        p=base.iloc[max(0,i-21):i];res=float(p.high.max());sup=float(p.low.min());prev=float(base.close.iloc[i-1])
+        rb=prev>res and r.low<=res+.35*av and r.close>res; rs=prev<sup and r.high>=sup-.35*av and r.close<sup
+        def bull(s): return s.close>s.ema20>s.ema50>s.ema100
+        def bear(s): return s.close<s.ema20<s.ema50<s.ema100
+        bull_mtf=bull(r) and bool(r.close_m15>r.ema20_m15>r.ema50_m15>r.ema100_m15) and bool(r.close_h1>r.ema20_h1>r.ema50_h1>r.ema100_h1) and bool(r.close_h4>r.ema20_h4>r.ema50_h4>r.ema100_h4)
+        bear_mtf=bear(r) and bool(r.close_m15<r.ema20_m15<r.ema50_m15<r.ema100_m15) and bool(r.close_h1<r.ema20_h1<r.ema50_h1<r.ema100_h1) and bool(r.close_h4<r.ema20_h4<r.ema50_h4<r.ema100_h4)
+        mb=r.rsi>=52 and r.momentum>0 and r.macd_hist>0 and r.adx>=25; ms=r.rsi<=48 and r.momentum<0 and r.macd_hist<0 and r.adx>=25
+        side='شراء' if rb and bull_mtf and mb else 'بيع' if rs and bear_mtf and ms else None
         if not side:i+=1;continue
         entry=float(r.close);d=max(av*1.4,entry*.0015);sl=entry-d if side=='شراء' else entry+d;tp1=entry+d if side=='شراء' else entry-d;tp2=entry+2.2*d if side=='شراء' else entry-2.2*d
-        realized=0.;rem=1.;hit=False;outcome=None;reason=None;close_i=None
-        for j in range(i+1,min(i+80,len(y))):
-            hi,lo=float(y.high.iloc[j]),float(y.low.iloc[j])
+        realized=0.;rem=.5 if False else 1.;hit=False;outcome=None;reason=None;close_i=None
+        for j in range(i+1,min(i+100,len(base))):
+            hi,lo=float(base.high.iloc[j]),float(base.low.iloc[j])
             if side=='شراء':
                 if lo<=sl:outcome=realized-rem;reason='وقف الخسارة';close_i=j;break
                 if not hit and hi>=tp1:realized+=.5;rem=.5;hit=True;sl=entry
@@ -254,14 +298,14 @@ def backtest_b2(x):
                 if not hit and lo<=tp1:realized+=.5;rem=.5;hit=True;sl=entry
                 if hit and lo<=tp2:outcome=realized+1.1;reason='الهدف الثاني';close_i=j;break
         if outcome is not None:
-            rows.append({'الوقت':y.datetime.iloc[i],'النوع':side,'الدخول':round(entry,2),'الوقف':round(entry-d if side=='شراء' else entry+d,2),'TP1':round(tp1,2),'TP2':round(tp2,2),'R':round(outcome,3),'السبب':reason,'OOS':i>=split});i=close_i+1
+            rows.append({'الوقت':r.datetime,'النوع':side,'الدخول':round(entry,2),'الوقف':round(entry-d if side=='شراء' else entry+d,2),'TP1':round(tp1,2),'TP2':round(tp2,2),'R':round(outcome,3),'السبب':reason,'OOS':r.datetime>=split_time});i=close_i+1
         else:i+=1
     t=pd.DataFrame(rows);o=t[t.OOS].copy() if not t.empty else t
-    if o.empty:return t,{'trades':0,'warning':'لا توجد صفقات OOS'}
+    if o.empty:return t,{'trades':0,'warning':'لا توجد صفقات OOS مطابقة لكل بوابات MTF'}
     eq=peak=dd=0.
     for v in o.R:eq+=float(v);peak=max(peak,eq);dd=max(dd,peak-eq)
     gw=o.loc[o.R>0,'R'].sum();gl=abs(o.loc[o.R<0,'R'].sum());pf=gw/gl if gl else math.inf
-    return t,{'trades':len(o),'win_rate':float((o.R>0).mean()*100),'profit_factor':float(pf),'total_r':float(o.R.sum()),'max_dd_r':float(dd),'warning':None}
+    return t,{'trades':len(o),'win_rate':float((o.R>0).mean()*100),'profit_factor':float(pf),'total_r':float(o.R.sum()),'max_dd_r':float(dd),'warning':None,'oos_start':str(split_time)}
 
 
 def metrics(items):
@@ -290,6 +334,7 @@ if st.session_state.last_signal_candle!=candle:
     rec.update({k:'PASS' if v else 'BLOCK' for k,v in a['gates'].items()});st.session_state.decisions.insert(0,rec);st.session_state.decisions=st.session_state.decisions[:500]
 if a['signal'] in ('شراء','بيع') and st.session_state.position is None:open_trade(a['signal'],price,a['snaps']['M5']['atr'])
 
+st.caption('الوضع: Paper Trading فقط • الحالة محفوظة داخل جلسة Streamlit الحالية وليست قاعدة بيانات دائمة')
 st.markdown(f"<div class='hero'><div class='kicker'>GOLD AI • SMART TRADING SYSTEM</div><h1 class='gold'>XAU/USD</h1><div class='price'>${price:,.2f}</div><p class='muted'>Paper Trading • Market Data • Strategy Engine • Risk Engine</p></div>",unsafe_allow_html=True)
 metrics([('القرار',a['signal']),('قوة الإشارة',f"{a['strength']}%"),('السوق',a['snaps']['M5']['regime']),('الرصيد',f"${st.session_state.balance:,.2f}"),('الخسارة اليومية',f"{daily_loss_pct(price):.2f}%")])
 
@@ -324,13 +369,13 @@ with st.expander('تشغيل OOS Backtest'):
     mx=min(5000,len(m15))
     if mx<500:st.warning('بيانات M15 الحالية لا تكفي.')
     else:
-        bars=st.slider('شموع M15',500,mx,min(3000,mx),100);trades,stats=backtest_b2(m15.tail(bars))
+        bars=st.slider('حجم الاختبار (تقريبيًا بعدد شموع M15)',500,mx,min(3000,mx),100);trades,stats=backtest_mtf(raw.tail(min(len(raw),bars*3)))
         if stats['trades']:
-            metrics([('OOS Trades',stats['trades']),('Win Rate',f"{stats['win_rate']:.1f}%"),('Profit Factor',f"{stats['profit_factor']:.2f}"),('Total R',f"{stats['total_r']:.2f}R"),('Max DD',f"{stats['max_dd_r']:.2f}R")]);st.caption('OOS فقط. هذا اختبار B2 أحادي الإطار وليس محاكاة كاملة لـ M5/M15/H1/H4.');st.dataframe(trades.tail(100),hide_index=True,use_container_width=True)
+            metrics([('OOS Trades',stats['trades']),('Win Rate',f"{stats['win_rate']:.1f}%"),('Profit Factor',f"{stats['profit_factor']:.2f}"),('Total R',f"{stats['total_r']:.2f}R"),('Max DD',f"{stats['max_dd_r']:.2f}R")]);st.caption('OOS فقط. هذا الاختبار يحاكي M5 + توافق M15/H1/H4 + B2 + Momentum/ADX، باستخدام شموع مغلقة فقط. الأخبار والسبريد التاريخيان غير متاحين لذلك لا يدخلان في نتيجة الباك تست.');st.dataframe(trades.tail(100),hide_index=True,use_container_width=True)
         else:st.warning(stats.get('warning','لا توجد نتائج'))
 
 st.subheader('Decision Log');st.dataframe(pd.DataFrame(st.session_state.decisions),hide_index=True,use_container_width=True) if st.session_state.decisions else st.info('لا يوجد سجل بعد.')
 st.subheader('Trade Log');st.dataframe(pd.DataFrame(st.session_state.history),hide_index=True,use_container_width=True) if st.session_state.history else st.info('لا توجد صفقات مغلقة.')
-st.subheader('System Health');st.dataframe(pd.DataFrame([{'النظام':k,'الحالة':'ONLINE' if v else 'BLOCKED'} for k,v in {'Data Feed':not raw.empty,'Data Quality':qok,'Strategy Engine':a['snaps']['M5'] is not None,'Risk Engine':True,'Paper Engine':True,'Time Sync':True,'News Provider':a['news']['connected'],'Bid/Ask Spread':a['spread']['connected']}.items()]),hide_index=True,use_container_width=True)
+st.subheader('System Health');st.dataframe(pd.DataFrame([{'النظام':k,'الحالة':'ONLINE' if v else 'BLOCKED'} for k,v in {'Data Feed':not raw.empty,'Data Quality':qok,'Strategy Engine':a['snaps']['M5'] is not None,'Risk Engine':True,'Paper Engine':True,'Time Sync':True,'Economic Calendar':a['news']['connected'],'Bid/Ask Spread':a['spread']['connected']}.items()]),hide_index=True,use_container_width=True)
 st.caption(f"Last closed M5: {raw.datetime.iloc[-1]} UTC • {len(raw):,} bars • batches {chunks}/{CHUNKS} • API credits left: {credits[-1] if credits else 'N/A'}")
 if st.session_state.auto_refresh:time.sleep(refresh);st.rerun()
