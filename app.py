@@ -286,7 +286,7 @@ def backtest_mtf(raw_m5):
     base=m5[['datetime','decision_ts','open','high','low','close','ema20','ema50','ema100','rsi','atr','macd_hist','momentum','adx']].copy()
     for name,df in [('m15',m15),('h1',h1),('h4',h4)]:
         cols=['ts','close','ema20','ema50','ema100','rsi','adx']
-        base=pd.merge_asof(base.sort_values('decision_ts'),df[cols].sort_values('ts'),left_on='decision_ts',right_on='ts',direction='backward',suffixes=('','_'+name))
+        base=pd.merge_asof(base.sort_values('decision_ts'),df[cols].sort_values('ts'),left_on='decision_ts',right_on='ts',direction='backward',allow_exact_matches=False,suffixes=('','_'+name))
     split_time=base.decision_ts.iloc[int(len(base)*.7)]; rows=[]; i=130
     while i<len(base)-2:
         r=base.iloc[i]
