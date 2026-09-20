@@ -25,7 +25,7 @@ import altair as alt
 # Gold • Stocks • Futures/Contracts • Paper • Optional live bridge
 # ============================================================
 
-VERSION = "3.2.0-x10"
+VERSION = "3.3.0-x10"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -305,6 +305,99 @@ def data_quality(frame: pd.DataFrame) -> dict[str, Any]:
         "age_min": age_min,
         "duplicates": duplicate_count,
         "label": f"آخر شمعة منذ {age_min:.0f} دقيقة • تكرار {duplicate_count}",
+    }
+
+
+def _quote_timestamp(raw_quote: dict[str, Any]) -> pd.Timestamp | None:
+    """Best-effort timestamp parser for quote providers. Returns UTC or None."""
+    raw = raw_quote.get("raw") if isinstance(raw_quote, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    candidates = [raw.get("timestamp"), raw.get("datetime"), raw.get("last_update_at"), raw.get("last_update") ]
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        try:
+            if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+                n = float(value)
+                unit = "ms" if n > 10_000_000_000 else "s"
+                ts = pd.to_datetime(n, unit=unit, utc=True, errors="coerce")
+            else:
+                ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.notna(ts):
+                return pd.Timestamp(ts)
+        except Exception:
+            pass
+    return None
+
+
+def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]:
+    """Detect stale, frozen, or synthetic-looking market data before execution."""
+    base = data_quality(frame)
+    reasons: list[str] = []
+    if not base.get("ok"):
+        reasons.append("ترتيب/تكرار الشموع غير سليم")
+
+    sample = frame.tail(min(120, len(frame))).copy()
+    if len(sample) < 30:
+        reasons.append("عدد الشموع الحديثة غير كافٍ لفحص سلامة الـFeed")
+        return {**base, "trusted": False, "execution_ok": False, "reasons": reasons, "unique_ratio": 0.0, "alternation_ratio": 0.0, "zero_range_ratio": 0.0, "quote_age_min": None}
+
+    close = pd.to_numeric(sample["close"], errors="coerce").dropna()
+    high = pd.to_numeric(sample["high"], errors="coerce")
+    low = pd.to_numeric(sample["low"], errors="coerce")
+    unique_ratio = float(close.nunique() / max(len(close), 1))
+
+    ref = max(abs(float(close.iloc[-1])) if len(close) else 1.0, 1.0)
+    tick_eps = max(ref * 1e-8, 1e-8)
+    zero_range_ratio = float(((high - low).abs() <= tick_eps).mean())
+
+    diffs = close.diff().dropna()
+    nonzero = diffs[diffs.abs() > tick_eps]
+    alternation_ratio = 0.0
+    if len(nonzero) >= 20:
+        signs = np.sign(nonzero.to_numpy())
+        alternation_ratio = float(np.mean(signs[1:] != signs[:-1]))
+
+    # Frozen feed: too few unique closes over a two-hour-equivalent M5 sample.
+    if len(close) >= 60 and unique_ratio < 0.08:
+        reasons.append("السعر متكرر بدرجة غير طبيعية")
+    # Zero-range candles across most of the recent feed often indicate a bad/frozen source.
+    if zero_range_ratio > 0.80:
+        reasons.append("نسبة كبيرة من الشموع بلا نطاق سعري")
+    # Repeated up/down saw-tooth pattern with low price diversity is suspicious.
+    if alternation_ratio > 0.93 and unique_ratio < 0.35:
+        reasons.append("نمط صعود/هبوط متناوب متكرر بشكل غير طبيعي")
+
+    quote_ts = _quote_timestamp(quote)
+    quote_age_min = None
+    if quote_ts is not None:
+        quote_age_min = max(0.0, (now_utc() - quote_ts).total_seconds() / 60.0)
+
+    # Compare quote and last closed bar only for gross mismatches; use a wide threshold
+    # to avoid false positives around gaps or session transitions.
+    if quote.get("connected") and finite(quote.get("last")) and len(close):
+        q = float(quote["last"])
+        c = float(close.iloc[-1])
+        mismatch_pct = abs(q - c) / max(abs(c), 1e-9) * 100.0
+        if mismatch_pct > 3.0:
+            reasons.append(f"فرق Quote عن آخر شمعة كبير ({mismatch_pct:.2f}%)")
+
+    structural_ok = base.get("ok", False) and not reasons
+    execution_ok = structural_ok and bool(quote.get("connected")) and base.get("age_min", 9999) <= 15
+    if quote_age_min is not None and quote_age_min > 15:
+        execution_ok = False
+        reasons.append(f"Quote قديم ({quote_age_min:.0f} دقيقة)")
+
+    return {
+        **base,
+        "trusted": bool(structural_ok),
+        "execution_ok": bool(execution_ok),
+        "reasons": list(dict.fromkeys(reasons)),
+        "unique_ratio": unique_ratio,
+        "alternation_ratio": alternation_ratio,
+        "zero_range_ratio": zero_range_ratio,
+        "quote_age_min": quote_age_min,
     }
 
 # ------------------------- indicators -------------------------
@@ -860,6 +953,16 @@ def self_test() -> tuple[bool, str]:
         assert plan["qty"] > 0 and plan["stop_loss"] < plan["entry_reference"] < plan["take_profit_1"]
         ok, reasons = risk_gate(100000.0, 0.0, 0, plan, 2.0, 3, 1.0)
         assert ok and not reasons
+        healthy = feed_integrity(df, {"connected": True, "last": float(df["close"].iloc[-1]), "raw": {}})
+        assert healthy["trusted"]
+        # Synthetic alternating two-price feed must be rejected.
+        bad = df.tail(120).copy().reset_index(drop=True)
+        bad["close"] = np.where(np.arange(len(bad)) % 2 == 0, 100.0, 100.1)
+        bad["open"] = bad["close"]
+        bad["high"] = bad["close"] + 0.01
+        bad["low"] = bad["close"] - 0.01
+        suspicious = feed_integrity(bad, {"connected": True, "last": float(bad["close"].iloc[-1]), "raw": {}})
+        assert not suspicious["trusted"]
         return True, "OK"
     except Exception as exc:
         return False, str(exc)
@@ -934,8 +1037,12 @@ if raw.empty:
 
 quality = data_quality(raw)
 quote = fetch_quote(instrument.symbol)
+feed = feed_integrity(raw, quote)
 reference_price = float(quote["last"]) if quote.get("connected") and finite(quote.get("last")) else float(raw["close"].iloc[-1])
 analysis = analyze_mtf(raw)
+# A structurally suspicious feed must never emit an actionable BUY/SELL.
+if not feed.get("trusted", False) and analysis.get("signal") in {"BUY", "SELL"}:
+    analysis = {**analysis, "signal": "WAIT", "reason": "تم حجب الإشارة بسبب فشل فحص سلامة بيانات السوق"}
 candle_id = str(raw["datetime"].iloc[-1])
 
 # Manage paper position before rendering.
@@ -969,13 +1076,17 @@ mini_grid([
     ("السعر", fmt(reference_price, 4), ""),
     ("القرار", analysis["signal"], "ok" if analysis["signal"] in {"BUY", "SELL"} else "wait"),
     ("القوة", f"{analysis['strength']}%", ""),
-    ("البيانات", "OK" if quality["ok"] else "CHECK", fresh_state if quality["ok"] else "bad"),
+    ("Feed", "TRUSTED" if feed.get("trusted") else "CHECK", "ok" if feed.get("trusted") else "bad"),
     ("Live", "UNLOCKED" if live_unlocked else "LOCKED", "ok" if live_unlocked else "wait"),
     ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF", "wait" if st.session_state.kill_switch else "ok"),
 ], "status-grid")
 
 if quality.get("age_min", 0) > 240:
     st.warning("البيانات الحالية قد تكون قديمة لأن السوق مغلق أو المصدر متأخر. لا تعتمد على السعر كتنفيذ حي قبل التأكد من Quote مباشر.")
+if not feed.get("trusted", False):
+    st.error("فحص سلامة الـFeed لم ينجح. تم حجب أي إشارة تنفيذية حتى تعود البيانات لطبيعتها.")
+    for reason in feed.get("reasons", []):
+        st.caption("• " + reason)
 
 st.subheader("Multi-Timeframe Command Center")
 tf_cards = []
@@ -1037,6 +1148,7 @@ diag_rows = [
     ("ADX M5", f"{m5_diag.get('adx', 0):.1f}" if m5_diag else "—", bool(m5_diag) and m5_diag.get("adx",0) >= 20),
     ("B2 Break/Retest", b2_diag.get("side") or ("Breakout فقط" if b2_diag.get("breakout") else "بانتظار التأكيد"), bool(b2_diag.get("valid"))),
     ("حداثة البيانات", f"{quality.get('age_min',0):.0f} دقيقة", quality.get("age_min",9999) <= 15),
+    ("سلامة Feed", "موثوق" if feed.get("trusted") else "تحقق مطلوب", bool(feed.get("trusted"))),
 ]
 with st.expander("لماذا هذا القرار؟", expanded=False):
     for label, value, passed in diag_rows:
@@ -1083,6 +1195,9 @@ if mode == "Paper":
         if quality.get("age_min", 9999) > 30:
             p_gate_ok = False
             p_gate_reasons.append("بيانات السوق أقدم من 30 دقيقة")
+        if not feed.get("trusted", False):
+            p_gate_ok = False
+            p_gate_reasons.append("سلامة Feed غير موثوقة")
     gate_label = "WAIT SIGNAL" if not plan else ("PASS" if p_gate_ok else "BLOCK")
     gate_state = "wait" if not plan else ("ok" if p_gate_ok else "bad")
     mini_grid([
@@ -1171,6 +1286,9 @@ if mode == "Live":
         if quality.get("age_min", 9999) > 15:
             live_gate_ok = False
             live_reasons.append("بيانات السوق أقدم من 15 دقيقة")
+        if not feed.get("execution_ok", False):
+            live_gate_ok = False
+            live_reasons.append("فحص سلامة Feed/Quote لم ينجح")
 
         if live_reasons:
             for reason in dict.fromkeys(live_reasons):
@@ -1261,13 +1379,20 @@ health_rows = [
     {"Component": "Market data", "Status": "ONLINE" if not raw.empty else "BLOCKED"},
     {"Component": "Quote", "Status": "ONLINE" if quote.get("connected") else "CHECK"},
     {"Component": "Data quality", "Status": "ONLINE" if quality["ok"] else "CHECK"},
+    {"Component": "Feed integrity", "Status": "TRUSTED" if feed.get("trusted") else "CHECK"},
+    {"Component": "Execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
     {"Component": "Paper engine", "Status": "ONLINE"},
     {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
 ]
 st.dataframe(pd.DataFrame(health_rows), hide_index=True, use_container_width=True)
-st.caption(f"{quality['label']} • Last closed M5: {raw['datetime'].iloc[-1]} UTC • {len(raw):,} bars")
+quote_age_label = "N/A" if feed.get("quote_age_min") is None else f"{feed['quote_age_min']:.0f}m"
+st.caption(
+    f"{quality['label']} • Feed {'TRUSTED' if feed.get('trusted') else 'CHECK'} • "
+    f"Quote age {quote_age_label} • unique {feed.get('unique_ratio',0)*100:.0f}% • "
+    f"alternation {feed.get('alternation_ratio',0)*100:.0f}% • Last closed M5: {raw['datetime'].iloc[-1]} UTC • {len(raw):,} bars"
+)
 
 with st.expander("Decision Log", expanded=False):
     if st.session_state.decisions:
