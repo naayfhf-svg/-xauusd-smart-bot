@@ -24,7 +24,7 @@ import streamlit as st
 # Gold • Stocks • Futures/Contracts • Paper • Optional live bridge
 # ============================================================
 
-VERSION = "3.0.0-x10"
+VERSION = "3.1.0-x10"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -34,7 +34,7 @@ st.set_page_config(
     page_title="GOLD AI X10",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ----------------------------- UI -----------------------------
@@ -44,18 +44,41 @@ st.markdown(
 :root{
   --bg:#070a10;--panel:#0e1622;--panel2:#111b2a;--line:#26364f;
   --gold:#d4af37;--text:#f5f7fb;--muted:#8fa2ba;--green:#24c97d;
-  --red:#f05d68;--blue:#62a8ff;
+  --red:#f05d68;--blue:#62a8ff;--amber:#f2b84b;
 }
+html,body,[class*="css"]{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 .stApp{background:var(--bg);color:var(--text)}
-.block-container{max-width:1500px;padding:1rem 1rem 4rem}
-.hero{border:1px solid #5f4d18;border-radius:22px;padding:24px;background:
+.block-container{max-width:1450px;padding:1rem 1rem 4rem}
+.hero{border:1px solid #5f4d18;border-radius:22px;padding:22px;background:
  radial-gradient(circle at 90% 10%,rgba(212,175,55,.15),transparent 30%),var(--panel)}
 .card{border:1px solid var(--line);border-radius:16px;padding:16px;background:var(--panel);margin-bottom:12px}
 .kicker{font-size:.72rem;letter-spacing:.13em;color:var(--muted)}
-.big{font-size:clamp(2.1rem,6vw,4.5rem);font-weight:900;line-height:1.05}
+.big{font-size:clamp(2rem,6vw,4.3rem);font-weight:900;line-height:1.05}
 .gold{color:var(--gold)}.buy{color:var(--green)}.sell{color:var(--red)}.muted{color:var(--muted)}
 .badge{display:inline-block;padding:4px 9px;border:1px solid var(--line);border-radius:999px;font-size:.78rem;color:var(--muted)}
+.status-grid,.tf-grid,.plan-grid,.paper-grid,.bt-grid{display:grid;gap:12px;margin:14px 0 18px}
+.status-grid{grid-template-columns:repeat(6,minmax(0,1fr))}
+.tf-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+.plan-grid{grid-template-columns:repeat(7,minmax(0,1fr))}
+.paper-grid{grid-template-columns:repeat(5,minmax(0,1fr))}
+.bt-grid{grid-template-columns:repeat(6,minmax(0,1fr))}
+.mini{border:1px solid var(--line);border-radius:15px;padding:14px;background:var(--panel);min-width:0}
+.mini .l{font-size:.78rem;color:var(--muted);margin-bottom:6px}
+.mini .v{font-size:clamp(1.05rem,2vw,1.55rem);font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.state-ok{color:var(--green)}.state-bad{color:var(--red)}.state-wait{color:var(--amber)}
 div[data-testid="stMetric"]{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px}
+@media (max-width: 900px){
+  .block-container{padding:.65rem .65rem 5rem}
+  .hero{padding:16px;border-radius:18px}
+  .status-grid,.paper-grid,.bt-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .tf-grid,.plan-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .mini{padding:11px;border-radius:13px}
+  .mini .l{font-size:.70rem}.mini .v{font-size:1.08rem}
+  h1{font-size:1.75rem!important} h2{font-size:1.35rem!important} h3{font-size:1.15rem!important}
+}
+@media (max-width: 480px){
+  .status-grid,.paper-grid,.bt-grid,.tf-grid,.plan-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -111,6 +134,16 @@ def finite(value: Any) -> bool:
 
 def fmt(value: Any, digits: int = 2) -> str:
     return f"{float(value):,.{digits}f}" if finite(value) else "—"
+
+
+def mini_grid(items: list[tuple[str, str, str]], css_class: str = "status-grid") -> None:
+    cards = []
+    for label, value, state in items:
+        state_class = f" state-{state}" if state in {"ok", "bad", "wait"} else ""
+        cards.append(
+            f"<div class='mini'><div class='l'>{label}</div><div class='v{state_class}'>{value}</div></div>"
+        )
+    st.markdown(f"<div class='{css_class}'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -857,12 +890,15 @@ instrument = InstrumentSpec(
 st.sidebar.divider()
 mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
 risk_pct = st.sidebar.number_input("مخاطرة الصفقة %", min_value=0.05, max_value=1.0, value=0.50, step=0.05)
-max_daily_loss_pct = st.sidebar.number_input("حد الخسارة اليومية %", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-max_open_positions = st.sidebar.number_input("أقصى مراكز مفتوحة", min_value=1, max_value=10, value=3, step=1)
-max_order_risk_pct = st.sidebar.number_input("الحد الصلب لمخاطرة الأمر %", min_value=0.05, max_value=1.0, value=1.0, step=0.05)
 st.session_state.kill_switch = st.sidebar.toggle("KILL SWITCH", value=st.session_state.kill_switch, help="ON يمنع أي أمر Live جديد")
-st.session_state.auto_refresh = st.sidebar.toggle("تحديث تلقائي", value=st.session_state.auto_refresh)
-refresh_seconds = st.sidebar.slider("ثواني التحديث", 10, 120, 30)
+with st.sidebar.expander("إعدادات المخاطر والتحديث", expanded=False):
+    max_daily_loss_pct = st.number_input("حد الخسارة اليومية %", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
+    max_open_positions = st.number_input("أقصى مراكز مفتوحة", min_value=1, max_value=10, value=3, step=1)
+    max_order_risk_pct = st.number_input("الحد الصلب لمخاطرة الأمر %", min_value=0.05, max_value=1.0, value=1.0, step=0.05)
+    st.session_state.auto_refresh = st.toggle("تحديث تلقائي", value=st.session_state.auto_refresh)
+    refresh_seconds = st.slider("ثواني التحديث", 10, 120, 30)
+if not st.session_state.auto_refresh:
+    refresh_seconds = 30
 
 live_unlocked = truthy(secret("LIVE_TRADING_ENABLED", "false"))
 auto_live_unlocked = truthy(secret("AUTO_EXECUTION_ALLOWED", "false"))
@@ -916,30 +952,32 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
     })
     st.session_state.decisions = st.session_state.decisions[:500]
 
-m = st.columns(6)
-m[0].metric("السعر", fmt(reference_price, 4))
-m[1].metric("القرار", analysis["signal"])
-m[2].metric("القوة", f"{analysis['strength']}%")
-m[3].metric("جودة البيانات", "OK" if quality["ok"] else "CHECK")
-m[4].metric("Live", "UNLOCKED" if live_unlocked else "LOCKED")
-m[5].metric("Kill Switch", "ON" if st.session_state.kill_switch else "OFF")
+fresh_state = "ok" if quality.get("age_min", 9999) <= 15 else "wait"
+mini_grid([
+    ("السعر", fmt(reference_price, 4), ""),
+    ("القرار", analysis["signal"], "ok" if analysis["signal"] in {"BUY", "SELL"} else "wait"),
+    ("القوة", f"{analysis['strength']}%", ""),
+    ("البيانات", "OK" if quality["ok"] else "CHECK", fresh_state if quality["ok"] else "bad"),
+    ("Live", "UNLOCKED" if live_unlocked else "LOCKED", "ok" if live_unlocked else "wait"),
+    ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF", "wait" if st.session_state.kill_switch else "ok"),
+], "status-grid")
 
 if quality.get("age_min", 0) > 240:
     st.warning("البيانات الحالية قد تكون قديمة لأن السوق مغلق أو المصدر متأخر. لا تعتمد على السعر كتنفيذ حي قبل التأكد من Quote مباشر.")
 
 st.subheader("Multi-Timeframe Command Center")
-tf_cols = st.columns(4)
-for col, tf in zip(tf_cols, TIMEFRAMES):
+tf_cards = []
+for tf in TIMEFRAMES:
     snap = analysis["snapshots"].get(tf)
     if snap:
         cls = "buy" if snap["trend"] == "UP" else "sell" if snap["trend"] == "DOWN" else ""
-        col.markdown(
+        tf_cards.append(
             f"<div class='card'><div class='kicker'>{tf}</div><h2 class='{cls}'>{snap['trend']}</h2>"
-            f"<div class='muted'>RSI {snap['rsi']:.1f} • ADX {snap['adx']:.1f}</div></div>",
-            unsafe_allow_html=True,
+            f"<div class='muted'>RSI {snap['rsi']:.1f} • ADX {snap['adx']:.1f}</div></div>"
         )
     else:
-        col.markdown(f"<div class='card'><div class='kicker'>{tf}</div><h2>WAIT</h2><div class='muted'>Insufficient data</div></div>", unsafe_allow_html=True)
+        tf_cards.append(f"<div class='card'><div class='kicker'>{tf}</div><h2>WAIT</h2><div class='muted'>Insufficient data</div></div>")
+st.markdown("<div class='tf-grid'>" + "".join(tf_cards) + "</div>", unsafe_allow_html=True)
 
 signal_class = "buy" if analysis["signal"] == "BUY" else "sell" if analysis["signal"] == "SELL" else ""
 st.markdown(
@@ -969,14 +1007,15 @@ if analysis["signal"] in {"BUY", "SELL"} and m5_snap:
 
 if plan:
     st.subheader("Trade Plan")
-    pc = st.columns(7)
-    pc[0].metric("Side", plan["side"])
-    pc[1].metric("Qty", fmt(plan["qty"], 6))
-    pc[2].metric("Entry", fmt(plan["entry_reference"], 4))
-    pc[3].metric("SL", fmt(plan["stop_loss"], 4))
-    pc[4].metric("TP1", fmt(plan["take_profit_1"], 4))
-    pc[5].metric("TP2", fmt(plan["take_profit_2"], 4))
-    pc[6].metric("Est. Risk", fmt(plan["estimated_risk"], 2))
+    mini_grid([
+        ("Side", plan["side"], "ok"),
+        ("Qty", fmt(plan["qty"], 6), ""),
+        ("Entry", fmt(plan["entry_reference"], 4), ""),
+        ("SL", fmt(plan["stop_loss"], 4), "bad"),
+        ("TP1", fmt(plan["take_profit_1"], 4), "ok"),
+        ("TP2", fmt(plan["take_profit_2"], 4), "ok"),
+        ("Est. Risk", "$" + fmt(plan["estimated_risk"], 2), "wait"),
+    ], "plan-grid")
 
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
@@ -990,13 +1029,18 @@ if mode == "Paper":
             float(st.session_state.paper_balance), day_pnl, p_open, plan,
             float(max_daily_loss_pct), int(max_open_positions), float(max_order_risk_pct), True,
         )
-
-    pc = st.columns(5)
-    pc[0].metric("Paper Balance", f"${st.session_state.paper_balance:,.2f}")
-    pc[1].metric("Day P&L", f"${day_pnl:,.2f}")
-    pc[2].metric("Trades Today", st.session_state.paper_trades_today)
-    pc[3].metric("Open Position", "YES" if st.session_state.paper_position else "NO")
-    pc[4].metric("Risk Gate", "PASS" if p_gate_ok else "BLOCK")
+        if quality.get("age_min", 9999) > 30:
+            p_gate_ok = False
+            p_gate_reasons.append("بيانات السوق أقدم من 30 دقيقة")
+    gate_label = "WAIT SIGNAL" if not plan else ("PASS" if p_gate_ok else "BLOCK")
+    gate_state = "wait" if not plan else ("ok" if p_gate_ok else "bad")
+    mini_grid([
+        ("Paper Balance", f"${st.session_state.paper_balance:,.2f}", ""),
+        ("Day P&L", f"${day_pnl:,.2f}", "ok" if day_pnl >= 0 else "bad"),
+        ("Trades Today", str(st.session_state.paper_trades_today), ""),
+        ("Open Position", "YES" if st.session_state.paper_position else "NO", "wait" if st.session_state.paper_position else ""),
+        ("Risk Gate", gate_label, gate_state),
+    ], "paper-grid")
 
     st.session_state.auto_paper = st.toggle("Auto Paper", value=st.session_state.auto_paper, help="ينفذ Paper فقط عند وجود إشارة وخطة واجتياز المخاطر")
 
@@ -1062,6 +1106,12 @@ if mode == "Live":
         if not live_unlocked:
             live_gate_ok = False
             live_reasons.append("Live غير مفتوح من Secrets")
+        if not quote.get("connected"):
+            live_gate_ok = False
+            live_reasons.append("Quote المباشر غير متصل")
+        if quality.get("age_min", 9999) > 15:
+            live_gate_ok = False
+            live_reasons.append("بيانات السوق أقدم من 15 دقيقة")
 
         if live_reasons:
             for reason in dict.fromkeys(live_reasons):
@@ -1133,13 +1183,14 @@ if st.session_state.backtest:
     bt = st.session_state.backtest
     stats = bt["stats"]
     if stats.get("trades", 0):
-        bc = st.columns(6)
-        bc[0].metric("Trades", stats["trades"])
-        bc[1].metric("Win Rate", f"{stats['win_rate']:.1f}%")
-        bc[2].metric("Profit Factor", "∞" if not math.isfinite(stats["profit_factor"]) else f"{stats['profit_factor']:.2f}")
-        bc[3].metric("Net P&L", f"${stats['net_pnl']:,.2f}")
-        bc[4].metric("Max DD", f"${stats['max_dd']:,.2f}")
-        bc[5].metric("Ending Equity", f"${stats['ending_equity']:,.2f}")
+        mini_grid([
+            ("Trades", str(stats["trades"]), ""),
+            ("Win Rate", f"{stats['win_rate']:.1f}%", ""),
+            ("Profit Factor", "∞" if not math.isfinite(stats["profit_factor"]) else f"{stats['profit_factor']:.2f}", ""),
+            ("Net P&L", f"${stats['net_pnl']:,.2f}", "ok" if stats["net_pnl"] >= 0 else "bad"),
+            ("Max DD", f"${stats['max_dd']:,.2f}", "wait"),
+            ("Ending Equity", f"${stats['ending_equity']:,.2f}", ""),
+        ], "bt-grid")
         st.dataframe(bt["trades"].tail(100), hide_index=True, use_container_width=True)
     else:
         st.info(stats.get("warning", "لا توجد نتائج"))
@@ -1152,7 +1203,7 @@ health_rows = [
     {"Component": "Quote", "Status": "ONLINE" if quote.get("connected") else "CHECK"},
     {"Component": "Data quality", "Status": "ONLINE" if quality["ok"] else "CHECK"},
     {"Component": "Paper engine", "Status": "ONLINE"},
-    {"Component": "Broker bridge", "Status": "ONLINE" if account else "BLOCKED"},
+    {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
 ]
@@ -1165,7 +1216,7 @@ with st.expander("Decision Log", expanded=False):
     else:
         st.info("لا يوجد سجل بعد")
 
-st.info("إعدادات Live مقفولة افتراضيًا. أي تنفيذ حقيقي يحتاج Broker Bridge فعلي وحالة حساب موثقة وفتح LIVE_TRADING_ENABLED في Secrets.")
+st.info("Live مقفول افتراضيًا. للتنفيذ الحقيقي يلزم Broker Bridge فعلي، Quote حديث، حالة حساب موثقة، وفتح LIVE_TRADING_ENABLED في Secrets.")
 
 if st.session_state.auto_refresh:
     time.sleep(refresh_seconds)
