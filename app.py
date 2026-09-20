@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import altair as alt
 
 # ============================================================
 # GOLD AI v3.0 — X10 Build
@@ -24,7 +25,7 @@ import streamlit as st
 # Gold • Stocks • Futures/Contracts • Paper • Optional live bridge
 # ============================================================
 
-VERSION = "3.1.0-x10"
+VERSION = "3.2.0-x10"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -67,6 +68,9 @@ html,body,[class*="css"]{font-family:Inter,system-ui,-apple-system,BlinkMacSyste
 .mini .v{font-size:clamp(1.05rem,2vw,1.55rem);font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .state-ok{color:var(--green)}.state-bad{color:var(--red)}.state-wait{color:var(--amber)}
 div[data-testid="stMetric"]{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px}
+.chart-wrap{border:1px solid var(--line);border-radius:16px;padding:8px;background:var(--panel);margin:10px 0 18px}
+.gate-row{display:grid;grid-template-columns:1.4fr .8fr;gap:8px;padding:9px 0;border-bottom:1px solid rgba(143,162,186,.14)}
+.gate-row:last-child{border-bottom:none}
 @media (max-width: 900px){
   .block-container{padding:.65rem .65rem 5rem}
   .hero{padding:16px;border-radius:18px}
@@ -175,6 +179,7 @@ def init_state() -> None:
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
         "backtest": None,
+        "last_alert_candle": {},
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -952,6 +957,13 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
     })
     st.session_state.decisions = st.session_state.decisions[:500]
 
+    # In-app signal alert once per closed candle. No browser permission is required.
+    if analysis["signal"] in {"BUY", "SELL"}:
+        alert_key = f"{instrument.symbol}:{candle_id}:{analysis['signal']}"
+        if st.session_state.last_alert_candle.get(instrument.symbol) != alert_key:
+            st.session_state.last_alert_candle[instrument.symbol] = alert_key
+            st.toast(f"{instrument.symbol} • {analysis['signal']} • قوة {analysis['strength']}%", icon="⚡")
+
 fresh_state = "ok" if quality.get("age_min", 9999) <= 15 else "wait"
 mini_grid([
     ("السعر", fmt(reference_price, 4), ""),
@@ -988,8 +1000,47 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-chart = raw.tail(400).set_index("datetime")[["close"]]
-st.line_chart(chart, use_container_width=True)
+# Price chart with a local Y-domain so mobile does not stretch the axis toward zero.
+chart_df = raw.tail(288)[["datetime", "close"]].copy()
+chart_min = float(chart_df["close"].min())
+chart_max = float(chart_df["close"].max())
+chart_span = max(chart_max - chart_min, max(abs(reference_price) * 0.001, 1e-6))
+chart_pad = chart_span * 0.14
+price_chart = (
+    alt.Chart(chart_df)
+    .mark_line(strokeWidth=2)
+    .encode(
+        x=alt.X("datetime:T", title=None, axis=alt.Axis(labelOverlap=True, grid=False)),
+        y=alt.Y(
+            "close:Q",
+            title=None,
+            scale=alt.Scale(zero=False, domain=[chart_min - chart_pad, chart_max + chart_pad]),
+            axis=alt.Axis(format=",.2f"),
+        ),
+    )
+    .properties(height=285)
+)
+st.markdown("<div class='chart-wrap'>", unsafe_allow_html=True)
+st.altair_chart(price_chart, use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+# Explain exactly why the engine is waiting / buying / selling.
+m5_diag = analysis.get("snapshots", {}).get("M5") or {}
+trends_diag = [((analysis.get("snapshots", {}).get(tf) or {}).get("trend")) for tf in TIMEFRAMES]
+up_count = sum(t == "UP" for t in trends_diag)
+down_count = sum(t == "DOWN" for t in trends_diag)
+b2_diag = analysis.get("b2") or {}
+diag_rows = [
+    ("اتجاه الأطر", f"UP {up_count}/4 • DOWN {down_count}/4", up_count >= 3 or down_count >= 3),
+    ("RSI M5", f"{m5_diag.get('rsi', 0):.1f}" if m5_diag else "—", bool(m5_diag) and (m5_diag.get("rsi", 50) >= 52 or m5_diag.get("rsi", 50) <= 48)),
+    ("زخم MACD", "متوافق" if m5_diag and ((m5_diag.get("momentum",0)>0 and m5_diag.get("macd_hist",0)>0) or (m5_diag.get("momentum",0)<0 and m5_diag.get("macd_hist",0)<0)) else "غير مكتمل", bool(m5_diag) and ((m5_diag.get("momentum",0)>0 and m5_diag.get("macd_hist",0)>0) or (m5_diag.get("momentum",0)<0 and m5_diag.get("macd_hist",0)<0))),
+    ("ADX M5", f"{m5_diag.get('adx', 0):.1f}" if m5_diag else "—", bool(m5_diag) and m5_diag.get("adx",0) >= 20),
+    ("B2 Break/Retest", b2_diag.get("side") or ("Breakout فقط" if b2_diag.get("breakout") else "بانتظار التأكيد"), bool(b2_diag.get("valid"))),
+    ("حداثة البيانات", f"{quality.get('age_min',0):.0f} دقيقة", quality.get("age_min",9999) <= 15),
+]
+with st.expander("لماذا هذا القرار؟", expanded=False):
+    for label, value, passed in diag_rows:
+        st.markdown(f"<div class='gate-row'><div>{label}</div><div class='{'state-ok' if passed else 'state-wait'}'>{'✓' if passed else '•'} {value}</div></div>", unsafe_allow_html=True)
 
 # Prepare plan for BUY/SELL.
 plan: dict[str, Any] | None = None
@@ -1070,7 +1121,15 @@ if mode == "Paper":
             st.rerun()
 
     if st.session_state.paper_history:
-        st.dataframe(pd.DataFrame(st.session_state.paper_history), hide_index=True, use_container_width=True)
+        paper_df = pd.DataFrame(st.session_state.paper_history)
+        st.dataframe(paper_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "تنزيل سجل Paper CSV",
+            data=paper_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"gold_ai_paper_{now_riyadh().date().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 # ---------------------------- Live ----------------------------
 if mode == "Live":
@@ -1212,7 +1271,15 @@ st.caption(f"{quality['label']} • Last closed M5: {raw['datetime'].iloc[-1]} U
 
 with st.expander("Decision Log", expanded=False):
     if st.session_state.decisions:
-        st.dataframe(pd.DataFrame(st.session_state.decisions), hide_index=True, use_container_width=True)
+        decisions_df = pd.DataFrame(st.session_state.decisions)
+        st.dataframe(decisions_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "تنزيل سجل القرارات CSV",
+            data=decisions_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"gold_ai_decisions_{now_riyadh().date().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
         st.info("لا يوجد سجل بعد")
 
