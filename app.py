@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.1.0-x10-final"
+VERSION = "4.2.0-x10-longhistory"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -338,6 +338,130 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
             "spread": None,
         }
     return {**base, "connected": False, "error": str(payload.get("message") or "No quote")}
+
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_long_history(
+    symbol: str,
+    history_days: int = 180,
+    chunk_days: int = 16,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Fetch long M5 history using date windows small enough to stay below
+    Twelve Data's 5,000-point limit per request.
+
+    The function is cached for 6 hours so the audit does not repeatedly spend
+    API credits. It also reads api-credits-left response headers and waits for
+    the next minute only when the current quota is nearly exhausted.
+    """
+    key = secret("TWELVE_DATA_API_KEY")
+    if not key:
+        raise RuntimeError("TWELVE_DATA_API_KEY missing")
+
+    end_ts = now_utc().floor("5min")
+    start_ts = end_ts - pd.Timedelta(days=int(history_days))
+    cursor = start_ts
+
+    frames: list[pd.DataFrame] = []
+    request_count = 0
+    waits = 0
+    credit_samples: list[int] = []
+    errors: list[str] = []
+
+    while cursor < end_ts:
+        chunk_end = min(cursor + pd.Timedelta(days=int(chunk_days)), end_ts)
+
+        params = {
+            "symbol": symbol,
+            "interval": "5min",
+            "timezone": "UTC",
+            "order": "asc",
+            "start_date": cursor.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+            "apikey": key,
+        }
+
+        def _request_once() -> tuple[pd.DataFrame, int | None]:
+            nonlocal request_count
+            response = requests.get(DATA_URL, params=params, timeout=30)
+            request_count += 1
+
+            left_raw = response.headers.get("api-credits-left")
+            left = None
+            if left_raw is not None:
+                try:
+                    left = int(float(left_raw))
+                except Exception:
+                    left = None
+
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Historical API returned non-JSON HTTP {response.status_code}"
+                ) from exc
+
+            if response.status_code >= 400 or "values" not in payload:
+                message = str(payload.get("message") or payload)
+                raise RuntimeError(f"Historical API HTTP {response.status_code}: {message}")
+
+            frame = normalize_ohlcv(payload["values"])
+            return frame, left
+
+        try:
+            frame, credits_left = _request_once()
+        except RuntimeError as exc:
+            msg = str(exc)
+            rate_limited = (
+                "429" in msg
+                or "credit" in msg.lower()
+                or "limit" in msg.lower()
+            )
+            if rate_limited:
+                wait_seconds = max(3, 62 - int(now_utc().second))
+                time.sleep(wait_seconds)
+                waits += 1
+                frame, credits_left = _request_once()
+            else:
+                raise
+
+        if credits_left is not None:
+            credit_samples.append(credits_left)
+
+        if not frame.empty:
+            frames.append(frame)
+
+        # Basic plans can be as low as 8 API credits/min. If the provider tells
+        # us the remaining credits are nearly exhausted, wait for the minute reset.
+        if credits_left is not None and credits_left <= 1 and chunk_end < end_ts:
+            wait_seconds = max(3, 62 - int(now_utc().second))
+            time.sleep(wait_seconds)
+            waits += 1
+
+        cursor = chunk_end
+
+    if not frames:
+        raise RuntimeError("لم يتم جلب أي بيانات تاريخية صالحة")
+
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates("datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    combined = closed_m5(combined)
+
+    meta = {
+        "requested_days": int(history_days),
+        "bars": int(len(combined)),
+        "requests": int(request_count),
+        "quota_waits": int(waits),
+        "first_bar": combined["datetime"].iloc[0].isoformat() if len(combined) else None,
+        "last_bar": combined["datetime"].iloc[-1].isoformat() if len(combined) else None,
+        "min_credits_left_seen": min(credit_samples) if credit_samples else None,
+    }
+    return combined, meta
 
 
 def data_quality(frame: pd.DataFrame) -> dict[str, Any]:
@@ -1319,6 +1443,8 @@ def _research_gate(
     capped_stats: dict[str, Any],
     cost_scenarios: pd.DataFrame,
     context: str,
+    history_days: int,
+    history_bars: int,
 ) -> dict[str, Any]:
     """
     Conservative research gate. Passing it is NOT a promise of profitability.
@@ -1336,6 +1462,16 @@ def _research_gate(
             row10 = matches.iloc[0].to_dict()
 
     rules = [
+        {
+            "name": "التاريخ المطلوب ≥ 180 يوم",
+            "pass": int(history_days) >= 180,
+            "value": int(history_days),
+        },
+        {
+            "name": "شموع M5 التاريخية ≥ 20,000",
+            "pass": int(history_bars) >= 20_000,
+            "value": int(history_bars),
+        },
         {
             "name": "إجمالي الصفقات ≥ 40",
             "pass": int(capped_stats.get("trades", 0)) >= 40,
@@ -1977,7 +2113,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD FINAL • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
+    "X10 GOLD FINAL LONG-HISTORY • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -2058,10 +2194,23 @@ mini_grid(
     "status-grid",
 )
 
-if st.button("تحديث البيانات الآن", use_container_width=True):
-    fetch_market.clear()
-    fetch_quote.clear()
-    st.rerun()
+c_refresh1, c_refresh2 = st.columns(2)
+with c_refresh1:
+    if st.button("تحديث البيانات الآن", use_container_width=True):
+        fetch_market.clear()
+        fetch_quote.clear()
+        st.rerun()
+with c_refresh2:
+    if st.button("مسح كاش التاريخ", use_container_width=True):
+        fetch_long_history.clear()
+        st.session_state.backtest = None
+        st.session_state.research_gate = {
+            "passed": False,
+            "context": None,
+            "rules": [],
+            "reasons": ["تم مسح كاش التاريخ؛ أعد Final Research Audit"],
+        }
+        st.rerun()
 
 if not feed.get("trusted", False):
     st.error("فحص بنية بيانات السوق لم ينجح. تم حجب أي إشارة تنفيذية.")
@@ -2542,92 +2691,138 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Final Research Audit — X10")
+st.subheader("Final Research Audit — Long History X10")
 st.caption(
-    "يفصل بين نتيجتين: Broker-Capped sizing الفعلي، وFixed-Risk Normalized لإزالة أثر max_qty. "
-    "كما يختبر OUT 30% وتكاليف 2/5/10 bps. اجتياز Research Gate ليس ضمانًا للربحية؛ "
-    "هو فقط حد أمان قبل السماح للـLive."
+    "الاختبار النهائي لا يعتمد على آخر 5,000 شمعة فقط. يجلب تاريخ M5 طويل على دفعات، "
+    "ثم يفصل Broker-Capped عن Fixed-Risk Normalized ويختبر OUT 30% وتكاليف 2/5/10 bps. "
+    "Twelve Data يحد كل طلب إلى 5,000 نقطة، لذلك نقسم التاريخ تلقائيًا إلى نوافذ صغيرة."
 )
 
-if st.button("تشغيل Final Research Audit", use_container_width=True):
-    with st.spinner("تشغيل Broker-Capped + Fixed-Risk Normalized + Cost Stress..."):
+history_days = st.selectbox(
+    "فترة التاريخ للاختبار",
+    options=[90, 180, 365],
+    index=1,
+    format_func=lambda d: f"{d} يوم" if d != 365 else "365 يوم (سنة)",
+)
+estimated_requests = math.ceil(int(history_days) / 16)
+st.caption(
+    f"متوقع تقريبًا {estimated_requests} طلب تاريخي. على الخطة المجانية قد ينتظر التطبيق "
+    "إعادة ضبط الرصيد للدقيقة تلقائيًا إذا لزم."
+)
+
+if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_container_width=True):
+    with st.spinner("جلب التاريخ الطويل ثم تشغيل الاختبارات... قد يستغرق بعض الوقت لأول مرة."):
+        try:
+            audit_raw, history_meta = fetch_long_history(
+                instrument.symbol,
+                history_days=int(history_days),
+                chunk_days=16,
+            )
+        except Exception as exc:
+            st.error(f"تعذر جلب التاريخ الطويل: {exc}")
+            audit_raw = pd.DataFrame()
+            history_meta = {}
+
         scenario_rows: list[dict[str, Any]] = []
         base_trades = pd.DataFrame()
         base_stats: dict[str, Any] = {}
 
-        for cost_bps in (2.0, 5.0, 10.0):
-            scenario_trades, scenario_stats = backtest_mtf(
-                raw,
-                instrument,
-                risk_pct=float(risk_pct),
-                cost_bps_roundtrip=cost_bps,
+        if not audit_raw.empty:
+            for cost_bps in (2.0, 5.0, 10.0):
+                scenario_trades, scenario_stats = backtest_mtf(
+                    audit_raw,
+                    instrument,
+                    risk_pct=float(risk_pct),
+                    cost_bps_roundtrip=cost_bps,
+                )
+                if cost_bps == 2.0:
+                    base_trades = scenario_trades
+                    base_stats = scenario_stats
+
+                if scenario_stats.get("trades", 0):
+                    scenario_rows.append(
+                        {
+                            "Round-trip cost (bps)": cost_bps,
+                            "Trades": scenario_stats["trades"],
+                            "Win Rate %": round(scenario_stats["win_rate"], 1),
+                            "Profit Factor": (
+                                math.inf
+                                if not math.isfinite(scenario_stats["profit_factor"])
+                                else round(scenario_stats["profit_factor"], 2)
+                            ),
+                            "Net P&L": round(scenario_stats["net_pnl"], 2),
+                            "Max DD %": round(scenario_stats["max_dd_pct"], 2),
+                            "Avg Net R": round(scenario_stats["avg_r_net"], 3),
+                            "Risk-Weighted Exp R": round(scenario_stats["risk_weighted_expectancy_r"], 3),
+                            "Avg Risk $": round(scenario_stats["avg_risk_money"], 2),
+                            "Max Qty Hit %": round(scenario_stats["max_qty_hit_pct"], 1),
+                            "Normalized PF": (
+                                math.inf
+                                if not math.isfinite(scenario_stats["normalized"]["profit_factor"])
+                                else round(scenario_stats["normalized"]["profit_factor"], 2)
+                            ),
+                            "Normalized Net P&L": round(scenario_stats["normalized"]["net_pnl"], 2),
+                            "Normalized Avg R": round(scenario_stats["normalized"]["avg_r_net"], 3),
+                            "Normalized Max DD %": round(scenario_stats["normalized"]["max_dd_pct"], 2),
+                        }
+                    )
+                else:
+                    scenario_rows.append(
+                        {
+                            "Round-trip cost (bps)": cost_bps,
+                            "Trades": 0,
+                            "Win Rate %": 0.0,
+                            "Profit Factor": 0.0,
+                            "Net P&L": 0.0,
+                            "Max DD %": 0.0,
+                            "Avg Net R": 0.0,
+                            "Risk-Weighted Exp R": 0.0,
+                            "Avg Risk $": 0.0,
+                            "Max Qty Hit %": 0.0,
+                            "Normalized PF": 0.0,
+                            "Normalized Net P&L": 0.0,
+                            "Normalized Avg R": 0.0,
+                            "Normalized Max DD %": 0.0,
+                        }
+                    )
+
+            cost_df = pd.DataFrame(scenario_rows)
+            gate = _research_gate(
+                base_stats,
+                cost_df,
+                research_context,
+                history_days=int(history_meta.get("requested_days", history_days)),
+                history_bars=int(history_meta.get("bars", len(audit_raw))),
             )
-            if cost_bps == 2.0:
-                base_trades = scenario_trades
-                base_stats = scenario_stats
-
-            if scenario_stats.get("trades", 0):
-                scenario_rows.append(
-                    {
-                        "Round-trip cost (bps)": cost_bps,
-                        "Trades": scenario_stats["trades"],
-                        "Win Rate %": round(scenario_stats["win_rate"], 1),
-                        "Profit Factor": (
-                            math.inf
-                            if not math.isfinite(scenario_stats["profit_factor"])
-                            else round(scenario_stats["profit_factor"], 2)
-                        ),
-                        "Net P&L": round(scenario_stats["net_pnl"], 2),
-                        "Max DD %": round(scenario_stats["max_dd_pct"], 2),
-                        "Avg Net R": round(scenario_stats["avg_r_net"], 3),
-                        "Risk-Weighted Exp R": round(scenario_stats["risk_weighted_expectancy_r"], 3),
-                        "Avg Risk $": round(scenario_stats["avg_risk_money"], 2),
-                        "Max Qty Hit %": round(scenario_stats["max_qty_hit_pct"], 1),
-                        "Normalized PF": (
-                            math.inf
-                            if not math.isfinite(scenario_stats["normalized"]["profit_factor"])
-                            else round(scenario_stats["normalized"]["profit_factor"], 2)
-                        ),
-                        "Normalized Net P&L": round(scenario_stats["normalized"]["net_pnl"], 2),
-                        "Normalized Avg R": round(scenario_stats["normalized"]["avg_r_net"], 3),
-                        "Normalized Max DD %": round(scenario_stats["normalized"]["max_dd_pct"], 2),
-                    }
-                )
-            else:
-                scenario_rows.append(
-                    {
-                        "Round-trip cost (bps)": cost_bps,
-                        "Trades": 0,
-                        "Win Rate %": 0.0,
-                        "Profit Factor": 0.0,
-                        "Net P&L": 0.0,
-                        "Max DD %": 0.0,
-                        "Avg Net R": 0.0,
-                        "Risk-Weighted Exp R": 0.0,
-                        "Avg Risk $": 0.0,
-                        "Max Qty Hit %": 0.0,
-                        "Normalized PF": 0.0,
-                        "Normalized Net P&L": 0.0,
-                        "Normalized Avg R": 0.0,
-                        "Normalized Max DD %": 0.0,
-                    }
-                )
-
-        cost_df = pd.DataFrame(scenario_rows)
-        gate = _research_gate(base_stats, cost_df, research_context)
-        st.session_state.backtest = {
-            "trades": base_trades,
-            "stats": base_stats,
-            "cost_scenarios": cost_df,
-            "research_gate": gate,
-        }
-        st.session_state.research_gate = gate
-
+            st.session_state.backtest = {
+                "trades": base_trades,
+                "stats": base_stats,
+                "cost_scenarios": cost_df,
+                "research_gate": gate,
+                "history_meta": history_meta,
+            }
+            st.session_state.research_gate = gate
 if st.session_state.backtest:
     bt = st.session_state.backtest
     stats = bt["stats"]
 
     if stats.get("trades", 0):
+        hmeta = bt.get("history_meta", {})
+        st.markdown("### Historical Coverage")
+        mini_grid(
+            [
+                ("Requested", f"{hmeta.get('requested_days', 0)} days", ""),
+                ("M5 Bars", f"{int(hmeta.get('bars', 0)):,}", "ok" if int(hmeta.get("bars", 0)) >= 20_000 else "wait"),
+                ("API Requests", str(hmeta.get("requests", 0)), ""),
+                ("Quota Waits", str(hmeta.get("quota_waits", 0)), ""),
+            ],
+            "tf-grid",
+        )
+        if hmeta.get("first_bar") and hmeta.get("last_bar"):
+            st.caption(
+                f"History: {hmeta['first_bar']} → {hmeta['last_bar']}"
+            )
+
         mini_grid(
             [
                 ("Trades", str(stats["trades"]), ""),
