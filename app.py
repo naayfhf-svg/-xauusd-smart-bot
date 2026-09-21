@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.4.0-x10-optimized"
+VERSION = "4.5.0-x10-independent"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -202,6 +202,7 @@ def init_state() -> None:
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
         "backtest": None,
+        "independent_validation": None,
         "research_gate": {
             "passed": False,
             "context": None,
@@ -460,6 +461,144 @@ def fetch_long_history(
         "first_bar": combined["datetime"].iloc[0].isoformat() if len(combined) else None,
         "last_bar": combined["datetime"].iloc[-1].isoformat() if len(combined) else None,
         "min_credits_left_seen": min(credit_samples) if credit_samples else None,
+    }
+    return combined, meta
+
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_history_window(
+    symbol: str,
+    start_ts: str,
+    end_ts: str,
+    chunk_days: int = 17,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Fetch an explicit historical M5 window.
+
+    Used only for independent validation so the candidate strategy is tested
+    on data that predates the development window. The requested start/end are
+    frozen before the test begins and are not optimized after seeing results.
+    """
+    key = secret("TWELVE_DATA_API_KEY")
+    if not key:
+        raise RuntimeError("TWELVE_DATA_API_KEY missing")
+
+    start = pd.Timestamp(start_ts)
+    end = pd.Timestamp(end_ts)
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    else:
+        start = start.tz_convert("UTC")
+    if end.tzinfo is None:
+        end = end.tz_localize("UTC")
+    else:
+        end = end.tz_convert("UTC")
+
+    if start >= end:
+        raise RuntimeError("Independent validation window is invalid")
+
+    cursor = start
+    frames: list[pd.DataFrame] = []
+    request_count = 0
+    waits = 0
+    credit_samples: list[int] = []
+
+    while cursor < end:
+        chunk_end = min(cursor + pd.Timedelta(days=int(chunk_days)), end)
+
+        params = {
+            "symbol": symbol,
+            "interval": "5min",
+            "timezone": "UTC",
+            "order": "asc",
+            "start_date": cursor.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+            "apikey": key,
+        }
+
+        def _request_once() -> tuple[pd.DataFrame, int | None]:
+            nonlocal request_count
+            response = requests.get(DATA_URL, params=params, timeout=30)
+            request_count += 1
+
+            left_raw = response.headers.get("api-credits-left")
+            left = None
+            if left_raw is not None:
+                try:
+                    left = int(float(left_raw))
+                except Exception:
+                    left = None
+
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Historical API returned non-JSON HTTP {response.status_code}"
+                ) from exc
+
+            if response.status_code >= 400 or "values" not in payload:
+                message = str(payload.get("message") or payload)
+                raise RuntimeError(
+                    f"Historical API HTTP {response.status_code}: {message}"
+                )
+
+            return normalize_ohlcv(payload["values"]), left
+
+        try:
+            frame, credits_left = _request_once()
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "429" in msg or "credit" in msg or "limit" in msg:
+                wait_seconds = max(3, 62 - int(now_utc().second))
+                time.sleep(wait_seconds)
+                waits += 1
+                frame, credits_left = _request_once()
+            else:
+                raise
+
+        if credits_left is not None:
+            credit_samples.append(credits_left)
+
+        if not frame.empty:
+            frames.append(frame)
+
+        if credits_left is not None and credits_left <= 1 and chunk_end < end:
+            wait_seconds = max(3, 62 - int(now_utc().second))
+            time.sleep(wait_seconds)
+            waits += 1
+
+        cursor = chunk_end
+
+    if not frames:
+        raise RuntimeError("لم يتم جلب بيانات لفترة Independent Validation")
+
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates("datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    combined = closed_m5(combined)
+
+    requested_days = max(
+        1,
+        int(round((end - start).total_seconds() / 86400.0)),
+    )
+
+    meta = {
+        "requested_days": requested_days,
+        "bars": int(len(combined)),
+        "requests": int(request_count),
+        "quota_waits": int(waits),
+        "requested_start": start.isoformat(),
+        "requested_end": end.isoformat(),
+        "first_bar": combined["datetime"].iloc[0].isoformat()
+        if len(combined) else None,
+        "last_bar": combined["datetime"].iloc[-1].isoformat()
+        if len(combined) else None,
+        "min_credits_left_seen": min(credit_samples)
+        if credit_samples else None,
     }
     return combined, meta
 
@@ -2235,6 +2374,163 @@ def _research_robustness(trades: pd.DataFrame) -> dict[str, Any]:
     return {"quarters": quarter_rows, "bootstrap_low": float(low), "bootstrap_high": float(high), "cost_break_even_bps": float(break_even)}
 
 
+
+FROZEN_VALIDATION_VARIANT = "SELL_SESSION"
+FROZEN_VALIDATION_LABEL = "SELL only + UTC 06:00–20:00"
+
+
+def _independent_validation_gate(
+    stats_2bps: dict[str, Any],
+    cost_df: pd.DataFrame,
+    robustness: dict[str, Any],
+    history_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Gate for a truly older, untouched validation window.
+
+    This gate is intentionally NOT connected to Live. Passing it means the
+    frozen candidate deserves forward Paper validation; it is not a promise
+    of profitability and does not unlock execution.
+    """
+    norm = stats_2bps.get("normalized", {})
+
+    cost5 = {}
+    cost10 = {}
+    if isinstance(cost_df, pd.DataFrame) and not cost_df.empty:
+        m5 = cost_df[
+            pd.to_numeric(
+                cost_df["Round-trip cost (bps)"],
+                errors="coerce",
+            ).eq(5.0)
+        ]
+        m10 = cost_df[
+            pd.to_numeric(
+                cost_df["Round-trip cost (bps)"],
+                errors="coerce",
+            ).eq(10.0)
+        ]
+        if not m5.empty:
+            cost5 = m5.iloc[0].to_dict()
+        if not m10.empty:
+            cost10 = m10.iloc[0].to_dict()
+
+    quarters = robustness.get("quarters", []) or []
+    profitable_quarters = sum(
+        1
+        for q in quarters
+        if float(q.get("Avg R", 0.0)) > 0.0
+    )
+
+    rules = [
+        {
+            "name": "نافذة مستقلة ≥ 170 يوم",
+            "pass": int(history_meta.get("requested_days", 0)) >= 170,
+            "value": int(history_meta.get("requested_days", 0)),
+        },
+        {
+            "name": "شموع M5 مستقلة ≥ 20,000",
+            "pass": int(history_meta.get("bars", 0)) >= 20_000,
+            "value": int(history_meta.get("bars", 0)),
+        },
+        {
+            "name": "Independent trades ≥ 30",
+            "pass": int(stats_2bps.get("trades", 0)) >= 30,
+            "value": int(stats_2bps.get("trades", 0)),
+        },
+        {
+            "name": "2 bps Normalized PF ≥ 1.20",
+            "pass": float(norm.get("profit_factor", 0.0)) >= 1.20,
+            "value": float(norm.get("profit_factor", 0.0)),
+        },
+        {
+            "name": "2 bps Normalized Avg R ≥ +0.05R",
+            "pass": float(norm.get("avg_r_net", 0.0)) >= 0.05,
+            "value": float(norm.get("avg_r_net", 0.0)),
+        },
+        {
+            "name": "2 bps Normalized P&L > 0",
+            "pass": float(norm.get("net_pnl", 0.0)) > 0.0,
+            "value": float(norm.get("net_pnl", 0.0)),
+        },
+        {
+            "name": "5 bps Normalized PF ≥ 1.10",
+            "pass": bool(cost5)
+            and float(cost5.get("Normalized PF", 0.0)) >= 1.10,
+            "value": None
+            if not cost5
+            else float(cost5.get("Normalized PF", 0.0)),
+        },
+        {
+            "name": "5 bps Normalized P&L > 0",
+            "pass": bool(cost5)
+            and float(cost5.get("Normalized Net P&L", 0.0)) > 0.0,
+            "value": None
+            if not cost5
+            else float(cost5.get("Normalized Net P&L", 0.0)),
+        },
+        {
+            "name": "Normalized Max DD ≤ 5%",
+            "pass": float(norm.get("max_dd_pct", 999.0)) <= 5.0,
+            "value": float(norm.get("max_dd_pct", 999.0)),
+        },
+        {
+            "name": "Bootstrap 95% Low > 0R",
+            "pass": float(
+                robustness.get("bootstrap_low", -999.0)
+            ) > 0.0,
+            "value": float(
+                robustness.get("bootstrap_low", -999.0)
+            ),
+        },
+        {
+            "name": "ربحية زمنية ≥ 3 من 4 أرباع",
+            "pass": profitable_quarters >= 3,
+            "value": profitable_quarters,
+        },
+    ]
+
+    failed = [r["name"] for r in rules if not r["pass"]]
+    return {
+        "passed": not failed,
+        "rules": rules,
+        "reasons": failed,
+        "profitable_quarters": profitable_quarters,
+        "cost_10bps_pf": None
+        if not cost10
+        else cost10.get("Normalized PF"),
+        "cost_10bps_net": None
+        if not cost10
+        else cost10.get("Normalized Net P&L"),
+        "checked_at": now_riyadh().isoformat(),
+    }
+
+
+def _validation_cost_row(
+    cost_bps: float,
+    stats: dict[str, Any],
+) -> dict[str, Any]:
+    norm = stats.get("normalized", {})
+    return {
+        "Round-trip cost (bps)": float(cost_bps),
+        "Trades": int(stats.get("trades", 0)),
+        "Win Rate %": round(stats.get("win_rate", 0.0), 1),
+        "PF": (
+            math.inf
+            if not math.isfinite(stats.get("profit_factor", 0.0))
+            else round(stats.get("profit_factor", 0.0), 3)
+        ),
+        "Net P&L": round(stats.get("net_pnl", 0.0), 2),
+        "Normalized PF": (
+            math.inf
+            if not math.isfinite(norm.get("profit_factor", 0.0))
+            else round(norm.get("profit_factor", 0.0), 3)
+        ),
+        "Normalized Avg R": round(norm.get("avg_r_net", 0.0), 4),
+        "Normalized Net P&L": round(norm.get("net_pnl", 0.0), 2),
+        "Normalized DD %": round(norm.get("max_dd_pct", 0.0), 2),
+    }
+
+
 RESEARCH_VARIANTS = {
     "STRICT_BOTH": "Baseline BUY + SELL",
     "SELL_ONLY": "SELL only",
@@ -2506,7 +2802,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD RESEARCH v4.4 OPTIMIZED • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
+    "X10 GOLD v4.5 INDEPENDENT • Frozen SELL_SESSION validation • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3084,7 +3380,7 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Final Research Audit — v4.4 Optimized")
+st.subheader("Research Audit — v4.5 Independent Validation")
 st.caption(
     "نفس قواعد v4.3 بدون تخفيف للاستراتيجية. المؤشرات وMTF وB2 تُحسب مرة واحدة فقط، "
     "ثم يعاد استخدام نفس السياق لكل Cost Stress وResearch Variant، مع فحص ثبات إضافي."
@@ -3382,6 +3678,346 @@ if st.session_state.backtest:
     else:
         st.info(stats.get("warning", "لا توجد نتائج"))
 
+
+# ------------------- independent validation -------------------
+st.divider()
+st.subheader("Independent Validation — Frozen SELL_SESSION")
+st.caption(
+    "المرشح مجمّد: SELL فقط خلال UTC 06:00–20:00. "
+    "لا نعدّل RSI/ADX/SL/TP/الساعات بعد رؤية هذه النتائج. "
+    "الاختبار يستخدم 180 يومًا أقدم بالكامل من نافذة التطوير الحالية."
+)
+
+bt_dev = st.session_state.get("backtest")
+if not bt_dev or not bt_dev.get("history_meta"):
+    st.info(
+        "شغّل Research Audit لمدة 180 يوم أولًا حتى نثبت بداية نافذة التطوير."
+    )
+else:
+    dev_meta = bt_dev.get("history_meta", {})
+    dev_first = dev_meta.get("first_bar")
+
+    if not dev_first:
+        st.warning("تعذر تحديد بداية نافذة التطوير.")
+    else:
+        validation_end = pd.Timestamp(dev_first)
+        if validation_end.tzinfo is None:
+            validation_end = validation_end.tz_localize("UTC")
+        else:
+            validation_end = validation_end.tz_convert("UTC")
+
+        validation_start = validation_end - pd.Timedelta(days=180)
+
+        frozen_context = hashlib.sha256(
+            (
+                f"{instrument.symbol}|{FROZEN_VALIDATION_VARIANT}|"
+                f"{float(risk_pct):.6f}|"
+                f"{validation_start.isoformat()}|"
+                f"{validation_end.isoformat()}"
+            ).encode()
+        ).hexdigest()[:16]
+
+        mini_grid(
+            [
+                ("Frozen Variant", "SELL_SESSION", "ok"),
+                (
+                    "Window Start",
+                    validation_start.strftime("%Y-%m-%d"),
+                    "",
+                ),
+                (
+                    "Window End",
+                    validation_end.strftime("%Y-%m-%d"),
+                    "",
+                ),
+                ("Risk", f"{float(risk_pct):.2f}%", ""),
+            ],
+            "tf-grid",
+        )
+
+        st.caption(
+            f"Independent window: {validation_start.isoformat()} → "
+            f"{validation_end.isoformat()} • لا تتداخل مع Development 180d."
+        )
+
+        if st.button(
+            "تشغيل Independent Validation على 180 يوم الأقدم",
+            use_container_width=True,
+        ):
+            iv_t0 = time.perf_counter()
+
+            with st.status(
+                "تشغيل الاختبار المستقل المجمد...",
+                expanded=True,
+            ) as iv_status:
+                st.write("1/3 • جلب الفترة الأقدم غير المستخدمة")
+                try:
+                    iv_raw, iv_meta = fetch_history_window(
+                        instrument.symbol,
+                        validation_start.isoformat(),
+                        validation_end.isoformat(),
+                        chunk_days=17,
+                    )
+                except Exception as exc:
+                    st.error(f"تعذر جلب Independent Window: {exc}")
+                    iv_raw = pd.DataFrame()
+                    iv_meta = {}
+
+                if not iv_raw.empty:
+                    st.write("2/3 • تجهيز المؤشرات مرة واحدة")
+                    iv_prepared = prepare_research_context(iv_raw)
+
+                    if not iv_prepared.get("ok", False):
+                        st.error(
+                            iv_prepared.get(
+                                "warning",
+                                "تعذر تجهيز Independent Validation",
+                            )
+                        )
+                    else:
+                        st.write(
+                            "3/3 • Frozen SELL_SESSION + "
+                            "Cost Stress 2/5/10 bps"
+                        )
+
+                        iv_rows = []
+                        iv_trades_2 = pd.DataFrame()
+                        iv_stats_2: dict[str, Any] = {}
+
+                        for iv_cost in (2.0, 5.0, 10.0):
+                            iv_trades, iv_stats = (
+                                simulate_prepared_research(
+                                    iv_prepared,
+                                    instrument,
+                                    risk_pct=float(risk_pct),
+                                    cost_bps_roundtrip=iv_cost,
+                                    research_variant=FROZEN_VALIDATION_VARIANT,
+                                )
+                            )
+
+                            if iv_cost == 2.0:
+                                iv_trades_2 = iv_trades
+                                iv_stats_2 = iv_stats
+
+                            iv_rows.append(
+                                _validation_cost_row(
+                                    iv_cost,
+                                    iv_stats,
+                                )
+                            )
+
+                        iv_cost_df = pd.DataFrame(iv_rows)
+                        iv_robustness = _research_robustness(
+                            iv_trades_2
+                        )
+                        iv_gate = _independent_validation_gate(
+                            iv_stats_2,
+                            iv_cost_df,
+                            iv_robustness,
+                            iv_meta,
+                        )
+
+                        st.session_state.independent_validation = {
+                            "context": frozen_context,
+                            "variant": FROZEN_VALIDATION_VARIANT,
+                            "label": FROZEN_VALIDATION_LABEL,
+                            "window_start": validation_start.isoformat(),
+                            "window_end": validation_end.isoformat(),
+                            "history_meta": iv_meta,
+                            "trades": iv_trades_2,
+                            "stats": iv_stats_2,
+                            "cost_scenarios": iv_cost_df,
+                            "robustness": iv_robustness,
+                            "gate": iv_gate,
+                            "elapsed_seconds": float(
+                                time.perf_counter() - iv_t0
+                            ),
+                        }
+
+                        iv_status.update(
+                            label=(
+                                "Independent Validation اكتمل خلال "
+                                f"{time.perf_counter()-iv_t0:.1f} ثانية"
+                            ),
+                            state="complete",
+                            expanded=False,
+                        )
+
+        iv = st.session_state.get("independent_validation")
+        if iv:
+            if iv.get("context") != frozen_context:
+                st.warning(
+                    "نتيجة Independent Validation المحفوظة تخص إعدادات/فترة "
+                    "مختلفة. أعد الاختبار قبل الاعتماد عليها."
+                )
+            else:
+                iv_stats = iv.get("stats", {})
+                iv_norm = iv_stats.get("normalized", {})
+                iv_meta = iv.get("history_meta", {})
+                iv_gate = iv.get("gate", {})
+                iv_robust = iv.get("robustness", {})
+
+                st.markdown("### Independent Result — 2 bps")
+                mini_grid(
+                    [
+                        (
+                            "Trades",
+                            str(iv_stats.get("trades", 0)),
+                            "",
+                        ),
+                        (
+                            "Normalized PF",
+                            (
+                                "∞"
+                                if not math.isfinite(
+                                    iv_norm.get(
+                                        "profit_factor",
+                                        0.0,
+                                    )
+                                )
+                                else f"{iv_norm.get('profit_factor',0.0):.2f}"
+                            ),
+                            (
+                                "ok"
+                                if iv_norm.get(
+                                    "profit_factor",
+                                    0.0,
+                                ) >= 1.2
+                                else "bad"
+                            ),
+                        ),
+                        (
+                            "Normalized Avg R",
+                            f"{iv_norm.get('avg_r_net',0.0):.3f}R",
+                            (
+                                "ok"
+                                if iv_norm.get(
+                                    "avg_r_net",
+                                    0.0,
+                                ) > 0
+                                else "bad"
+                            ),
+                        ),
+                        (
+                            "Normalized Net",
+                            f"${iv_norm.get('net_pnl',0.0):,.2f}",
+                            (
+                                "ok"
+                                if iv_norm.get("net_pnl", 0.0) > 0
+                                else "bad"
+                            ),
+                        ),
+                        (
+                            "Normalized DD",
+                            f"{iv_norm.get('max_dd_pct',0.0):.2f}%",
+                            "wait",
+                        ),
+                        (
+                            "Elapsed",
+                            f"{iv.get('elapsed_seconds',0.0):.1f}s",
+                            "",
+                        ),
+                    ],
+                    "plan-grid",
+                )
+
+                st.caption(
+                    f"Coverage: {iv_meta.get('first_bar')} → "
+                    f"{iv_meta.get('last_bar')} • "
+                    f"{int(iv_meta.get('bars',0)):,} M5 bars • "
+                    f"{iv_meta.get('requests',0)} API requests"
+                )
+
+                st.markdown("### Independent Cost Stress")
+                st.dataframe(
+                    iv.get("cost_scenarios", pd.DataFrame()),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                st.markdown("### Independent Robustness")
+                mini_grid(
+                    [
+                        (
+                            "Bootstrap 95% Low",
+                            f"{iv_robust.get('bootstrap_low',0.0):.3f}R",
+                            (
+                                "ok"
+                                if iv_robust.get(
+                                    "bootstrap_low",
+                                    0.0,
+                                ) > 0
+                                else "bad"
+                            ),
+                        ),
+                        (
+                            "Bootstrap 95% High",
+                            f"{iv_robust.get('bootstrap_high',0.0):.3f}R",
+                            "",
+                        ),
+                        (
+                            "Cost Break-even",
+                            f"{iv_robust.get('cost_break_even_bps',0.0):.2f} bps RT",
+                            "wait",
+                        ),
+                    ],
+                    "tf-grid",
+                )
+
+                iv_quarters = pd.DataFrame(
+                    iv_robust.get("quarters", [])
+                )
+                if not iv_quarters.empty:
+                    st.dataframe(
+                        iv_quarters,
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                st.markdown("### Independent Validation Gate")
+                iv_pass = bool(iv_gate.get("passed"))
+                mini_grid(
+                    [
+                        (
+                            "Independent Gate",
+                            (
+                                "PASS → PAPER FORWARD"
+                                if iv_pass
+                                else "FAIL / MORE RESEARCH"
+                            ),
+                            "ok" if iv_pass else "bad",
+                        )
+                    ],
+                    "tf-grid",
+                )
+
+                for rule in iv_gate.get("rules", []):
+                    icon = "✅" if rule.get("pass") else "❌"
+                    st.write(
+                        f"{icon} {rule.get('name')} — "
+                        f"{rule.get('value')}"
+                    )
+
+                st.caption(
+                    "10 bps يبقى Stress Test إضافي: "
+                    f"PF={iv_gate.get('cost_10bps_pf')} • "
+                    f"Net={iv_gate.get('cost_10bps_net')}"
+                )
+
+                if iv_pass:
+                    st.success(
+                        "المرشح اجتاز نافذة مستقلة أقدم. "
+                        "الخطوة التالية Paper Forward فقط؛ "
+                        "لا يتم فتح Live من هذا الاختبار."
+                    )
+                else:
+                    st.error(
+                        "المرشح لم يثبت نفسه على نافذة مستقلة. "
+                        "لا نعدّل شروطه باستخدام نفس الفترة؛ "
+                        "نعود للبحث أو نغيّر منطق الاستراتيجية."
+                    )
+
+
 # --------------------------- health ---------------------------
 st.subheader("System Health")
 
@@ -3412,6 +4048,7 @@ health_rows = [
     {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
     {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
     {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
+    {"Component": "Independent validation", "Status": "PASS" if st.session_state.get("independent_validation", {}).get("gate", {}).get("passed", False) else "NOT PASSED"},
     {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
