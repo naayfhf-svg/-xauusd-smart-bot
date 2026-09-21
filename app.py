@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • MTF backtest • broker-safe Live bridge
 # ============================================================
 
-VERSION = "3.5.0-x10"
+VERSION = "3.6.0-x10"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -721,13 +721,15 @@ def build_trade_plan(
     stop_distance = max(atr_value * stop_atr, 1e-9)
     risk_budget = equity * risk_pct / 100.0
     raw_qty = risk_budget / (stop_distance * spec.point_value)
-    qty = floor_step(raw_qty, spec.qty_step)
+    stepped_qty = floor_step(raw_qty, spec.qty_step)
 
     # Critical safety rule: never force the minimum quantity upward if it would
     # violate the requested risk budget.
-    if qty < spec.min_qty:
+    if stepped_qty < spec.min_qty:
         raise ValueError("الحد الأدنى للكمية يرفع المخاطرة فوق ميزانية الصفقة")
-    qty = min(qty, spec.max_qty)
+
+    max_qty_hit = stepped_qty > spec.max_qty
+    qty = min(stepped_qty, spec.max_qty)
 
     if signal == "BUY":
         stop = entry - stop_distance
@@ -746,6 +748,8 @@ def build_trade_plan(
         "symbol": spec.symbol,
         "qty": float(qty),
         "raw_qty": float(raw_qty),
+        "stepped_qty": float(stepped_qty),
+        "max_qty_hit": bool(max_qty_hit),
         "entry_reference": float(entry),
         "stop_loss": float(stop),
         "take_profit_1": float(tp1),
@@ -1064,7 +1068,7 @@ def live_payload(
     idem = hashlib.sha256(idem_src.encode()).hexdigest()[:20]
     return {
         "client_order_id": f"goldai-{idem}",
-        "strategy": "GOLD_AI_V34_X10_MTF",
+        "strategy": "GOLD_AI_V36_X10_MTF",
         "version": VERSION,
         "symbol": instrument.symbol,
         "asset_class": instrument.asset_class,
@@ -1140,6 +1144,12 @@ def _backtest_summary(df: pd.DataFrame, initial_equity: float = 100_000.0) -> di
             "max_dd_pct": 0.0,
             "ending_equity": initial_equity,
             "avg_r_net": 0.0,
+            "risk_weighted_expectancy_r": 0.0,
+            "avg_risk_money": 0.0,
+            "median_risk_money": 0.0,
+            "avg_risk_utilization_pct": 0.0,
+            "max_qty_hit_count": 0,
+            "max_qty_hit_pct": 0.0,
             "avg_duration_min": 0.0,
             "max_losing_streak": 0,
         }
@@ -1154,6 +1164,29 @@ def _backtest_summary(df: pd.DataFrame, initial_equity: float = 100_000.0) -> di
     drawdown = peaks - eq_curve
     drawdown_pct = drawdown / peaks.replace(0, np.nan) * 100.0
 
+    risk_money = pd.to_numeric(
+        df["risk_money"] if "risk_money" in df.columns else pd.Series([0.0] * len(df)),
+        errors="coerce",
+    ).fillna(0.0)
+    risk_budget = pd.to_numeric(
+        df["risk_budget"] if "risk_budget" in df.columns else risk_money,
+        errors="coerce",
+    ).fillna(0.0)
+    total_risk = float(risk_money.sum())
+    weighted_expectancy = float(pnl.sum() / total_risk) if total_risk > 0 else 0.0
+
+    if "risk_utilization_pct" in df.columns:
+        risk_utilization = pd.to_numeric(df["risk_utilization_pct"], errors="coerce").fillna(0.0)
+    else:
+        risk_utilization = pd.Series(
+            np.where(risk_budget > 0, risk_money / risk_budget * 100.0, 0.0)
+        )
+
+    if "max_qty_hit" in df.columns:
+        max_qty_hits = df["max_qty_hit"].fillna(False).astype(bool)
+    else:
+        max_qty_hits = pd.Series([False] * len(df))
+
     return {
         "trades": int(len(df)),
         "win_rate": float((pnl > 0).mean() * 100.0),
@@ -1163,6 +1196,12 @@ def _backtest_summary(df: pd.DataFrame, initial_equity: float = 100_000.0) -> di
         "max_dd_pct": float(drawdown_pct.max()),
         "ending_equity": float(initial_equity + pnl.sum()),
         "avg_r_net": float(pd.to_numeric(df["R_net"], errors="coerce").mean()),
+        "risk_weighted_expectancy_r": weighted_expectancy,
+        "avg_risk_money": float(risk_money.mean()) if len(risk_money) else 0.0,
+        "median_risk_money": float(risk_money.median()) if len(risk_money) else 0.0,
+        "avg_risk_utilization_pct": float(risk_utilization.mean()) if len(risk_utilization) else 0.0,
+        "max_qty_hit_count": int(max_qty_hits.sum()),
+        "max_qty_hit_pct": float(max_qty_hits.mean() * 100.0) if len(max_qty_hits) else 0.0,
         "avg_duration_min": float(pd.to_numeric(df["duration_min"], errors="coerce").mean()),
         "max_losing_streak": int(_max_losing_streak(pnl)),
     }
@@ -1182,6 +1221,9 @@ def _group_audit(df: pd.DataFrame, column: str) -> list[dict[str, Any]]:
                 "profit_factor": math.inf if not math.isfinite(s["profit_factor"]) else round(s["profit_factor"], 2),
                 "net_pnl": round(s["net_pnl"], 2),
                 "avg_r_net": round(s["avg_r_net"], 3),
+                "risk_weighted_expectancy_r": round(s["risk_weighted_expectancy_r"], 3),
+                "avg_risk_money": round(s["avg_risk_money"], 2),
+                "max_qty_hit_pct": round(s["max_qty_hit_pct"], 1),
             }
         )
     return rows
@@ -1346,6 +1388,11 @@ def backtest_mtf(
                 "tp1": plan["take_profit_1"],
                 "tp2": plan["take_profit_2"],
                 "risk": plan["estimated_risk"],
+                "risk_budget": plan["risk_budget"],
+                "actual_risk_pct": plan["actual_risk_pct"],
+                "raw_qty": plan["raw_qty"],
+                "stepped_qty": plan["stepped_qty"],
+                "max_qty_hit": plan["max_qty_hit"],
                 "qty": plan["qty"],
                 "point_value": spec.point_value,
                 "remaining": 1.0,
@@ -1439,6 +1486,17 @@ def backtest_mtf(
                     "exit": float(exit_price),
                     "R_gross": float(total_r),
                     "R_net": float(r_net),
+                    "risk_money": float(position["risk"]),
+                    "risk_budget": float(position["risk_budget"]),
+                    "risk_utilization_pct": (
+                        float(position["risk"]) / float(position["risk_budget"]) * 100.0
+                        if float(position["risk_budget"]) > 0 else 0.0
+                    ),
+                    "actual_risk_pct": float(position["actual_risk_pct"]),
+                    "raw_qty": float(position["raw_qty"]),
+                    "stepped_qty": float(position["stepped_qty"]),
+                    "qty": float(position["qty"]),
+                    "max_qty_hit": bool(position["max_qty_hit"]),
                     "gross_pnl": gross,
                     "costs": costs,
                     "PnL": pnl,
@@ -1535,12 +1593,18 @@ def self_test() -> tuple[bool, str]:
             {
                 "PnL": [-100.0, -50.0, 120.0, -20.0],
                 "R_net": [-1.0, -0.5, 1.2, -0.2],
+                "risk_money": [100.0, 100.0, 100.0, 100.0],
+                "risk_budget": [100.0, 100.0, 100.0, 100.0],
+                "risk_utilization_pct": [100.0, 100.0, 100.0, 100.0],
+                "max_qty_hit": [False, False, True, False],
                 "duration_min": [5.0, 10.0, 15.0, 5.0],
             }
         )
         audit = _backtest_summary(audit_df)
         assert audit["max_losing_streak"] == 2
         assert audit["trades"] == 4
+        assert abs(audit["risk_weighted_expectancy_r"] - (-0.125)) < 1e-9
+        assert audit["max_qty_hit_count"] == 1
 
         return True, "OK"
     except Exception as exc:
@@ -2211,7 +2275,8 @@ if mode == "Live":
 st.subheader("Backtest Lab — X10 Audit")
 st.caption(
     "اختبار متعدد الأطر بنفس منطق الإشارة وإدارة TP1/Break-even/TP2 تقريبًا. "
-    "يعرض In-sample / Out-of-sample واختبار حساسية للتكاليف. النتائج تشخيصية وليست ضمانًا للربحية."
+    "يعرض In-sample / Out-of-sample واختبار حساسية للتكاليف، "
+    "ويفصل أثر اختلاف أحجام المخاطرة وحد max_qty. النتائج تشخيصية وليست ضمانًا للربحية."
 )
 
 if st.button("تشغيل Backtest Audit", use_container_width=True):
@@ -2245,6 +2310,9 @@ if st.button("تشغيل Backtest Audit", use_container_width=True):
                         "Net P&L": round(scenario_stats["net_pnl"], 2),
                         "Max DD %": round(scenario_stats["max_dd_pct"], 2),
                         "Avg Net R": round(scenario_stats["avg_r_net"], 3),
+                        "Risk-Weighted Exp R": round(scenario_stats["risk_weighted_expectancy_r"], 3),
+                        "Avg Risk $": round(scenario_stats["avg_risk_money"], 2),
+                        "Max Qty Hit %": round(scenario_stats["max_qty_hit_pct"], 1),
                     }
                 )
             else:
@@ -2257,6 +2325,9 @@ if st.button("تشغيل Backtest Audit", use_container_width=True):
                         "Net P&L": 0.0,
                         "Max DD %": 0.0,
                         "Avg Net R": 0.0,
+                        "Risk-Weighted Exp R": 0.0,
+                        "Avg Risk $": 0.0,
+                        "Max Qty Hit %": 0.0,
                     }
                 )
 
@@ -2286,12 +2357,28 @@ if st.session_state.backtest:
         mini_grid(
             [
                 ("Avg Net R", f"{stats['avg_r_net']:.3f}R", "ok" if stats["avg_r_net"] > 0 else "bad"),
+                (
+                    "Risk-Weighted Exp",
+                    f"{stats['risk_weighted_expectancy_r']:.3f}R",
+                    "ok" if stats["risk_weighted_expectancy_r"] > 0 else "bad",
+                ),
+                ("Avg Risk $", f"${stats['avg_risk_money']:,.2f}", ""),
+                ("Risk Utilization", f"{stats['avg_risk_utilization_pct']:.1f}%", ""),
+                ("Max Qty Hits", f"{stats['max_qty_hit_count']} / {stats['max_qty_hit_pct']:.1f}%", "wait" if stats["max_qty_hit_count"] else "ok"),
                 ("Max Losing Streak", str(stats["max_losing_streak"]), "wait"),
                 ("Avg Duration", f"{stats['avg_duration_min']:.0f} min", ""),
                 ("Base Cost", f"{stats['cost_bps_roundtrip']:.0f} bps RT", ""),
             ],
-            "tf-grid",
+            "plan-grid",
         )
+
+        if (stats["avg_r_net"] < 0 < stats["risk_weighted_expectancy_r"]) or (
+            stats["avg_r_net"] > 0 > stats["risk_weighted_expectancy_r"]
+        ):
+            st.warning(
+                "Sizing asymmetry detected: متوسط R البسيط واتجاه العائد الموزون بالمخاطرة مختلفان. "
+                "راجع Max Qty Hits وRisk Utilization قبل الاعتماد على النتيجة."
+            )
 
         st.markdown("### Cost Stress Test")
         st.dataframe(
@@ -2319,6 +2406,9 @@ if st.session_state.backtest:
                     ),
                     "Net P&L": round(in_stats.get("net_pnl", 0.0), 2),
                     "Avg Net R": round(in_stats.get("avg_r_net", 0.0), 3),
+                    "Risk-Weighted Exp R": round(in_stats.get("risk_weighted_expectancy_r", 0.0), 3),
+                    "Avg Risk $": round(in_stats.get("avg_risk_money", 0.0), 2),
+                    "Max Qty Hit %": round(in_stats.get("max_qty_hit_pct", 0.0), 1),
                     "Max Losing Streak": in_stats.get("max_losing_streak", 0),
                 },
                 {
@@ -2332,6 +2422,9 @@ if st.session_state.backtest:
                     ),
                     "Net P&L": round(out_stats.get("net_pnl", 0.0), 2),
                     "Avg Net R": round(out_stats.get("avg_r_net", 0.0), 3),
+                    "Risk-Weighted Exp R": round(out_stats.get("risk_weighted_expectancy_r", 0.0), 3),
+                    "Avg Risk $": round(out_stats.get("avg_risk_money", 0.0), 2),
+                    "Max Qty Hit %": round(out_stats.get("max_qty_hit_pct", 0.0), 1),
                     "Max Losing Streak": out_stats.get("max_losing_streak", 0),
                 },
             ]
