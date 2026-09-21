@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • MTF backtest • broker-safe Live bridge
 # ============================================================
 
-VERSION = "3.4.0-x10"
+VERSION = "3.5.0-x10"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -1105,13 +1105,86 @@ def precompute_b2(frame: pd.DataFrame) -> pd.DataFrame:
     out["b2_side"] = None
     out["b2_breakout"] = False
     lookback = 20
+    # b2_signal only needs a small trailing window. Avoid repeatedly copying
+    # the entire history, which matters when the audit runs several cost cases.
+    window_size = lookback + 3
     for i in range(lookback + 2, len(out)):
-        window = out.iloc[: i + 1]
-        sig = b2_signal(window)
+        start = max(0, i - window_size + 1)
+        sig = b2_signal(out.iloc[start : i + 1])
         out.at[i, "b2_valid"] = bool(sig.get("valid"))
         out.at[i, "b2_side"] = sig.get("side")
         out.at[i, "b2_breakout"] = bool(sig.get("breakout"))
     return out
+
+
+def _max_losing_streak(pnl: pd.Series) -> int:
+    best = 0
+    current = 0
+    for value in pnl.fillna(0.0):
+        if float(value) <= 0:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
+
+
+def _backtest_summary(df: pd.DataFrame, initial_equity: float = 100_000.0) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "trades": 0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "net_pnl": 0.0,
+            "max_dd": 0.0,
+            "max_dd_pct": 0.0,
+            "ending_equity": initial_equity,
+            "avg_r_net": 0.0,
+            "avg_duration_min": 0.0,
+            "max_losing_streak": 0,
+        }
+
+    pnl = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
+    gross_win = float(pnl[pnl > 0].sum())
+    gross_loss = float(abs(pnl[pnl < 0].sum()))
+    pf = gross_win / gross_loss if gross_loss else math.inf
+
+    eq_curve = pd.Series([initial_equity] + (initial_equity + pnl.cumsum()).tolist())
+    peaks = eq_curve.cummax()
+    drawdown = peaks - eq_curve
+    drawdown_pct = drawdown / peaks.replace(0, np.nan) * 100.0
+
+    return {
+        "trades": int(len(df)),
+        "win_rate": float((pnl > 0).mean() * 100.0),
+        "profit_factor": float(pf),
+        "net_pnl": float(pnl.sum()),
+        "max_dd": float(drawdown.max()),
+        "max_dd_pct": float(drawdown_pct.max()),
+        "ending_equity": float(initial_equity + pnl.sum()),
+        "avg_r_net": float(pd.to_numeric(df["R_net"], errors="coerce").mean()),
+        "avg_duration_min": float(pd.to_numeric(df["duration_min"], errors="coerce").mean()),
+        "max_losing_streak": int(_max_losing_streak(pnl)),
+    }
+
+
+def _group_audit(df: pd.DataFrame, column: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if df.empty or column not in df.columns:
+        return rows
+    for key, part in df.groupby(column, dropna=False):
+        s = _backtest_summary(part)
+        rows.append(
+            {
+                column: key,
+                "trades": s["trades"],
+                "win_rate": round(s["win_rate"], 1),
+                "profit_factor": math.inf if not math.isfinite(s["profit_factor"]) else round(s["profit_factor"], 2),
+                "net_pnl": round(s["net_pnl"], 2),
+                "avg_r_net": round(s["avg_r_net"], 3),
+            }
+        )
+    return rows
 
 
 def backtest_mtf(
@@ -1127,6 +1200,9 @@ def backtest_mtf(
         }
 
     base = raw.copy().reset_index(drop=True)
+    split_index = max(1, min(len(base) - 1, int(len(base) * 0.70)))
+    split_time = pd.Timestamp(base["datetime"].iloc[split_index])
+
     tf_frames = {
         "M5": base,
         "M15": (
@@ -1220,9 +1296,12 @@ def backtest_mtf(
     initial_equity = equity
     trades: list[dict[str, Any]] = []
     position: dict[str, Any] | None = None
-
-    # map next M5 bar by open time
     raw_by_time = base.set_index("datetime")
+
+    weekday_map = {
+        0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu",
+        4: "Fri", 5: "Sat", 6: "Sun",
+    }
 
     for _, row in bt.iterrows():
         eval_time = pd.Timestamp(row["effective_time"])
@@ -1246,6 +1325,7 @@ def backtest_mtf(
         b2 = {"valid": bool(row["b2_valid"]), "side": row["b2_side"]}
         signal, buy_score, sell_score, _ = score_signal(snaps, b2)
 
+        opened_this_bar = False
         if position is None and signal in {"BUY", "SELL"}:
             try:
                 plan = build_trade_plan(
@@ -1275,6 +1355,7 @@ def backtest_mtf(
                 "buy_score": buy_score,
                 "sell_score": sell_score,
             }
+            opened_this_bar = True
 
         if position is None:
             continue
@@ -1292,8 +1373,10 @@ def backtest_mtf(
         exit_reason = None
         total_r = None
 
+        # Entry occurs at the M5 open. Intrabar order is unknown, so stop is
+        # checked before targets. A same-bar exit is recorded at bar end (+5m)
+        # rather than showing identical open/close timestamps.
         if side == "BUY":
-            # Conservative intrabar ordering: stop is checked before profit targets.
             if lo <= position["stop"]:
                 total_r = position["realized_r"] + position["remaining"] * (
                     (position["stop"] - position["entry"]) / d
@@ -1329,23 +1412,39 @@ def backtest_mtf(
                     exit_price, exit_reason, closed = position["tp2"], "TP2", True
 
         if closed and total_r is not None:
-            gross = total_r * position["risk"]
+            gross = float(total_r * position["risk"])
             notional = abs(position["entry"] * position["qty"] * position["point_value"])
-            costs = notional * (cost_bps_roundtrip / 10_000.0)
-            pnl = gross - costs
+            costs = float(notional * (cost_bps_roundtrip / 10_000.0))
+            pnl = float(gross - costs)
             equity += pnl
+
+            close_time = eval_time + pd.Timedelta(minutes=5)
+            duration_min = max(
+                5.0,
+                (close_time - pd.Timestamp(position["opened"])).total_seconds() / 60.0,
+            )
+            r_net = pnl / position["risk"] if position["risk"] > 0 else 0.0
+            opened_ts = pd.Timestamp(position["opened"])
+
             trades.append(
                 {
-                    "opened": position["opened"],
-                    "closed": eval_time,
+                    "opened": opened_ts,
+                    "closed": close_time,
                     "side": side,
-                    "entry": position["entry"],
-                    "exit": exit_price,
-                    "R_gross": round(total_r, 4),
-                    "costs": round(costs, 2),
-                    "PnL": round(pnl, 2),
-                    "equity": round(equity, 2),
+                    "segment": "IN" if opened_ts < split_time else "OUT",
+                    "entry_hour_utc": int(opened_ts.hour),
+                    "entry_weekday": weekday_map[int(opened_ts.dayofweek)],
+                    "duration_min": float(duration_min),
+                    "entry": float(position["entry"]),
+                    "exit": float(exit_price),
+                    "R_gross": float(total_r),
+                    "R_net": float(r_net),
+                    "gross_pnl": gross,
+                    "costs": costs,
+                    "PnL": pnl,
+                    "equity": float(equity),
                     "reason": exit_reason,
+                    "same_bar_exit": bool(opened_this_bar),
                 }
             )
             position = None
@@ -1353,24 +1452,19 @@ def backtest_mtf(
     if not trades:
         return pd.DataFrame(), {"trades": 0, "warning": "لم ينتج الاختبار صفقات"}
 
-    df = pd.DataFrame(trades)
-    gross_win = df.loc[df["PnL"] > 0, "PnL"].sum()
-    gross_loss = abs(df.loc[df["PnL"] < 0, "PnL"].sum())
-    pf = gross_win / gross_loss if gross_loss else math.inf
+    df = pd.DataFrame(trades).sort_values("opened").reset_index(drop=True)
+    stats = _backtest_summary(df, initial_equity)
+    stats["cost_bps_roundtrip"] = float(cost_bps_roundtrip)
+    stats["split_time"] = split_time.isoformat()
 
-    eq_curve = pd.Series([initial_equity] + df["equity"].astype(float).tolist())
-    drawdown = eq_curve.cummax() - eq_curve
-    drawdown_pct = drawdown / eq_curve.cummax().replace(0, np.nan) * 100
+    in_df = df[df["segment"] == "IN"].copy()
+    out_df = df[df["segment"] == "OUT"].copy()
+    stats["in_sample"] = _backtest_summary(in_df, initial_equity)
+    stats["out_of_sample"] = _backtest_summary(out_df, initial_equity)
+    stats["side_stats"] = _group_audit(df, "side")
+    stats["hour_stats"] = _group_audit(df, "entry_hour_utc")
+    stats["day_stats"] = _group_audit(df, "entry_weekday")
 
-    stats = {
-        "trades": len(df),
-        "win_rate": float((df["PnL"] > 0).mean() * 100),
-        "profit_factor": float(pf),
-        "net_pnl": float(df["PnL"].sum()),
-        "max_dd": float(drawdown.max()),
-        "max_dd_pct": float(drawdown_pct.max()),
-        "ending_equity": float(df["equity"].iloc[-1]),
-    }
     return df, stats
 
 # --------------------------- self test ------------------------
@@ -1436,6 +1530,17 @@ def self_test() -> tuple[bool, str]:
             raise AssertionError("min-qty guard failed")
         except ValueError:
             pass
+
+        audit_df = pd.DataFrame(
+            {
+                "PnL": [-100.0, -50.0, 120.0, -20.0],
+                "R_net": [-1.0, -0.5, 1.2, -0.2],
+                "duration_min": [5.0, 10.0, 15.0, 5.0],
+            }
+        )
+        audit = _backtest_summary(audit_df)
+        assert audit["max_losing_streak"] == 2
+        assert audit["trades"] == 4
 
         return True, "OK"
     except Exception as exc:
@@ -2103,28 +2208,68 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Backtest Lab — Matched MTF")
+st.subheader("Backtest Lab — X10 Audit")
 st.caption(
-    "يستخدم نفس منطق M5/M15/H1/H4 ونفس TP1/Break-even/TP2 تقريبًا، مع تكلفة تداول تقديرية. "
-    "النتائج تشخيصية وليست ضمانًا للربحية."
+    "اختبار متعدد الأطر بنفس منطق الإشارة وإدارة TP1/Break-even/TP2 تقريبًا. "
+    "يعرض In-sample / Out-of-sample واختبار حساسية للتكاليف. النتائج تشخيصية وليست ضمانًا للربحية."
 )
 
-if st.button("تشغيل Backtest متعدد الأطر", use_container_width=True):
-    with st.spinner("تشغيل الاختبار..."):
-        bt_trades, bt_stats = backtest_mtf(
-            raw,
-            instrument,
-            risk_pct=float(risk_pct),
-            cost_bps_roundtrip=2.0,
-        )
+if st.button("تشغيل Backtest Audit", use_container_width=True):
+    with st.spinner("تشغيل الاختبار الأساسي واختبار التكاليف..."):
+        scenario_rows: list[dict[str, Any]] = []
+        base_trades = pd.DataFrame()
+        base_stats: dict[str, Any] = {}
+
+        for cost_bps in (2.0, 5.0, 10.0):
+            scenario_trades, scenario_stats = backtest_mtf(
+                raw,
+                instrument,
+                risk_pct=float(risk_pct),
+                cost_bps_roundtrip=cost_bps,
+            )
+            if cost_bps == 2.0:
+                base_trades = scenario_trades
+                base_stats = scenario_stats
+
+            if scenario_stats.get("trades", 0):
+                scenario_rows.append(
+                    {
+                        "Round-trip cost (bps)": cost_bps,
+                        "Trades": scenario_stats["trades"],
+                        "Win Rate %": round(scenario_stats["win_rate"], 1),
+                        "Profit Factor": (
+                            math.inf
+                            if not math.isfinite(scenario_stats["profit_factor"])
+                            else round(scenario_stats["profit_factor"], 2)
+                        ),
+                        "Net P&L": round(scenario_stats["net_pnl"], 2),
+                        "Max DD %": round(scenario_stats["max_dd_pct"], 2),
+                        "Avg Net R": round(scenario_stats["avg_r_net"], 3),
+                    }
+                )
+            else:
+                scenario_rows.append(
+                    {
+                        "Round-trip cost (bps)": cost_bps,
+                        "Trades": 0,
+                        "Win Rate %": 0.0,
+                        "Profit Factor": 0.0,
+                        "Net P&L": 0.0,
+                        "Max DD %": 0.0,
+                        "Avg Net R": 0.0,
+                    }
+                )
+
         st.session_state.backtest = {
-            "trades": bt_trades,
-            "stats": bt_stats,
+            "trades": base_trades,
+            "stats": base_stats,
+            "cost_scenarios": pd.DataFrame(scenario_rows),
         }
 
 if st.session_state.backtest:
     bt = st.session_state.backtest
     stats = bt["stats"]
+
     if stats.get("trades", 0):
         mini_grid(
             [
@@ -2137,7 +2282,91 @@ if st.session_state.backtest:
             ],
             "bt-grid",
         )
-        st.dataframe(bt["trades"].tail(100), hide_index=True, use_container_width=True)
+
+        mini_grid(
+            [
+                ("Avg Net R", f"{stats['avg_r_net']:.3f}R", "ok" if stats["avg_r_net"] > 0 else "bad"),
+                ("Max Losing Streak", str(stats["max_losing_streak"]), "wait"),
+                ("Avg Duration", f"{stats['avg_duration_min']:.0f} min", ""),
+                ("Base Cost", f"{stats['cost_bps_roundtrip']:.0f} bps RT", ""),
+            ],
+            "tf-grid",
+        )
+
+        st.markdown("### Cost Stress Test")
+        st.dataframe(
+            bt["cost_scenarios"],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        in_stats = stats.get("in_sample", {})
+        out_stats = stats.get("out_of_sample", {})
+        split_time = stats.get("split_time", "—")
+
+        st.markdown(f"### In-sample / Out-of-sample")
+        st.caption(f"التقسيم الزمني 70/30 • بداية Out-of-sample: {split_time}")
+        split_table = pd.DataFrame(
+            [
+                {
+                    "Segment": "IN 70%",
+                    "Trades": in_stats.get("trades", 0),
+                    "Win Rate %": round(in_stats.get("win_rate", 0.0), 1),
+                    "Profit Factor": (
+                        math.inf
+                        if not math.isfinite(in_stats.get("profit_factor", 0.0))
+                        else round(in_stats.get("profit_factor", 0.0), 2)
+                    ),
+                    "Net P&L": round(in_stats.get("net_pnl", 0.0), 2),
+                    "Avg Net R": round(in_stats.get("avg_r_net", 0.0), 3),
+                    "Max Losing Streak": in_stats.get("max_losing_streak", 0),
+                },
+                {
+                    "Segment": "OUT 30%",
+                    "Trades": out_stats.get("trades", 0),
+                    "Win Rate %": round(out_stats.get("win_rate", 0.0), 1),
+                    "Profit Factor": (
+                        math.inf
+                        if not math.isfinite(out_stats.get("profit_factor", 0.0))
+                        else round(out_stats.get("profit_factor", 0.0), 2)
+                    ),
+                    "Net P&L": round(out_stats.get("net_pnl", 0.0), 2),
+                    "Avg Net R": round(out_stats.get("avg_r_net", 0.0), 3),
+                    "Max Losing Streak": out_stats.get("max_losing_streak", 0),
+                },
+            ]
+        )
+        st.dataframe(split_table, hide_index=True, use_container_width=True)
+
+        with st.expander("BUY / SELL Audit", expanded=True):
+            side_df = pd.DataFrame(stats.get("side_stats", []))
+            if not side_df.empty:
+                st.dataframe(side_df, hide_index=True, use_container_width=True)
+            else:
+                st.info("لا توجد بيانات كافية لتقسيم BUY/SELL")
+
+        with st.expander("النتائج حسب ساعة الدخول UTC واليوم", expanded=False):
+            hour_df = pd.DataFrame(stats.get("hour_stats", []))
+            day_df = pd.DataFrame(stats.get("day_stats", []))
+            st.markdown("**حسب الساعة UTC**")
+            st.dataframe(hour_df, hide_index=True, use_container_width=True)
+            st.markdown("**حسب اليوم**")
+            st.dataframe(day_df, hide_index=True, use_container_width=True)
+
+        st.markdown("### Trade Log")
+        st.dataframe(
+            bt["trades"].tail(150),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.download_button(
+            "تنزيل نتائج Backtest CSV",
+            data=bt["trades"].to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"gold_ai_backtest_{now_riyadh().date().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
         st.info(stats.get("warning", "لا توجد نتائج"))
 
