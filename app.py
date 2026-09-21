@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.5.0-x10-independent"
+VERSION = "4.5.1-x10-independent-fix"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -221,6 +221,20 @@ def init_state() -> None:
 
 
 init_state()
+
+# Defensive session-state normalization for upgrades/hot reloads.
+if st.session_state.get("independent_validation") is not None and not isinstance(
+    st.session_state.get("independent_validation"), dict
+):
+    st.session_state.independent_validation = None
+
+if st.session_state.get("research_gate") is None:
+    st.session_state.research_gate = {
+        "passed": False,
+        "context": None,
+        "rules": [],
+        "reasons": ["Research Gate غير مهيأ في هذه الجلسة"],
+    }
 
 # -------------------------- data feed -------------------------
 def normalize_ohlcv(values: Any) -> pd.DataFrame:
@@ -4048,7 +4062,7 @@ health_rows = [
     {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
     {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
     {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
-    {"Component": "Independent validation", "Status": "PASS" if st.session_state.get("independent_validation", {}).get("gate", {}).get("passed", False) else "NOT PASSED"},
+    {"Component": "Independent validation", "Status": "PASS" if ((st.session_state.get("independent_validation") or {}).get("gate") or {}).get("passed", False) else "NOT PASSED"},
     {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
