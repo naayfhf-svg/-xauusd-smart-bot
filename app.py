@@ -20,12 +20,12 @@ import requests
 import streamlit as st
 
 # ============================================================
-# GOLD AI v3.4 — X10 Build
+# GOLD AI v4.0 — X10 FINAL
 # Single-file multi-asset Streamlit terminal.
-# Analysis • Paper • MTF backtest • broker-safe Live bridge
+# Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "3.6.0-x10"
+VERSION = "4.1.0-x10-final"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -202,6 +202,12 @@ def init_state() -> None:
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
         "backtest": None,
+        "research_gate": {
+            "passed": False,
+            "context": None,
+            "rules": [],
+            "reasons": ["لم يتم تشغيل Final Research Audit في هذه الجلسة"],
+        },
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -598,12 +604,15 @@ def snapshot(frame: pd.DataFrame) -> dict[str, Any] | None:
         "momentum": float(row["momentum"]),
         "macd_hist": float(row["macd_hist"]),
         "close": float(row["close"]),
+        "ema20": float(row["ema20"]),
+        "ema50": float(row["ema50"]),
+        "ema100": float(row["ema100"]) if finite(row.get("ema100")) else None,
         "candle": row["datetime"],
         "frame": calc,
     }
 
 
-def b2_signal(frame: pd.DataFrame, lookback: int = 20, retest_atr: float = 0.35) -> dict[str, Any]:
+def b2_signal(frame: pd.DataFrame, lookback: int = 20, retest_atr: float = 0.30) -> dict[str, Any]:
     if len(frame) < lookback + 3:
         return {"valid": False, "side": None, "level": None, "breakout": False, "retest": False}
     current = frame.iloc[-1]
@@ -640,35 +649,72 @@ def b2_signal(frame: pd.DataFrame, lookback: int = 20, retest_atr: float = 0.35)
     }
 
 
-def score_signal(snaps: dict[str, dict[str, Any]], b2: dict[str, Any]) -> tuple[str, int, int, str]:
+def score_signal(
+    snaps: dict[str, dict[str, Any]],
+    b2: dict[str, Any],
+) -> tuple[str, int, int, str]:
+    """
+    X10 GOLD FINAL strict-entry model.
+
+    BUY/SELL is emitted only when every required condition is true.
+    The percentage scores are diagnostic only; they do not override a failed rule.
+    """
     m5 = snaps["M5"]
-    trends = [snaps[x]["trend"] for x in TIMEFRAMES]
-    buy_score = 0
-    sell_score = 0
+    m15 = snaps["M15"]
+    h1 = snaps["H1"]
+    h4 = snaps["H4"]
 
-    buy_score += 25 if trends[3] == "UP" else 0
-    sell_score += 25 if trends[3] == "DOWN" else 0
-    buy_score += 20 if trends[2] == "UP" else 0
-    sell_score += 20 if trends[2] == "DOWN" else 0
-    buy_score += 15 if trends[1] == "UP" else 0
-    sell_score += 15 if trends[1] == "DOWN" else 0
-    buy_score += 10 if trends[0] == "UP" else 0
-    sell_score += 10 if trends[0] == "DOWN" else 0
-    buy_score += 10 if m5["rsi"] >= 52 else 0
-    sell_score += 10 if m5["rsi"] <= 48 else 0
-    buy_score += 8 if m5["momentum"] > 0 and m5["macd_hist"] > 0 else 0
-    sell_score += 8 if m5["momentum"] < 0 and m5["macd_hist"] < 0 else 0
-    buy_score += 5 if m5["adx"] >= 20 else 0
-    sell_score += 5 if m5["adx"] >= 20 else 0
-    buy_score += 7 if b2.get("valid") and b2.get("side") == "BUY" else 0
-    sell_score += 7 if b2.get("valid") and b2.get("side") == "SELL" else 0
+    buy_conditions = [
+        h4["trend"] == "UP",
+        h1["trend"] == "UP",
+        m15["trend"] == "UP",
+        m5["close"] > m5["ema20"] > m5["ema50"],
+        finite(h1.get("ema100")) and h1["close"] > h1["ema100"],
+        52 <= m5["rsi"] <= 68,
+        m5["momentum"] > 0,
+        m5["macd_hist"] > 0,
+        max(m15["adx"], h1["adx"]) >= 20,
+        b2.get("valid") and b2.get("side") == "BUY",
+    ]
 
-    if buy_score >= 75 and buy_score >= sell_score + 20:
-        return "BUY", buy_score, sell_score, "اتجاه متعدد الأطر + زخم صاعد متوافق"
-    if sell_score >= 75 and sell_score >= buy_score + 20:
-        return "SELL", buy_score, sell_score, "اتجاه متعدد الأطر + زخم هابط متوافق"
-    return "WAIT", buy_score, sell_score, "شروط الدخول غير مكتملة"
+    sell_conditions = [
+        h4["trend"] == "DOWN",
+        h1["trend"] == "DOWN",
+        m15["trend"] == "DOWN",
+        m5["close"] < m5["ema20"] < m5["ema50"],
+        finite(h1.get("ema100")) and h1["close"] < h1["ema100"],
+        32 <= m5["rsi"] <= 48,
+        m5["momentum"] < 0,
+        m5["macd_hist"] < 0,
+        max(m15["adx"], h1["adx"]) >= 20,
+        b2.get("valid") and b2.get("side") == "SELL",
+    ]
 
+    buy_score = round(sum(bool(x) for x in buy_conditions) / len(buy_conditions) * 100)
+    sell_score = round(sum(bool(x) for x in sell_conditions) / len(sell_conditions) * 100)
+
+    if all(buy_conditions):
+        return (
+            "BUY",
+            buy_score,
+            sell_score,
+            "X10 FINAL: اتجاه صاعد + زخم + Breakout/Retest مؤكد",
+        )
+
+    if all(sell_conditions):
+        return (
+            "SELL",
+            buy_score,
+            sell_score,
+            "X10 FINAL: اتجاه هابط + زخم + Breakout/Retest مؤكد",
+        )
+
+    return (
+        "WAIT",
+        buy_score,
+        sell_score,
+        "X10 FINAL: بانتظار اكتمال جميع شروط الدخول",
+    )
 
 def analyze_mtf(raw: pd.DataFrame) -> dict[str, Any]:
     frames = {
@@ -709,7 +755,7 @@ def build_trade_plan(
     equity: float,
     risk_pct: float,
     spec: InstrumentSpec,
-    stop_atr: float = 1.5,
+    stop_atr: float = 1.6,
     tp1_r: float = 1.0,
     tp2_r: float = 2.2,
 ) -> dict[str, Any]:
@@ -1068,7 +1114,7 @@ def live_payload(
     idem = hashlib.sha256(idem_src.encode()).hexdigest()[:20]
     return {
         "client_order_id": f"goldai-{idem}",
-        "strategy": "GOLD_AI_V36_X10_MTF",
+        "strategy": "GOLD_AI_V40_X10_FINAL",
         "version": VERSION,
         "symbol": instrument.symbol,
         "asset_class": instrument.asset_class,
@@ -1207,6 +1253,141 @@ def _backtest_summary(df: pd.DataFrame, initial_equity: float = 100_000.0) -> di
     }
 
 
+
+def _fixed_risk_normalized(
+    df: pd.DataFrame,
+    initial_equity: float = 100_000.0,
+    risk_pct: float = 0.5,
+    cost_bps_roundtrip: float = 2.0,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Reprice the SAME historical entries/exits with uncapped, fixed-percent risk.
+
+    This removes max_qty/qty-step sizing distortion and answers one question:
+    does the signal/exit logic itself have positive expectancy before broker caps?
+    """
+    if df.empty:
+        empty = pd.DataFrame()
+        return empty, _backtest_summary(empty, initial_equity)
+
+    equity = float(initial_equity)
+    rows: list[dict[str, Any]] = []
+
+    for _, trade in df.sort_values("opened").iterrows():
+        stop_distance = float(trade.get("stop_distance", 0.0))
+        point_value = float(trade.get("point_value", 0.0))
+        entry = float(trade.get("entry", 0.0))
+        r_gross = float(trade.get("R_gross", 0.0))
+
+        if stop_distance <= 0 or point_value <= 0 or equity <= 0:
+            continue
+
+        risk_budget = equity * float(risk_pct) / 100.0
+        qty_uncapped = risk_budget / (stop_distance * point_value)
+        notional = abs(entry * qty_uncapped * point_value)
+        costs = notional * (float(cost_bps_roundtrip) / 10_000.0)
+        gross_pnl = r_gross * risk_budget
+        pnl = gross_pnl - costs
+        r_net = pnl / risk_budget if risk_budget > 0 else 0.0
+        equity += pnl
+
+        row = dict(trade)
+        row.update(
+            {
+                "normalized_qty": float(qty_uncapped),
+                "normalized_risk_money": float(risk_budget),
+                "normalized_costs": float(costs),
+                "normalized_pnl": float(pnl),
+                "normalized_r_net": float(r_net),
+                "normalized_equity": float(equity),
+                # Map to common summary field names.
+                "PnL": float(pnl),
+                "R_net": float(r_net),
+                "risk_money": float(risk_budget),
+                "risk_budget": float(risk_budget),
+                "risk_utilization_pct": 100.0,
+                "max_qty_hit": False,
+            }
+        )
+        rows.append(row)
+
+    norm = pd.DataFrame(rows)
+    return norm, _backtest_summary(norm, initial_equity)
+
+
+def _research_gate(
+    capped_stats: dict[str, Any],
+    cost_scenarios: pd.DataFrame,
+    context: str,
+) -> dict[str, Any]:
+    """
+    Conservative research gate. Passing it is NOT a promise of profitability.
+    It only prevents Live from being enabled on obviously weak/fragile evidence.
+    """
+    oos = capped_stats.get("normalized_out_of_sample", {})
+    normalized = capped_stats.get("normalized", {})
+
+    row10 = None
+    if isinstance(cost_scenarios, pd.DataFrame) and not cost_scenarios.empty:
+        matches = cost_scenarios[
+            pd.to_numeric(cost_scenarios["Round-trip cost (bps)"], errors="coerce") == 10.0
+        ]
+        if not matches.empty:
+            row10 = matches.iloc[0].to_dict()
+
+    rules = [
+        {
+            "name": "إجمالي الصفقات ≥ 40",
+            "pass": int(capped_stats.get("trades", 0)) >= 40,
+            "value": int(capped_stats.get("trades", 0)),
+        },
+        {
+            "name": "OUT normalized trades ≥ 12",
+            "pass": int(oos.get("trades", 0)) >= 12,
+            "value": int(oos.get("trades", 0)),
+        },
+        {
+            "name": "OUT normalized PF ≥ 1.20",
+            "pass": float(oos.get("profit_factor", 0.0)) >= 1.20,
+            "value": float(oos.get("profit_factor", 0.0)),
+        },
+        {
+            "name": "OUT normalized Avg R ≥ +0.05R",
+            "pass": float(oos.get("avg_r_net", 0.0)) >= 0.05,
+            "value": float(oos.get("avg_r_net", 0.0)),
+        },
+        {
+            "name": "10 bps normalized PF ≥ 1.10",
+            "pass": bool(row10) and float(row10.get("Normalized PF", 0.0)) >= 1.10,
+            "value": None if row10 is None else float(row10.get("Normalized PF", 0.0)),
+        },
+        {
+            "name": "10 bps normalized P&L > 0",
+            "pass": bool(row10) and float(row10.get("Normalized Net P&L", 0.0)) > 0.0,
+            "value": None if row10 is None else float(row10.get("Normalized Net P&L", 0.0)),
+        },
+        {
+            "name": "Normalized Max DD ≤ 5%",
+            "pass": float(normalized.get("max_dd_pct", 999.0)) <= 5.0,
+            "value": float(normalized.get("max_dd_pct", 999.0)),
+        },
+        {
+            "name": "Max-qty hits ≤ 20%",
+            "pass": float(capped_stats.get("max_qty_hit_pct", 100.0)) <= 20.0,
+            "value": float(capped_stats.get("max_qty_hit_pct", 100.0)),
+        },
+    ]
+
+    failed = [r["name"] for r in rules if not r["pass"]]
+    return {
+        "passed": not failed,
+        "context": context,
+        "rules": rules,
+        "reasons": failed,
+        "checked_at": now_riyadh().isoformat(),
+    }
+
+
 def _group_audit(df: pd.DataFrame, column: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if df.empty or column not in df.columns:
@@ -1275,6 +1456,7 @@ def backtest_mtf(
         f = feature_frame(frame, TF_RULES[tf])
         keep = [
             "effective_time", "datetime", "open", "high", "low", "close",
+            "ema20", "ema50", "ema100",
             "rsi", "adx", "atr", "momentum", "macd_hist", "trend",
         ]
         f = f[keep].dropna(subset=["rsi", "adx", "atr", "momentum", "macd_hist"])
@@ -1298,6 +1480,7 @@ def backtest_mtf(
     bt = m5_full[
         [
             "effective_time", "datetime", "open", "high", "low", "close",
+            "ema20", "ema50",
             "rsi", "adx", "atr", "momentum", "macd_hist", "trend",
             "b2_valid", "b2_side",
         ]
@@ -1310,6 +1493,8 @@ def backtest_mtf(
             "high": "high_m5",
             "low": "low_m5",
             "close": "close_m5",
+            "ema20": "ema20_m5",
+            "ema50": "ema50_m5",
             "rsi": "rsi_m5",
             "adx": "adx_m5",
             "atr": "atr_m5",
@@ -1330,7 +1515,9 @@ def backtest_mtf(
     bt = bt.dropna(
         subset=[
             "trend_m5", "trend_m15", "trend_h1", "trend_h4",
+            "close_m5", "ema20_m5", "ema50_m5",
             "rsi_m5", "adx_m5", "atr_m5", "momentum_m5", "macd_hist_m5",
+            "adx_m15", "adx_h1", "close_h1", "ema100_h1",
         ]
     ).reset_index(drop=True)
 
@@ -1355,14 +1542,29 @@ def backtest_mtf(
 
         snaps = {
             "M5": {
-                "trend": row["trend_m5"], "rsi": float(row["rsi_m5"]),
-                "adx": float(row["adx_m5"]), "atr": float(row["atr_m5"]),
+                "trend": row["trend_m5"],
+                "close": float(row["close_m5"]),
+                "ema20": float(row["ema20_m5"]),
+                "ema50": float(row["ema50_m5"]),
+                "rsi": float(row["rsi_m5"]),
+                "adx": float(row["adx_m5"]),
+                "atr": float(row["atr_m5"]),
                 "momentum": float(row["momentum_m5"]),
                 "macd_hist": float(row["macd_hist_m5"]),
             },
-            "M15": {"trend": row["trend_m15"]},
-            "H1": {"trend": row["trend_h1"]},
-            "H4": {"trend": row["trend_h4"]},
+            "M15": {
+                "trend": row["trend_m15"],
+                "adx": float(row["adx_m15"]),
+            },
+            "H1": {
+                "trend": row["trend_h1"],
+                "adx": float(row["adx_h1"]),
+                "close": float(row["close_h1"]),
+                "ema100": float(row["ema100_h1"]),
+            },
+            "H4": {
+                "trend": row["trend_h4"],
+            },
         }
         b2 = {"valid": bool(row["b2_valid"]), "side": row["b2_side"]}
         signal, buy_score, sell_score, _ = score_signal(snaps, b2)
@@ -1484,6 +1686,8 @@ def backtest_mtf(
                     "duration_min": float(duration_min),
                     "entry": float(position["entry"]),
                     "exit": float(exit_price),
+                    "stop_distance": float(d),
+                    "point_value": float(position["point_value"]),
                     "R_gross": float(total_r),
                     "R_net": float(r_net),
                     "risk_money": float(position["risk"]),
@@ -1522,6 +1726,28 @@ def backtest_mtf(
     stats["side_stats"] = _group_audit(df, "side")
     stats["hour_stats"] = _group_audit(df, "entry_hour_utc")
     stats["day_stats"] = _group_audit(df, "entry_weekday")
+
+    _, normalized_stats = _fixed_risk_normalized(
+        df,
+        initial_equity=initial_equity,
+        risk_pct=risk_pct,
+        cost_bps_roundtrip=cost_bps_roundtrip,
+    )
+    _, normalized_in = _fixed_risk_normalized(
+        in_df,
+        initial_equity=initial_equity,
+        risk_pct=risk_pct,
+        cost_bps_roundtrip=cost_bps_roundtrip,
+    )
+    _, normalized_out = _fixed_risk_normalized(
+        out_df,
+        initial_equity=initial_equity,
+        risk_pct=risk_pct,
+        cost_bps_roundtrip=cost_bps_roundtrip,
+    )
+    stats["normalized"] = normalized_stats
+    stats["normalized_in_sample"] = normalized_in
+    stats["normalized_out_of_sample"] = normalized_out
 
     return df, stats
 
@@ -1606,6 +1832,20 @@ def self_test() -> tuple[bool, str]:
         assert abs(audit["risk_weighted_expectancy_r"] - (-0.125)) < 1e-9
         assert audit["max_qty_hit_count"] == 1
 
+        norm_test = audit_df.copy()
+        norm_test["opened"] = pd.date_range("2026-01-01", periods=4, freq="5min", tz="UTC")
+        norm_test["entry"] = [100.0, 100.0, 100.0, 100.0]
+        norm_test["stop_distance"] = [1.0, 1.0, 1.0, 1.0]
+        norm_test["point_value"] = [1.0, 1.0, 1.0, 1.0]
+        norm_test["R_gross"] = [-1.0, -0.5, 1.2, -0.2]
+        _, normalized_audit = _fixed_risk_normalized(
+            norm_test,
+            initial_equity=100_000.0,
+            risk_pct=0.5,
+            cost_bps_roundtrip=0.0,
+        )
+        assert normalized_audit["trades"] == 4
+
         return True, "OK"
     except Exception as exc:
         return False, str(exc)
@@ -1664,8 +1904,8 @@ mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"]
 risk_pct = st.sidebar.number_input(
     "مخاطرة الصفقة %",
     min_value=0.05,
-    max_value=1.0,
-    value=0.50,
+    max_value=0.50,
+    value=0.25,
     step=0.05,
 )
 st.session_state.kill_switch = st.sidebar.toggle(
@@ -1678,35 +1918,40 @@ with st.sidebar.expander("إعدادات المخاطر والتحديث", expan
     max_daily_loss_pct = st.number_input(
         "حد الخسارة اليومية %",
         min_value=0.5,
-        max_value=5.0,
-        value=2.0,
+        max_value=3.0,
+        value=1.5,
         step=0.5,
     )
     max_open_positions = st.number_input(
         "أقصى مراكز مفتوحة",
         min_value=1,
-        max_value=10,
-        value=3,
+        max_value=3,
+        value=1,
         step=1,
     )
     max_order_risk_pct = st.number_input(
         "الحد الصلب لمخاطرة الأمر %",
         min_value=0.05,
-        max_value=1.0,
-        value=1.0,
+        max_value=0.50,
+        value=0.50,
         step=0.05,
     )
     st.session_state.auto_refresh = st.toggle(
-        "تحديث تلقائي",
+        "Paper heartbeat تلقائي",
         value=st.session_state.auto_refresh,
+        help="يحدّث محرك Paper داخل Fragment بدون إعادة تحميل الصفحة كاملة",
     )
-    refresh_seconds = st.slider("ثواني التحديث", 10, 120, 30)
+    refresh_seconds = st.slider("ثواني heartbeat", 30, 120, 30, step=15)
 
 if not st.session_state.auto_refresh:
     refresh_seconds = 30
 
 live_unlocked = truthy(secret("LIVE_TRADING_ENABLED", "false"))
-auto_live_unlocked = truthy(secret("AUTO_EXECUTION_ALLOWED", "false"))
+automation_backend_ready = truthy(secret("AUTOMATION_BACKEND_READY", "false"))
+auto_live_unlocked = (
+    truthy(secret("AUTO_EXECUTION_ALLOWED", "false"))
+    and automation_backend_ready
+)
 contract_metadata_verified = truthy(secret("BROKER_CONTRACT_METADATA_VERIFIED", "false"))
 bridge = make_bridge()
 
@@ -1729,6 +1974,11 @@ st.markdown(
     f"<p class='muted'>{instrument.asset_class} • Decision Engine • Risk Engine • Paper/Live Bridge</p>"
     f"<span class='badge'>v{VERSION}</span></div>",
     unsafe_allow_html=True,
+)
+
+st.caption(
+    "X10 GOLD FINAL • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
+    "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
 raw, data_status = fetch_market(instrument.symbol)
@@ -1756,6 +2006,13 @@ if not feed.get("trusted", False) and analysis.get("signal") in {"BUY", "SELL"}:
     }
 
 candle_id = str(raw["datetime"].iloc[-1])
+research_context = hashlib.sha256(
+    (
+        f"{VERSION}|{instrument.symbol}|{instrument.point_value}|"
+        f"{instrument.qty_step}|{instrument.min_qty}|{instrument.max_qty}|"
+        f"{float(risk_pct):.6f}"
+    ).encode()
+).hexdigest()[:16]
 
 # Never manage a Paper position from a stale/unverifiable execution price.
 if st.session_state.paper_position and feed.get("execution_ok", False):
@@ -1800,6 +2057,11 @@ mini_grid(
     ],
     "status-grid",
 )
+
+if st.button("تحديث البيانات الآن", use_container_width=True):
+    fetch_market.clear()
+    fetch_quote.clear()
+    st.rerun()
 
 if not feed.get("trusted", False):
     st.error("فحص بنية بيانات السوق لم ينجح. تم حجب أي إشارة تنفيذية.")
@@ -2139,6 +2401,14 @@ if mode == "Live":
                 day_start_equity,
             )
 
+        research_gate = st.session_state.get("research_gate", {})
+        if not research_gate.get("passed", False):
+            live_gate_ok = False
+            live_reasons.append("Final Research Gate لم يجتز الاختبارات")
+        elif research_gate.get("context") != research_context:
+            live_gate_ok = False
+            live_reasons.append("إعدادات الأصل/المخاطرة تغيّرت بعد الاختبار؛ أعد Final Research Audit")
+
         if not positions_verified:
             live_gate_ok = False
             live_reasons.append("الوسيط لم يرسل positions موثقة")
@@ -2210,7 +2480,7 @@ if mode == "Live":
             "Auto Live",
             value=st.session_state.auto_live,
             disabled=not auto_live_unlocked,
-            help="يحتاج AUTO_EXECUTION_ALLOWED=true بالإضافة لكل بوابات الأمان",
+            help="يحتاج AUTO_EXECUTION_ALLOWED=true وAUTOMATION_BACKEND_READY=true بالإضافة لكل بوابات الأمان",
         )
 
         if (
@@ -2272,15 +2542,15 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Backtest Lab — X10 Audit")
+st.subheader("Final Research Audit — X10")
 st.caption(
-    "اختبار متعدد الأطر بنفس منطق الإشارة وإدارة TP1/Break-even/TP2 تقريبًا. "
-    "يعرض In-sample / Out-of-sample واختبار حساسية للتكاليف، "
-    "ويفصل أثر اختلاف أحجام المخاطرة وحد max_qty. النتائج تشخيصية وليست ضمانًا للربحية."
+    "يفصل بين نتيجتين: Broker-Capped sizing الفعلي، وFixed-Risk Normalized لإزالة أثر max_qty. "
+    "كما يختبر OUT 30% وتكاليف 2/5/10 bps. اجتياز Research Gate ليس ضمانًا للربحية؛ "
+    "هو فقط حد أمان قبل السماح للـLive."
 )
 
-if st.button("تشغيل Backtest Audit", use_container_width=True):
-    with st.spinner("تشغيل الاختبار الأساسي واختبار التكاليف..."):
+if st.button("تشغيل Final Research Audit", use_container_width=True):
+    with st.spinner("تشغيل Broker-Capped + Fixed-Risk Normalized + Cost Stress..."):
         scenario_rows: list[dict[str, Any]] = []
         base_trades = pd.DataFrame()
         base_stats: dict[str, Any] = {}
@@ -2313,6 +2583,14 @@ if st.button("تشغيل Backtest Audit", use_container_width=True):
                         "Risk-Weighted Exp R": round(scenario_stats["risk_weighted_expectancy_r"], 3),
                         "Avg Risk $": round(scenario_stats["avg_risk_money"], 2),
                         "Max Qty Hit %": round(scenario_stats["max_qty_hit_pct"], 1),
+                        "Normalized PF": (
+                            math.inf
+                            if not math.isfinite(scenario_stats["normalized"]["profit_factor"])
+                            else round(scenario_stats["normalized"]["profit_factor"], 2)
+                        ),
+                        "Normalized Net P&L": round(scenario_stats["normalized"]["net_pnl"], 2),
+                        "Normalized Avg R": round(scenario_stats["normalized"]["avg_r_net"], 3),
+                        "Normalized Max DD %": round(scenario_stats["normalized"]["max_dd_pct"], 2),
                     }
                 )
             else:
@@ -2328,14 +2606,22 @@ if st.button("تشغيل Backtest Audit", use_container_width=True):
                         "Risk-Weighted Exp R": 0.0,
                         "Avg Risk $": 0.0,
                         "Max Qty Hit %": 0.0,
+                        "Normalized PF": 0.0,
+                        "Normalized Net P&L": 0.0,
+                        "Normalized Avg R": 0.0,
+                        "Normalized Max DD %": 0.0,
                     }
                 )
 
+        cost_df = pd.DataFrame(scenario_rows)
+        gate = _research_gate(base_stats, cost_df, research_context)
         st.session_state.backtest = {
             "trades": base_trades,
             "stats": base_stats,
-            "cost_scenarios": pd.DataFrame(scenario_rows),
+            "cost_scenarios": cost_df,
+            "research_gate": gate,
         }
+        st.session_state.research_gate = gate
 
 if st.session_state.backtest:
     bt = st.session_state.backtest
@@ -2372,6 +2658,18 @@ if st.session_state.backtest:
             "plan-grid",
         )
 
+        normalized = stats.get("normalized", {})
+        st.markdown("### Fixed-Risk Normalized — Signal Edge")
+        mini_grid(
+            [
+                ("Normalized PF", "∞" if not math.isfinite(normalized.get("profit_factor", 0.0)) else f"{normalized.get('profit_factor',0.0):.2f}", ""),
+                ("Normalized Net", f"${normalized.get('net_pnl',0.0):,.2f}", "ok" if normalized.get("net_pnl",0.0) > 0 else "bad"),
+                ("Normalized Avg R", f"{normalized.get('avg_r_net',0.0):.3f}R", "ok" if normalized.get("avg_r_net",0.0) > 0 else "bad"),
+                ("Normalized DD", f"{normalized.get('max_dd_pct',0.0):.2f}%", "wait"),
+            ],
+            "tf-grid",
+        )
+
         if (stats["avg_r_net"] < 0 < stats["risk_weighted_expectancy_r"]) or (
             stats["avg_r_net"] > 0 > stats["risk_weighted_expectancy_r"]
         ):
@@ -2393,6 +2691,8 @@ if st.session_state.backtest:
 
         st.markdown(f"### In-sample / Out-of-sample")
         st.caption(f"التقسيم الزمني 70/30 • بداية Out-of-sample: {split_time}")
+        norm_in = stats.get("normalized_in_sample", {})
+        norm_out = stats.get("normalized_out_of_sample", {})
         split_table = pd.DataFrame(
             [
                 {
@@ -2410,6 +2710,9 @@ if st.session_state.backtest:
                     "Avg Risk $": round(in_stats.get("avg_risk_money", 0.0), 2),
                     "Max Qty Hit %": round(in_stats.get("max_qty_hit_pct", 0.0), 1),
                     "Max Losing Streak": in_stats.get("max_losing_streak", 0),
+                    "Norm PF": round(norm_in.get("profit_factor", 0.0), 2) if math.isfinite(norm_in.get("profit_factor", 0.0)) else math.inf,
+                    "Norm Avg R": round(norm_in.get("avg_r_net", 0.0), 3),
+                    "Norm Net P&L": round(norm_in.get("net_pnl", 0.0), 2),
                 },
                 {
                     "Segment": "OUT 30%",
@@ -2426,10 +2729,24 @@ if st.session_state.backtest:
                     "Avg Risk $": round(out_stats.get("avg_risk_money", 0.0), 2),
                     "Max Qty Hit %": round(out_stats.get("max_qty_hit_pct", 0.0), 1),
                     "Max Losing Streak": out_stats.get("max_losing_streak", 0),
+                    "Norm PF": round(norm_out.get("profit_factor", 0.0), 2) if math.isfinite(norm_out.get("profit_factor", 0.0)) else math.inf,
+                    "Norm Avg R": round(norm_out.get("avg_r_net", 0.0), 3),
+                    "Norm Net P&L": round(norm_out.get("net_pnl", 0.0), 2),
                 },
             ]
         )
         st.dataframe(split_table, hide_index=True, use_container_width=True)
+
+        gate = bt.get("research_gate", st.session_state.get("research_gate", {}))
+        st.markdown("### Final Research Gate")
+        gate_state = "PASS" if gate.get("passed") else "BLOCK LIVE"
+        gate_color = "ok" if gate.get("passed") else "bad"
+        mini_grid([("Research Gate", gate_state, gate_color)], "tf-grid")
+        for rule in gate.get("rules", []):
+            icon = "✅" if rule.get("pass") else "❌"
+            st.write(f"{icon} {rule.get('name')} — {rule.get('value')}")
+        if not gate.get("passed"):
+            st.error("Live سيبقى مقفولًا. لا يتم تعديل الشروط لإجبار النتيجة على PASS؛ نغيّر الاستراتيجية فقط بناءً على بيانات جديدة واختبار مستقل.")
 
         with st.expander("BUY / SELL Audit", expanded=True):
             side_df = pd.DataFrame(stats.get("side_stats", []))
@@ -2492,6 +2809,8 @@ health_rows = [
     {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
     {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
     {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
+    {"Component": "Research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
+    {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
 ]
@@ -2521,11 +2840,89 @@ with st.expander("Decision Log", expanded=False):
         st.info("لا يوجد سجل بعد")
 
 st.info(
-    "Live يبقى مقفولًا افتراضيًا. قبل التنفيذ الحقيقي يلزم Broker Bridge فعلي، "
-    "Broker Quote حديث، positions موثقة، بيانات عقد موثقة، LIVE_UI_PIN، "
-    "وفتح LIVE_TRADING_ENABLED."
+    "FINAL SAFETY: Live لا يفتح إلا بعد Broker Bridge فعلي + Broker Quote حديث + positions موثقة + "
+    "بيانات عقد موثقة + LIVE_UI_PIN + Final Research Gate PASS. "
+    "Auto Live يحتاج أيضًا AUTOMATION_BACKEND_READY=true لأن جلسة Streamlit ليست Worker دائمًا."
 )
 
 if st.session_state.auto_refresh:
-    time.sleep(refresh_seconds)
-    st.rerun()
+    @st.fragment(run_every=refresh_seconds)
+    def _paper_heartbeat() -> None:
+        """
+        Session-scoped Paper heartbeat.
+        It does not full-rerun the app, so mobile stays connected more reliably.
+        It is NOT a 24/7 server worker and may pause if the browser session sleeps.
+        """
+        hb_raw, _ = fetch_market(instrument.symbol)
+        if hb_raw.empty:
+            st.caption("Paper heartbeat: market data unavailable")
+            return
+
+        hb_quote = fetch_quote(instrument.symbol)
+        hb_feed = feed_integrity(hb_raw, hb_quote)
+        hb_price = (
+            float(hb_quote["last"])
+            if hb_quote.get("connected") and finite(hb_quote.get("last"))
+            else float(hb_raw["close"].iloc[-1])
+        )
+
+        if st.session_state.paper_position and hb_feed.get("execution_ok", False):
+            hb_mark = paper_mark_price(
+                st.session_state.paper_position,
+                hb_quote,
+                hb_price,
+            )
+            manage_paper(hb_mark)
+
+        if (
+            st.session_state.auto_paper
+            and not st.session_state.paper_position
+            and hb_feed.get("execution_ok", False)
+        ):
+            hb_analysis = analyze_mtf(hb_raw)
+            hb_m5 = hb_analysis.get("snapshots", {}).get("M5")
+            hb_candle = str(hb_raw["datetime"].iloc[-1])
+
+            if hb_analysis.get("signal") in {"BUY", "SELL"} and hb_m5:
+                try:
+                    hb_plan = build_trade_plan(
+                        hb_analysis["signal"],
+                        hb_price,
+                        float(hb_m5["atr"]),
+                        float(st.session_state.paper_balance),
+                        float(risk_pct),
+                        instrument,
+                    )
+                    hb_day_pnl = (
+                        float(st.session_state.paper_balance)
+                        - float(st.session_state.paper_day_start_balance)
+                    )
+                    hb_ok, _ = risk_gate(
+                        float(st.session_state.paper_balance),
+                        hb_day_pnl,
+                        0,
+                        hb_plan,
+                        float(max_daily_loss_pct),
+                        int(max_open_positions),
+                        float(max_order_risk_pct),
+                        True,
+                        float(st.session_state.paper_day_start_balance),
+                    )
+                    if (
+                        hb_ok
+                        and st.session_state.last_auto_paper_candle.get(instrument.symbol)
+                        != hb_candle
+                    ):
+                        st.session_state.last_auto_paper_candle[instrument.symbol] = hb_candle
+                        open_paper(hb_plan, instrument)
+                except ValueError:
+                    pass
+
+        st.caption(
+            f"Paper heartbeat • {now_riyadh().strftime('%H:%M:%S')} • "
+            f"{'READY' if hb_feed.get('execution_ok') else 'BLOCKED'}"
+        )
+
+    _paper_heartbeat()
+else:
+    st.caption("Paper heartbeat متوقف. استخدم «تحديث البيانات الآن» للتحديث اليدوي.")
