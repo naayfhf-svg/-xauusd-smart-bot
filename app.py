@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.2.0-x10-longhistory"
+VERSION = "4.3.0-x10-research"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -1551,6 +1551,7 @@ def backtest_mtf(
     spec: InstrumentSpec,
     risk_pct: float = 0.5,
     cost_bps_roundtrip: float = 2.0,
+    research_variant: str = "STRICT_BOTH",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if len(raw) < 3500:
         return pd.DataFrame(), {
@@ -1611,6 +1612,16 @@ def backtest_mtf(
     ).reset_index(drop=True)
     m5_full["trend"] = m5_full.apply(row_trend, axis=1)
     m5_full = precompute_b2(m5_full)
+
+    # Research-only volatility regime built from PRIOR bars only.
+    m5_full["atr_pct"] = (m5_full["atr"] / m5_full["close"].replace(0, np.nan)) * 100.0
+    vol_window = 288 * 10
+    m5_full["atr_pct_q20"] = (
+        m5_full["atr_pct"].shift(1).rolling(vol_window, min_periods=288 * 3).quantile(0.20)
+    )
+    m5_full["atr_pct_q90"] = (
+        m5_full["atr_pct"].shift(1).rolling(vol_window, min_periods=288 * 3).quantile(0.90)
+    )
     m5_full["effective_time"] = m5_full["datetime"] + pd.Timedelta("5min")
 
     bt = m5_full[
@@ -1618,6 +1629,7 @@ def backtest_mtf(
             "effective_time", "datetime", "open", "high", "low", "close",
             "ema20", "ema50",
             "rsi", "adx", "atr", "momentum", "macd_hist", "trend",
+            "atr_pct", "atr_pct_q20", "atr_pct_q90",
             "b2_valid", "b2_side",
         ]
     ].copy()
@@ -1631,6 +1643,9 @@ def backtest_mtf(
             "close": "close_m5",
             "ema20": "ema20_m5",
             "ema50": "ema50_m5",
+            "atr_pct": "atr_pct_m5",
+            "atr_pct_q20": "atr_pct_q20_m5",
+            "atr_pct_q90": "atr_pct_q90_m5",
             "rsi": "rsi_m5",
             "adx": "adx_m5",
             "atr": "atr_m5",
@@ -1704,6 +1719,30 @@ def backtest_mtf(
         }
         b2 = {"valid": bool(row["b2_valid"]), "side": row["b2_side"]}
         signal, buy_score, sell_score, _ = score_signal(snaps, b2)
+
+        # Research variants affect backtests only, never the live decision engine.
+        entry_hour = int(pd.Timestamp(eval_time).hour)
+        atr_pct_now = float(row.get("atr_pct_m5", np.nan))
+        atr_q20 = float(row.get("atr_pct_q20_m5", np.nan))
+        atr_q90 = float(row.get("atr_pct_q90_m5", np.nan))
+
+        if research_variant == "SELL_ONLY":
+            if signal != "SELL":
+                signal = "WAIT"
+
+        elif research_variant == "SELL_SESSION":
+            if signal != "SELL" or not (6 <= entry_hour < 20):
+                signal = "WAIT"
+
+        elif research_variant == "SELL_SESSION_VOL":
+            regime_ok = (
+                finite(atr_pct_now)
+                and finite(atr_q20)
+                and finite(atr_q90)
+                and atr_q20 <= atr_pct_now <= atr_q90
+            )
+            if signal != "SELL" or not (6 <= entry_hour < 20) or not regime_ok:
+                signal = "WAIT"
 
         opened_this_bar = False
         if position is None and signal in {"BUY", "SELL"}:
@@ -1854,6 +1893,7 @@ def backtest_mtf(
     stats = _backtest_summary(df, initial_equity)
     stats["cost_bps_roundtrip"] = float(cost_bps_roundtrip)
     stats["split_time"] = split_time.isoformat()
+    stats["research_variant"] = research_variant
 
     in_df = df[df["segment"] == "IN"].copy()
     out_df = df[df["segment"] == "OUT"].copy()
@@ -1886,6 +1926,57 @@ def backtest_mtf(
     stats["normalized_out_of_sample"] = normalized_out
 
     return df, stats
+
+
+RESEARCH_VARIANTS = {
+    "STRICT_BOTH": "Baseline BUY + SELL",
+    "SELL_ONLY": "SELL only",
+    "SELL_SESSION": "SELL only + UTC 06:00–20:00",
+    "SELL_SESSION_VOL": "SELL only + UTC 06:00–20:00 + prior-only volatility filter",
+}
+
+
+def run_research_variants(
+    raw: pd.DataFrame,
+    spec: InstrumentSpec,
+    risk_pct: float,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for variant, description in RESEARCH_VARIANTS.items():
+        _, stats = backtest_mtf(
+            raw,
+            spec,
+            risk_pct=risk_pct,
+            cost_bps_roundtrip=2.0,
+            research_variant=variant,
+        )
+        norm = stats.get("normalized", {})
+        out = stats.get("normalized_out_of_sample", {})
+        rows.append(
+            {
+                "Variant": variant,
+                "Description": description,
+                "Trades": int(stats.get("trades", 0)),
+                "Norm PF": (
+                    math.inf
+                    if not math.isfinite(norm.get("profit_factor", 0.0))
+                    else round(norm.get("profit_factor", 0.0), 3)
+                ),
+                "Norm Avg R": round(norm.get("avg_r_net", 0.0), 4),
+                "Norm Net P&L": round(norm.get("net_pnl", 0.0), 2),
+                "Norm DD %": round(norm.get("max_dd_pct", 0.0), 2),
+                "OUT Trades": int(out.get("trades", 0)),
+                "OUT PF": (
+                    math.inf
+                    if not math.isfinite(out.get("profit_factor", 0.0))
+                    else round(out.get("profit_factor", 0.0), 3)
+                ),
+                "OUT Avg R": round(out.get("avg_r_net", 0.0), 4),
+                "OUT Net P&L": round(out.get("net_pnl", 0.0), 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
 
 # --------------------------- self test ------------------------
 def self_test() -> tuple[bool, str]:
@@ -2113,7 +2204,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD FINAL LONG-HISTORY • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
+    "X10 GOLD RESEARCH v4.3 • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -2691,11 +2782,10 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Final Research Audit — Long History X10")
+st.subheader("Final Research Audit — v4.3 Research Edition")
 st.caption(
-    "الاختبار النهائي لا يعتمد على آخر 5,000 شمعة فقط. يجلب تاريخ M5 طويل على دفعات، "
-    "ثم يفصل Broker-Capped عن Fixed-Risk Normalized ويختبر OUT 30% وتكاليف 2/5/10 bps. "
-    "Twelve Data يحد كل طلب إلى 5,000 نقطة، لذلك نقسم التاريخ تلقائيًا إلى نوافذ صغيرة."
+    "نسخة بحثية تقارن Baseline مع SELL-only وفلتر ساعات السيولة وفلتر التذبذب الماضي فقط. "
+    "لا تغيّر Live تلقائيًا، وأي Variant واعد يجب تأكيده لاحقًا على فترة زمنية مستقلة جديدة."
 )
 
 history_days = st.selectbox(
@@ -2734,6 +2824,7 @@ if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_
                     instrument,
                     risk_pct=float(risk_pct),
                     cost_bps_roundtrip=cost_bps,
+                    research_variant="STRICT_BOTH",
                 )
                 if cost_bps == 2.0:
                     base_trades = scenario_trades
@@ -2794,12 +2885,18 @@ if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_
                 history_days=int(history_meta.get("requested_days", history_days)),
                 history_bars=int(history_meta.get("bars", len(audit_raw))),
             )
+            variant_df = run_research_variants(
+                audit_raw,
+                instrument,
+                risk_pct=float(risk_pct),
+            )
             st.session_state.backtest = {
                 "trades": base_trades,
                 "stats": base_stats,
                 "cost_scenarios": cost_df,
                 "research_gate": gate,
                 "history_meta": history_meta,
+                "variant_comparison": variant_df,
             }
             st.session_state.research_gate = gate
 if st.session_state.backtest:
@@ -2872,6 +2969,14 @@ if st.session_state.backtest:
                 "Sizing asymmetry detected: متوسط R البسيط واتجاه العائد الموزون بالمخاطرة مختلفان. "
                 "راجع Max Qty Hits وRisk Utilization قبل الاعتماد على النتيجة."
             )
+
+        st.markdown("### Research Variant Comparison")
+        st.caption(
+            "لا نختار الفائز من هذه الشاشة فقط. الهدف كشف هل SELL-only أو الفلاتر تستحق اختبارًا مستقلاً."
+        )
+        variant_df = bt.get("variant_comparison", pd.DataFrame())
+        if isinstance(variant_df, pd.DataFrame) and not variant_df.empty:
+            st.dataframe(variant_df, hide_index=True, use_container_width=True)
 
         st.markdown("### Cost Stress Test")
         st.dataframe(
@@ -3004,7 +3109,7 @@ health_rows = [
     {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
     {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
     {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
-    {"Component": "Research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
+    {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
     {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
     {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
