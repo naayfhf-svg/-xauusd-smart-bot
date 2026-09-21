@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.3.0-x10-research"
+VERSION = "4.4.0-x10-optimized"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -345,7 +345,7 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
 def fetch_long_history(
     symbol: str,
     history_days: int = 180,
-    chunk_days: int = 16,
+    chunk_days: int = 17,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Fetch long M5 history using date windows small enough to stay below
@@ -1263,33 +1263,52 @@ def live_payload(
 # ---------------------- matched MTF backtest ------------------
 def feature_frame(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
     calc = add_indicators(frame).copy()
-    calc["trend"] = calc.apply(
-        lambda r: row_trend(r)
-        if all(finite(r.get(k)) for k in ("ema20", "ema50", "close"))
-        else "MIXED",
-        axis=1,
-    )
+
+    close = pd.to_numeric(calc["close"], errors="coerce")
+    ema20 = pd.to_numeric(calc["ema20"], errors="coerce")
+    ema50 = pd.to_numeric(calc["ema50"], errors="coerce")
+    ema100 = pd.to_numeric(calc["ema100"], errors="coerce")
+
+    valid = close.notna() & ema20.notna() & ema50.notna()
+    up = valid & (close > ema20) & (ema20 > ema50) & (ema100.isna() | (close > ema100))
+    down = valid & (close < ema20) & (ema20 < ema50) & (ema100.isna() | (close < ema100))
+
+    calc["trend"] = np.select([up, down], ["UP", "DOWN"], default="MIXED")
     calc["effective_time"] = calc["datetime"] + pd.Timedelta(rule)
     return calc
 
 
 def precompute_b2(frame: pd.DataFrame) -> pd.DataFrame:
+    """Vectorized b2_signal over the full M5 frame with identical lookback semantics."""
     out = frame.copy()
-    out["b2_valid"] = False
-    out["b2_side"] = None
-    out["b2_breakout"] = False
     lookback = 20
-    # b2_signal only needs a small trailing window. Avoid repeatedly copying
-    # the entire history, which matters when the audit runs several cost cases.
-    window_size = lookback + 3
-    for i in range(lookback + 2, len(out)):
-        start = max(0, i - window_size + 1)
-        sig = b2_signal(out.iloc[start : i + 1])
-        out.at[i, "b2_valid"] = bool(sig.get("valid"))
-        out.at[i, "b2_side"] = sig.get("side")
-        out.at[i, "b2_breakout"] = bool(sig.get("breakout"))
-    return out
+    retest_atr = 0.30
 
+    high = pd.to_numeric(out["high"], errors="coerce")
+    low = pd.to_numeric(out["low"], errors="coerce")
+    close = pd.to_numeric(out["close"], errors="coerce")
+    atr = pd.to_numeric(out["atr"], errors="coerce")
+
+    # At row i, b2_signal uses rows i-21..i-2 as history and row i-1 as breakout.
+    resistance = high.shift(2).rolling(lookback, min_periods=lookback).max()
+    support = low.shift(2).rolling(lookback, min_periods=lookback).min()
+    previous_close = close.shift(1)
+
+    eligible = pd.Series(np.arange(len(out)) >= lookback + 2, index=out.index)
+    atr_ok = atr.notna() & (atr > 0)
+    bullish_break = eligible & atr_ok & (previous_close > resistance)
+    bearish_break = eligible & atr_ok & (previous_close < support)
+
+    bullish_retest = bullish_break & (low <= resistance + atr * retest_atr) & (close > resistance)
+    bearish_retest = bearish_break & (high >= support - atr * retest_atr) & (close < support)
+
+    out["b2_valid"] = (bullish_retest | bearish_retest).fillna(False)
+    side = pd.Series([None] * len(out), index=out.index, dtype=object)
+    side.loc[bullish_retest.fillna(False)] = "BUY"
+    side.loc[bearish_retest.fillna(False)] = "SELL"
+    out["b2_side"] = side
+    out["b2_breakout"] = (bullish_break | bearish_break).fillna(False)
+    return out
 
 def _max_losing_streak(pnl: pd.Series) -> int:
     best = 0
@@ -1928,6 +1947,294 @@ def backtest_mtf(
     return df, stats
 
 
+
+# ---------------- optimized research engine ----------------
+def prepare_research_context(raw: pd.DataFrame) -> dict[str, Any]:
+    """Prepare indicators/MTF/B2/signals once and reuse them across all research runs."""
+    if len(raw) < 3500:
+        return {"ok": False, "warning": "الاختبار يحتاج تقريبًا 3500 شمعة M5 على الأقل"}
+
+    t0 = time.perf_counter()
+    base = raw.copy().reset_index(drop=True)
+    split_index = max(1, min(len(base) - 1, int(len(base) * 0.70)))
+    split_time = pd.Timestamp(base["datetime"].iloc[split_index])
+
+    tf_frames = {
+        "M15": (
+            base.set_index("datetime")[["open", "high", "low", "close"]]
+            .resample("15min", label="left", closed="left")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna().reset_index()
+        ),
+        "H1": (
+            base.set_index("datetime")[["open", "high", "low", "close"]]
+            .resample("1h", label="left", closed="left")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna().reset_index()
+        ),
+        "H4": (
+            base.set_index("datetime")[["open", "high", "low", "close"]]
+            .resample("4h", label="left", closed="left")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna().reset_index()
+        ),
+    }
+
+    features: dict[str, pd.DataFrame] = {}
+    for tf, frame in tf_frames.items():
+        f = feature_frame(frame, TF_RULES[tf])
+        keep = [
+            "effective_time", "datetime", "open", "high", "low", "close",
+            "ema20", "ema50", "ema100", "rsi", "adx", "atr", "momentum", "macd_hist", "trend",
+        ]
+        f = f[keep].dropna(subset=["rsi", "adx", "atr", "momentum", "macd_hist"])
+        suffix = tf.lower()
+        f = f.rename(columns={c: f"{c}_{suffix}" for c in f.columns if c != "effective_time"})
+        features[tf] = f.sort_values("effective_time").reset_index(drop=True)
+
+    m5 = add_indicators(base).dropna(
+        subset=["ema20", "ema50", "rsi", "atr", "macd_hist", "momentum", "adx"]
+    ).reset_index(drop=True)
+
+    close = pd.to_numeric(m5["close"], errors="coerce")
+    ema20 = pd.to_numeric(m5["ema20"], errors="coerce")
+    ema50 = pd.to_numeric(m5["ema50"], errors="coerce")
+    ema100 = pd.to_numeric(m5["ema100"], errors="coerce")
+    m5["trend"] = np.select(
+        [
+            (close > ema20) & (ema20 > ema50) & (ema100.isna() | (close > ema100)),
+            (close < ema20) & (ema20 < ema50) & (ema100.isna() | (close < ema100)),
+        ],
+        ["UP", "DOWN"],
+        default="MIXED",
+    )
+    m5 = precompute_b2(m5)
+
+    m5["atr_pct"] = (m5["atr"] / m5["close"].replace(0, np.nan)) * 100.0
+    vol_window = 288 * 10
+    m5["atr_pct_q20"] = m5["atr_pct"].shift(1).rolling(vol_window, min_periods=288 * 3).quantile(0.20)
+    m5["atr_pct_q90"] = m5["atr_pct"].shift(1).rolling(vol_window, min_periods=288 * 3).quantile(0.90)
+    m5["effective_time"] = m5["datetime"] + pd.Timedelta("5min")
+
+    bt = m5[[
+        "effective_time", "datetime", "close", "ema20", "ema50", "rsi", "adx", "atr",
+        "momentum", "macd_hist", "trend", "atr_pct", "atr_pct_q20", "atr_pct_q90",
+        "b2_valid", "b2_side",
+    ]].copy().rename(columns={
+        "datetime": "datetime_m5", "close": "close_m5", "ema20": "ema20_m5", "ema50": "ema50_m5",
+        "rsi": "rsi_m5", "adx": "adx_m5", "atr": "atr_m5", "momentum": "momentum_m5",
+        "macd_hist": "macd_hist_m5", "trend": "trend_m5", "atr_pct": "atr_pct_m5",
+        "atr_pct_q20": "atr_pct_q20_m5", "atr_pct_q90": "atr_pct_q90_m5",
+    }).sort_values("effective_time")
+
+    for tf in ("M15", "H1", "H4"):
+        bt = pd.merge_asof(
+            bt.sort_values("effective_time"), features[tf].sort_values("effective_time"),
+            on="effective_time", direction="backward",
+        )
+
+    bt = bt.dropna(subset=[
+        "trend_m5", "trend_m15", "trend_h1", "trend_h4", "close_m5", "ema20_m5", "ema50_m5",
+        "rsi_m5", "adx_m5", "atr_m5", "momentum_m5", "macd_hist_m5", "adx_m15", "adx_h1",
+        "close_h1", "ema100_h1",
+    ]).reset_index(drop=True)
+
+    adx_ok = np.maximum(bt["adx_m15"].astype(float), bt["adx_h1"].astype(float)) >= 20
+    buy_conditions = [
+        bt["trend_h4"].eq("UP"), bt["trend_h1"].eq("UP"), bt["trend_m15"].eq("UP"),
+        (bt["close_m5"] > bt["ema20_m5"]) & (bt["ema20_m5"] > bt["ema50_m5"]),
+        bt["close_h1"] > bt["ema100_h1"], bt["rsi_m5"].between(52, 68, inclusive="both"),
+        bt["momentum_m5"] > 0, bt["macd_hist_m5"] > 0, adx_ok,
+        bt["b2_valid"].astype(bool) & bt["b2_side"].eq("BUY"),
+    ]
+    sell_conditions = [
+        bt["trend_h4"].eq("DOWN"), bt["trend_h1"].eq("DOWN"), bt["trend_m15"].eq("DOWN"),
+        (bt["close_m5"] < bt["ema20_m5"]) & (bt["ema20_m5"] < bt["ema50_m5"]),
+        bt["close_h1"] < bt["ema100_h1"], bt["rsi_m5"].between(32, 48, inclusive="both"),
+        bt["momentum_m5"] < 0, bt["macd_hist_m5"] < 0, adx_ok,
+        bt["b2_valid"].astype(bool) & bt["b2_side"].eq("SELL"),
+    ]
+    buy_count = sum(c.astype(np.int8) for c in buy_conditions)
+    sell_count = sum(c.astype(np.int8) for c in sell_conditions)
+    bt["buy_score"] = (buy_count * 10).astype(np.int16)
+    bt["sell_score"] = (sell_count * 10).astype(np.int16)
+    bt["base_signal"] = np.select(
+        [buy_count.eq(10), sell_count.eq(10)], ["BUY", "SELL"], default="WAIT"
+    )
+    bt["entry_hour_utc"] = pd.to_datetime(bt["effective_time"], utc=True).dt.hour.astype(np.int8)
+    bt["regime_ok"] = (
+        bt["atr_pct_m5"].notna() & bt["atr_pct_q20_m5"].notna() & bt["atr_pct_q90_m5"].notna()
+        & (bt["atr_pct_m5"] >= bt["atr_pct_q20_m5"]) & (bt["atr_pct_m5"] <= bt["atr_pct_q90_m5"])
+    )
+
+    # effective_time is the next M5 bar, which is the execution/evaluation bar in the original engine.
+    execution = base[["datetime", "open", "high", "low", "close"]].rename(columns={
+        "datetime": "effective_time", "open": "open_exec", "high": "high_exec",
+        "low": "low_exec", "close": "close_exec",
+    })
+    bt = bt.merge(execution, on="effective_time", how="inner", validate="many_to_one")
+    bt = bt.sort_values("effective_time").reset_index(drop=True)
+
+    return {
+        "ok": True, "bt": bt, "split_time": split_time, "bars": int(len(base)),
+        "prepared_rows": int(len(bt)), "prepare_seconds": float(time.perf_counter() - t0),
+    }
+
+
+def _variant_signal(base_signal: str, hour: int, regime_ok: bool, variant: str) -> str:
+    if variant == "SELL_ONLY":
+        return "SELL" if base_signal == "SELL" else "WAIT"
+    if variant == "SELL_SESSION":
+        return "SELL" if base_signal == "SELL" and 6 <= hour < 20 else "WAIT"
+    if variant == "SELL_SESSION_VOL":
+        return "SELL" if base_signal == "SELL" and 6 <= hour < 20 and regime_ok else "WAIT"
+    return base_signal
+
+
+def simulate_prepared_research(
+    prepared: dict[str, Any], spec: InstrumentSpec, risk_pct: float,
+    cost_bps_roundtrip: float = 2.0, research_variant: str = "STRICT_BOTH",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not prepared.get("ok", False):
+        return pd.DataFrame(), {"trades": 0, "warning": prepared.get("warning", "prepare failed")}
+
+    bt = prepared["bt"]
+    split_time = pd.Timestamp(prepared["split_time"])
+    equity = 100_000.0
+    initial_equity = equity
+    trades: list[dict[str, Any]] = []
+    position: dict[str, Any] | None = None
+    weekday_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+
+    for row in bt.itertuples(index=False, name="BT"):
+        eval_time = pd.Timestamp(row.effective_time)
+        signal = _variant_signal(str(row.base_signal), int(row.entry_hour_utc), bool(row.regime_ok), research_variant)
+        opened_this_bar = False
+
+        if position is None and signal in {"BUY", "SELL"}:
+            try:
+                plan = build_trade_plan(signal, float(row.open_exec), float(row.atr_m5), equity, risk_pct, spec)
+            except ValueError:
+                continue
+            position = {
+                "side": signal, "entry": plan["entry_reference"], "stop": plan["stop_loss"],
+                "stop_initial": plan["stop_loss"], "tp1": plan["take_profit_1"], "tp2": plan["take_profit_2"],
+                "risk": plan["estimated_risk"], "risk_budget": plan["risk_budget"],
+                "actual_risk_pct": plan["actual_risk_pct"], "raw_qty": plan["raw_qty"],
+                "stepped_qty": plan["stepped_qty"], "max_qty_hit": plan["max_qty_hit"], "qty": plan["qty"],
+                "point_value": spec.point_value, "remaining": 1.0, "realized_r": 0.0, "tp1_hit": False,
+                "opened": eval_time, "buy_score": int(row.buy_score), "sell_score": int(row.sell_score),
+            }
+            opened_this_bar = True
+
+        if position is None:
+            continue
+
+        hi, lo = float(row.high_exec), float(row.low_exec)
+        side = position["side"]
+        d = abs(position["entry"] - position["stop_initial"])
+        if d <= 0:
+            position = None
+            continue
+
+        closed=False; exit_price=None; exit_reason=None; total_r=None
+        if side == "BUY":
+            if lo <= position["stop"]:
+                total_r = position["realized_r"] + position["remaining"] * ((position["stop"]-position["entry"])/d)
+                exit_price, exit_reason, closed = position["stop"], "STOP", True
+            else:
+                if not position["tp1_hit"] and hi >= position["tp1"]:
+                    position["tp1_hit"] = True; position["remaining"] = 0.5; position["realized_r"] = 0.5; position["stop"] = position["entry"]
+                if position["tp1_hit"] and hi >= position["tp2"]:
+                    total_r = position["realized_r"] + 0.5 * ((position["tp2"]-position["entry"])/d)
+                    exit_price, exit_reason, closed = position["tp2"], "TP2", True
+        else:
+            if hi >= position["stop"]:
+                total_r = position["realized_r"] + position["remaining"] * ((position["entry"]-position["stop"])/d)
+                exit_price, exit_reason, closed = position["stop"], "STOP", True
+            else:
+                if not position["tp1_hit"] and lo <= position["tp1"]:
+                    position["tp1_hit"] = True; position["remaining"] = 0.5; position["realized_r"] = 0.5; position["stop"] = position["entry"]
+                if position["tp1_hit"] and lo <= position["tp2"]:
+                    total_r = position["realized_r"] + 0.5 * ((position["entry"]-position["tp2"])/d)
+                    exit_price, exit_reason, closed = position["tp2"], "TP2", True
+
+        if closed and total_r is not None:
+            gross = float(total_r * position["risk"])
+            notional = abs(position["entry"] * position["qty"] * position["point_value"])
+            costs = float(notional * (cost_bps_roundtrip / 10_000.0))
+            pnl = float(gross - costs); equity += pnl
+            close_time = eval_time + pd.Timedelta(minutes=5)
+            duration_min = max(5.0, (close_time - pd.Timestamp(position["opened"])).total_seconds()/60.0)
+            r_net = pnl / position["risk"] if position["risk"] > 0 else 0.0
+            opened_ts = pd.Timestamp(position["opened"])
+            trades.append({
+                "opened": opened_ts, "closed": close_time, "side": side,
+                "segment": "IN" if opened_ts < split_time else "OUT",
+                "entry_hour_utc": int(opened_ts.hour), "entry_weekday": weekday_map[int(opened_ts.dayofweek)],
+                "duration_min": float(duration_min), "entry": float(position["entry"]), "exit": float(exit_price),
+                "stop_distance": float(d), "point_value": float(position["point_value"]),
+                "R_gross": float(total_r), "R_net": float(r_net), "risk_money": float(position["risk"]),
+                "risk_budget": float(position["risk_budget"]),
+                "risk_utilization_pct": float(position["risk"])/float(position["risk_budget"])*100.0 if float(position["risk_budget"])>0 else 0.0,
+                "actual_risk_pct": float(position["actual_risk_pct"]), "raw_qty": float(position["raw_qty"]),
+                "stepped_qty": float(position["stepped_qty"]), "qty": float(position["qty"]),
+                "max_qty_hit": bool(position["max_qty_hit"]), "gross_pnl": gross, "costs": costs, "PnL": pnl,
+                "equity": float(equity), "reason": exit_reason, "same_bar_exit": bool(opened_this_bar),
+            })
+            position = None
+
+    if not trades:
+        return pd.DataFrame(), {"trades":0,"warning":"لم ينتج الاختبار صفقات","research_variant":research_variant}
+
+    df = pd.DataFrame(trades).sort_values("opened").reset_index(drop=True)
+    stats = _backtest_summary(df, initial_equity)
+    stats["cost_bps_roundtrip"] = float(cost_bps_roundtrip)
+    stats["split_time"] = split_time.isoformat()
+    stats["research_variant"] = research_variant
+    in_df = df[df["segment"]=="IN"].copy(); out_df = df[df["segment"]=="OUT"].copy()
+    stats["in_sample"] = _backtest_summary(in_df, initial_equity)
+    stats["out_of_sample"] = _backtest_summary(out_df, initial_equity)
+    stats["side_stats"] = _group_audit(df, "side")
+    stats["hour_stats"] = _group_audit(df, "entry_hour_utc")
+    stats["day_stats"] = _group_audit(df, "entry_weekday")
+    _, stats["normalized"] = _fixed_risk_normalized(df, initial_equity, risk_pct, cost_bps_roundtrip)
+    _, stats["normalized_in_sample"] = _fixed_risk_normalized(in_df, initial_equity, risk_pct, cost_bps_roundtrip)
+    _, stats["normalized_out_of_sample"] = _fixed_risk_normalized(out_df, initial_equity, risk_pct, cost_bps_roundtrip)
+    return df, stats
+
+
+def _research_robustness(trades: pd.DataFrame) -> dict[str, Any]:
+    """Extra diagnostics: chronological quarters, bootstrap mean-R CI, and cost break-even."""
+    if trades.empty:
+        return {"quarters": [], "bootstrap_low": 0.0, "bootstrap_high": 0.0, "cost_break_even_bps": 0.0}
+
+    ordered = trades.sort_values("opened").reset_index(drop=True)
+    quarter_rows=[]
+    for q, part in enumerate(np.array_split(ordered, 4), start=1):
+        ss=_backtest_summary(part)
+        quarter_rows.append({
+            "Quarter": f"Q{q}", "Trades": ss["trades"], "PF": math.inf if not math.isfinite(ss["profit_factor"]) else round(ss["profit_factor"],2),
+            "Avg R": round(ss["avg_r_net"],3), "Net P&L": round(ss["net_pnl"],2), "Max DD %": round(ss["max_dd_pct"],2),
+        })
+
+    r = pd.to_numeric(ordered["R_net"], errors="coerce").dropna().to_numpy(float)
+    if len(r):
+        rng=np.random.default_rng(44)
+        means=rng.choice(r, size=(1000,len(r)), replace=True).mean(axis=1)
+        low, high = np.quantile(means,[0.025,0.975])
+    else:
+        low=high=0.0
+
+    gross = float(pd.to_numeric(ordered["gross_pnl"], errors="coerce").fillna(0).sum())
+    # costs = notional * bps / 10000, so derive notional from recorded 2bps-like rows safely.
+    costs = pd.to_numeric(ordered["costs"], errors="coerce").fillna(0.0)
+    # Current rows may come from any cost. Infer aggregate notional from per-row entry*qty*point value.
+    notional = (ordered["entry"].abs() * ordered["qty"].abs() * ordered["point_value"].abs()).sum()
+    break_even = (gross / notional * 10000.0) if notional > 0 else 0.0
+    return {"quarters": quarter_rows, "bootstrap_low": float(low), "bootstrap_high": float(high), "cost_break_even_bps": float(break_even)}
+
+
 RESEARCH_VARIANTS = {
     "STRICT_BOTH": "Baseline BUY + SELL",
     "SELL_ONLY": "SELL only",
@@ -1940,41 +2247,28 @@ def run_research_variants(
     raw: pd.DataFrame,
     spec: InstrumentSpec,
     risk_pct: float,
+    prepared: dict[str, Any] | None = None,
+    baseline_stats: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
+    if prepared is None:
+        prepared = prepare_research_context(raw)
     rows: list[dict[str, Any]] = []
     for variant, description in RESEARCH_VARIANTS.items():
-        _, stats = backtest_mtf(
-            raw,
-            spec,
-            risk_pct=risk_pct,
-            cost_bps_roundtrip=2.0,
-            research_variant=variant,
-        )
-        norm = stats.get("normalized", {})
-        out = stats.get("normalized_out_of_sample", {})
-        rows.append(
-            {
-                "Variant": variant,
-                "Description": description,
-                "Trades": int(stats.get("trades", 0)),
-                "Norm PF": (
-                    math.inf
-                    if not math.isfinite(norm.get("profit_factor", 0.0))
-                    else round(norm.get("profit_factor", 0.0), 3)
-                ),
-                "Norm Avg R": round(norm.get("avg_r_net", 0.0), 4),
-                "Norm Net P&L": round(norm.get("net_pnl", 0.0), 2),
-                "Norm DD %": round(norm.get("max_dd_pct", 0.0), 2),
-                "OUT Trades": int(out.get("trades", 0)),
-                "OUT PF": (
-                    math.inf
-                    if not math.isfinite(out.get("profit_factor", 0.0))
-                    else round(out.get("profit_factor", 0.0), 3)
-                ),
-                "OUT Avg R": round(out.get("avg_r_net", 0.0), 4),
-                "OUT Net P&L": round(out.get("net_pnl", 0.0), 2),
-            }
-        )
+        if variant == "STRICT_BOTH" and baseline_stats:
+            stats = baseline_stats
+        else:
+            _, stats = simulate_prepared_research(
+                prepared, spec, risk_pct=risk_pct, cost_bps_roundtrip=2.0, research_variant=variant
+            )
+        norm = stats.get("normalized", {}); out = stats.get("normalized_out_of_sample", {})
+        rows.append({
+            "Variant": variant, "Description": description, "Trades": int(stats.get("trades",0)),
+            "Norm PF": math.inf if not math.isfinite(norm.get("profit_factor",0.0)) else round(norm.get("profit_factor",0.0),3),
+            "Norm Avg R": round(norm.get("avg_r_net",0.0),4), "Norm Net P&L": round(norm.get("net_pnl",0.0),2),
+            "Norm DD %": round(norm.get("max_dd_pct",0.0),2), "OUT Trades": int(out.get("trades",0)),
+            "OUT PF": math.inf if not math.isfinite(out.get("profit_factor",0.0)) else round(out.get("profit_factor",0.0),3),
+            "OUT Avg R": round(out.get("avg_r_net",0.0),4), "OUT Net P&L": round(out.get("net_pnl",0.0),2),
+        })
     return pd.DataFrame(rows)
 
 
@@ -2072,6 +2366,14 @@ def self_test() -> tuple[bool, str]:
             cost_bps_roundtrip=0.0,
         )
         assert normalized_audit["trades"] == 4
+
+        # Verify vectorized B2 matches the reference function on every eligible row.
+        b2_frame = calc.tail(80).copy().reset_index(drop=True)
+        b2_fast = precompute_b2(b2_frame)
+        for i in range(22, len(b2_frame)):
+            reference = b2_signal(b2_frame.iloc[max(0, i - 22): i + 1])
+            assert bool(b2_fast.loc[i, "b2_valid"]) == bool(reference.get("valid"))
+            assert b2_fast.loc[i, "b2_side"] == reference.get("side")
 
         return True, "OK"
     except Exception as exc:
@@ -2204,7 +2506,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD RESEARCH v4.3 • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
+    "X10 GOLD RESEARCH v4.4 OPTIMIZED • MTF M15/H1/H4 • M5 Breakout/Retest 20 • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -2782,10 +3084,10 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- backtest --------------------------
-st.subheader("Final Research Audit — v4.3 Research Edition")
+st.subheader("Final Research Audit — v4.4 Optimized")
 st.caption(
-    "نسخة بحثية تقارن Baseline مع SELL-only وفلتر ساعات السيولة وفلتر التذبذب الماضي فقط. "
-    "لا تغيّر Live تلقائيًا، وأي Variant واعد يجب تأكيده لاحقًا على فترة زمنية مستقلة جديدة."
+    "نفس قواعد v4.3 بدون تخفيف للاستراتيجية. المؤشرات وMTF وB2 تُحسب مرة واحدة فقط، "
+    "ثم يعاد استخدام نفس السياق لكل Cost Stress وResearch Variant، مع فحص ثبات إضافي."
 )
 
 history_days = st.selectbox(
@@ -2794,111 +3096,86 @@ history_days = st.selectbox(
     index=1,
     format_func=lambda d: f"{d} يوم" if d != 365 else "365 يوم (سنة)",
 )
-estimated_requests = math.ceil(int(history_days) / 16)
+estimated_requests = math.ceil(int(history_days) / 17)
 st.caption(
     f"متوقع تقريبًا {estimated_requests} طلب تاريخي. على الخطة المجانية قد ينتظر التطبيق "
     "إعادة ضبط الرصيد للدقيقة تلقائيًا إذا لزم."
 )
 
 if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_container_width=True):
-    with st.spinner("جلب التاريخ الطويل ثم تشغيل الاختبارات... قد يستغرق بعض الوقت لأول مرة."):
+    total_t0 = time.perf_counter()
+    with st.status("تشغيل Research Audit المحسّن...", expanded=True) as audit_status:
+        st.write("1/4 • جلب التاريخ الطويل")
+        fetch_t0 = time.perf_counter()
         try:
             audit_raw, history_meta = fetch_long_history(
-                instrument.symbol,
-                history_days=int(history_days),
-                chunk_days=16,
+                instrument.symbol, history_days=int(history_days), chunk_days=17,
             )
         except Exception as exc:
             st.error(f"تعذر جلب التاريخ الطويل: {exc}")
-            audit_raw = pd.DataFrame()
-            history_meta = {}
-
-        scenario_rows: list[dict[str, Any]] = []
-        base_trades = pd.DataFrame()
-        base_stats: dict[str, Any] = {}
+            audit_raw = pd.DataFrame(); history_meta = {}
+        fetch_seconds = time.perf_counter() - fetch_t0
 
         if not audit_raw.empty:
-            for cost_bps in (2.0, 5.0, 10.0):
-                scenario_trades, scenario_stats = backtest_mtf(
-                    audit_raw,
-                    instrument,
-                    risk_pct=float(risk_pct),
-                    cost_bps_roundtrip=cost_bps,
-                    research_variant="STRICT_BOTH",
+            st.write("2/4 • تجهيز المؤشرات + MTF + B2 مرة واحدة")
+            prepared = prepare_research_context(audit_raw)
+            if not prepared.get("ok", False):
+                st.error(prepared.get("warning", "تعذر تجهيز الاختبار"))
+            else:
+                scenario_rows=[]; base_trades=pd.DataFrame(); base_stats={}
+                st.write(f"تم تجهيز {prepared.get('prepared_rows',0):,} صف خلال {prepared.get('prepare_seconds',0):.1f} ثانية")
+                audit_t0=time.perf_counter()
+
+                st.write("3/4 • Cost Stress 2 / 5 / 10 bps")
+                for cost_bps in (2.0,5.0,10.0):
+                    scenario_trades, scenario_stats = simulate_prepared_research(
+                        prepared, instrument, risk_pct=float(risk_pct), cost_bps_roundtrip=cost_bps,
+                        research_variant="STRICT_BOTH",
+                    )
+                    if cost_bps == 2.0:
+                        base_trades=scenario_trades; base_stats=scenario_stats
+                    norm=scenario_stats.get("normalized",{})
+                    if scenario_stats.get("trades",0):
+                        scenario_rows.append({
+                            "Round-trip cost (bps)":cost_bps, "Trades":scenario_stats["trades"],
+                            "Win Rate %":round(scenario_stats["win_rate"],1),
+                            "Profit Factor":math.inf if not math.isfinite(scenario_stats["profit_factor"]) else round(scenario_stats["profit_factor"],2),
+                            "Net P&L":round(scenario_stats["net_pnl"],2), "Max DD %":round(scenario_stats["max_dd_pct"],2),
+                            "Avg Net R":round(scenario_stats["avg_r_net"],3),
+                            "Risk-Weighted Exp R":round(scenario_stats["risk_weighted_expectancy_r"],3),
+                            "Avg Risk $":round(scenario_stats["avg_risk_money"],2), "Max Qty Hit %":round(scenario_stats["max_qty_hit_pct"],1),
+                            "Normalized PF":math.inf if not math.isfinite(norm.get("profit_factor",0.0)) else round(norm.get("profit_factor",0.0),2),
+                            "Normalized Net P&L":round(norm.get("net_pnl",0.0),2), "Normalized Avg R":round(norm.get("avg_r_net",0.0),3),
+                            "Normalized Max DD %":round(norm.get("max_dd_pct",0.0),2),
+                        })
+                    else:
+                        scenario_rows.append({"Round-trip cost (bps)":cost_bps,"Trades":0,"Win Rate %":0.0,"Profit Factor":0.0,"Net P&L":0.0,"Max DD %":0.0,"Avg Net R":0.0,"Risk-Weighted Exp R":0.0,"Avg Risk $":0.0,"Max Qty Hit %":0.0,"Normalized PF":0.0,"Normalized Net P&L":0.0,"Normalized Avg R":0.0,"Normalized Max DD %":0.0})
+
+                cost_df=pd.DataFrame(scenario_rows)
+                st.write("4/4 • Variants + robustness diagnostics")
+                variant_df=run_research_variants(
+                    audit_raw, instrument, risk_pct=float(risk_pct), prepared=prepared, baseline_stats=base_stats,
                 )
-                if cost_bps == 2.0:
-                    base_trades = scenario_trades
-                    base_stats = scenario_stats
+                gate=_research_gate(
+                    base_stats,cost_df,research_context,
+                    history_days=int(history_meta.get("requested_days",history_days)),
+                    history_bars=int(history_meta.get("bars",len(audit_raw))),
+                )
+                robustness=_research_robustness(base_trades)
+                audit_seconds=time.perf_counter()-audit_t0; total_seconds=time.perf_counter()-total_t0
+                performance_meta={
+                    "fetch_seconds":float(fetch_seconds), "prepare_seconds":float(prepared.get("prepare_seconds",0.0)),
+                    "audit_seconds":float(audit_seconds), "total_seconds":float(total_seconds),
+                    "prepared_rows":int(prepared.get("prepared_rows",0)),
+                }
+                st.session_state.backtest={
+                    "trades":base_trades,"stats":base_stats,"cost_scenarios":cost_df,"research_gate":gate,
+                    "history_meta":history_meta,"variant_comparison":variant_df,"performance_meta":performance_meta,
+                    "robustness":robustness,
+                }
+                st.session_state.research_gate=gate
+                audit_status.update(label=f"اكتمل Research Audit خلال {total_seconds:.1f} ثانية",state="complete",expanded=False)
 
-                if scenario_stats.get("trades", 0):
-                    scenario_rows.append(
-                        {
-                            "Round-trip cost (bps)": cost_bps,
-                            "Trades": scenario_stats["trades"],
-                            "Win Rate %": round(scenario_stats["win_rate"], 1),
-                            "Profit Factor": (
-                                math.inf
-                                if not math.isfinite(scenario_stats["profit_factor"])
-                                else round(scenario_stats["profit_factor"], 2)
-                            ),
-                            "Net P&L": round(scenario_stats["net_pnl"], 2),
-                            "Max DD %": round(scenario_stats["max_dd_pct"], 2),
-                            "Avg Net R": round(scenario_stats["avg_r_net"], 3),
-                            "Risk-Weighted Exp R": round(scenario_stats["risk_weighted_expectancy_r"], 3),
-                            "Avg Risk $": round(scenario_stats["avg_risk_money"], 2),
-                            "Max Qty Hit %": round(scenario_stats["max_qty_hit_pct"], 1),
-                            "Normalized PF": (
-                                math.inf
-                                if not math.isfinite(scenario_stats["normalized"]["profit_factor"])
-                                else round(scenario_stats["normalized"]["profit_factor"], 2)
-                            ),
-                            "Normalized Net P&L": round(scenario_stats["normalized"]["net_pnl"], 2),
-                            "Normalized Avg R": round(scenario_stats["normalized"]["avg_r_net"], 3),
-                            "Normalized Max DD %": round(scenario_stats["normalized"]["max_dd_pct"], 2),
-                        }
-                    )
-                else:
-                    scenario_rows.append(
-                        {
-                            "Round-trip cost (bps)": cost_bps,
-                            "Trades": 0,
-                            "Win Rate %": 0.0,
-                            "Profit Factor": 0.0,
-                            "Net P&L": 0.0,
-                            "Max DD %": 0.0,
-                            "Avg Net R": 0.0,
-                            "Risk-Weighted Exp R": 0.0,
-                            "Avg Risk $": 0.0,
-                            "Max Qty Hit %": 0.0,
-                            "Normalized PF": 0.0,
-                            "Normalized Net P&L": 0.0,
-                            "Normalized Avg R": 0.0,
-                            "Normalized Max DD %": 0.0,
-                        }
-                    )
-
-            cost_df = pd.DataFrame(scenario_rows)
-            gate = _research_gate(
-                base_stats,
-                cost_df,
-                research_context,
-                history_days=int(history_meta.get("requested_days", history_days)),
-                history_bars=int(history_meta.get("bars", len(audit_raw))),
-            )
-            variant_df = run_research_variants(
-                audit_raw,
-                instrument,
-                risk_pct=float(risk_pct),
-            )
-            st.session_state.backtest = {
-                "trades": base_trades,
-                "stats": base_stats,
-                "cost_scenarios": cost_df,
-                "research_gate": gate,
-                "history_meta": history_meta,
-                "variant_comparison": variant_df,
-            }
-            st.session_state.research_gate = gate
 if st.session_state.backtest:
     bt = st.session_state.backtest
     stats = bt["stats"]
@@ -2919,6 +3196,16 @@ if st.session_state.backtest:
             st.caption(
                 f"History: {hmeta['first_bar']} → {hmeta['last_bar']}"
             )
+
+        perf = bt.get("performance_meta", {})
+        if perf:
+            st.markdown("### Audit Performance")
+            mini_grid([
+                ("Fetch", f"{perf.get('fetch_seconds',0.0):.1f}s", ""),
+                ("Prepare Once", f"{perf.get('prepare_seconds',0.0):.1f}s", "ok"),
+                ("All Tests", f"{perf.get('audit_seconds',0.0):.1f}s", ""),
+                ("Total", f"{perf.get('total_seconds',0.0):.1f}s", "ok"),
+            ], "tf-grid")
 
         mini_grid(
             [
@@ -2969,6 +3256,21 @@ if st.session_state.backtest:
                 "Sizing asymmetry detected: متوسط R البسيط واتجاه العائد الموزون بالمخاطرة مختلفان. "
                 "راجع Max Qty Hits وRisk Utilization قبل الاعتماد على النتيجة."
             )
+
+        robustness = bt.get("robustness", {})
+        if robustness:
+            st.markdown("### Robustness Diagnostics")
+            low = robustness.get("bootstrap_low",0.0); high = robustness.get("bootstrap_high",0.0)
+            be = robustness.get("cost_break_even_bps",0.0)
+            mini_grid([
+                ("Bootstrap Avg-R 95% Low", f"{low:.3f}R", "ok" if low > 0 else "bad"),
+                ("Bootstrap Avg-R 95% High", f"{high:.3f}R", "ok" if high > 0 else "bad"),
+                ("Cost Break-even", f"{be:.2f} bps RT", "ok" if be >= 10 else "wait"),
+            ], "tf-grid")
+            qdf = pd.DataFrame(robustness.get("quarters", []))
+            if not qdf.empty:
+                st.caption("تقسيم زمني إلى 4 أرباع متتالية لاختبار ثبات النتيجة عبر الزمن.")
+                st.dataframe(qdf, hide_index=True, use_container_width=True)
 
         st.markdown("### Research Variant Comparison")
         st.caption(
