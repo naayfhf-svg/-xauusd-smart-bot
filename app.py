@@ -7,6 +7,8 @@ import math
 import os
 import time
 import uuid
+import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -25,7 +27,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.8.1-x10-near-entry-watch"
+VERSION = "4.8.2-x10-api-safe"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -240,6 +242,62 @@ if st.session_state.get("research_gate") is None:
         "reasons": ["Research Gate غير مهيأ في هذه الجلسة"],
     }
 
+# -------------------- Twelve Data API budget -------------------
+@st.cache_resource
+def td_runtime() -> dict[str, Any]:
+    return {
+        "lock": threading.Lock(),
+        "calls": deque(),
+        "market_backup": {},
+        "quote_backup": {},
+    }
+
+
+def td_request_budget(limit: int = 7, window_seconds: int = 60) -> tuple[bool, int]:
+    """
+    Keep one credit in reserve on plans that allow 8 credits/min.
+    Shared across Streamlit reruns through cache_resource.
+    """
+    runtime = td_runtime()
+    now = time.monotonic()
+
+    with runtime["lock"]:
+        calls = runtime["calls"]
+        while calls and now - calls[0] >= window_seconds:
+            calls.popleft()
+
+        if len(calls) >= limit:
+            wait = max(1, int(window_seconds - (now - calls[0]) + 1))
+            return False, wait
+
+        calls.append(now)
+        return True, 0
+
+
+def td_rate_limit_text(wait_seconds: int | None = None) -> str:
+    if wait_seconds:
+        return (
+            f"تم إيقاف طلبات Twelve Data مؤقتًا لحماية رصيد API. "
+            f"سيُتاح طلب جديد تقريبًا خلال {wait_seconds} ثانية."
+        )
+    return (
+        "وصلنا إلى حد Twelve Data للدقيقة الحالية. "
+        "سيحاول النظام تلقائيًا عند تجدد الرصيد."
+    )
+
+
+def td_is_rate_limit_message(value: Any) -> bool:
+    text = str(value).lower()
+    return (
+        "api credits" in text
+        or "credit" in text
+        or "rate limit" in text
+        or "too many requests" in text
+        or "current limit" in text
+        or "429" in text
+    )
+
+
 # -------------------------- data feed -------------------------
 def normalize_ohlcv(values: Any) -> pd.DataFrame:
     if not isinstance(values, list) or not values:
@@ -285,11 +343,20 @@ def resample_closed(frame: pd.DataFrame, rule: str, as_of: pd.Timestamp | None =
     return out[out["datetime"] + pd.Timedelta(rule) <= cutoff].reset_index(drop=True)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=55, show_spinner=False)
 def fetch_market(symbol: str, outputsize: int = 5000) -> tuple[pd.DataFrame, str]:
     key = secret("TWELVE_DATA_API_KEY")
     if not key:
         return pd.DataFrame(), "أضف TWELVE_DATA_API_KEY في Secrets"
+
+    allowed, wait_seconds = td_request_budget()
+    runtime = td_runtime()
+    if not allowed:
+        backup = runtime["market_backup"].get(symbol)
+        if isinstance(backup, pd.DataFrame) and not backup.empty:
+            return backup.copy(), td_rate_limit_text(wait_seconds)
+        return pd.DataFrame(), td_rate_limit_text(wait_seconds)
+
     params = {
         "symbol": symbol,
         "interval": "5min",
@@ -303,19 +370,39 @@ def fetch_market(symbol: str, outputsize: int = 5000) -> tuple[pd.DataFrame, str
     except Exception as exc:
         return pd.DataFrame(), f"خطأ اتصال بمصدر البيانات: {exc}"
     if "values" not in payload:
-        return pd.DataFrame(), str(payload.get("message") or payload)
+        message = str(payload.get("message") or payload)
+        if td_is_rate_limit_message(message):
+            backup = runtime["market_backup"].get(symbol)
+            if isinstance(backup, pd.DataFrame) and not backup.empty:
+                return backup.copy(), td_rate_limit_text()
+            return pd.DataFrame(), td_rate_limit_text()
+        return pd.DataFrame(), message
+
     frame = closed_m5(normalize_ohlcv(payload["values"]))
     if frame.empty:
         return pd.DataFrame(), "تم الاتصال بالمصدر لكن لم تصل شموع صالحة"
+
+    runtime["market_backup"][symbol] = frame.copy()
     return frame, "OK"
 
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_quote(symbol: str) -> dict[str, Any]:
     """Analysis/Paper quote. Live execution uses the broker quote, not this quote."""
     key = secret("TWELVE_DATA_API_KEY")
     if not key:
         return {"connected": False, "error": "TWELVE_DATA_API_KEY missing"}
+
+    allowed, wait_seconds = td_request_budget()
+    runtime = td_runtime()
+    if not allowed:
+        return {
+            "connected": False,
+            "error": td_rate_limit_text(wait_seconds),
+            "rate_guard": True,
+            "retry_after_seconds": wait_seconds,
+        }
+
     try:
         response = requests.get(
             QUOTE_URL,
@@ -339,7 +426,7 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
     base = {"market_open": market_open, "raw": payload}
 
     if finite(bid) and finite(ask) and float(ask) >= float(bid):
-        return {
+        result = {
             **base,
             "connected": True,
             "bid": float(bid),
@@ -347,8 +434,11 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
             "last": float(last) if finite(last) else (float(bid) + float(ask)) / 2,
             "spread": float(ask) - float(bid),
         }
+        runtime["quote_backup"][symbol] = dict(result)
+        return result
+
     if finite(last):
-        return {
+        result = {
             **base,
             "connected": True,
             "bid": None,
@@ -356,7 +446,18 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
             "last": float(last),
             "spread": None,
         }
-    return {**base, "connected": False, "error": str(payload.get("message") or "No quote")}
+        runtime["quote_backup"][symbol] = dict(result)
+        return result
+
+    message = str(payload.get("message") or "No quote")
+    if td_is_rate_limit_message(message):
+        return {
+            **base,
+            "connected": False,
+            "error": td_rate_limit_text(),
+            "rate_guard": True,
+        }
+    return {**base, "connected": False, "error": message}
 
 
 
@@ -3379,10 +3480,17 @@ with st.sidebar.expander("إعدادات المخاطر والتحديث", expan
         value=st.session_state.auto_refresh,
         help="يحدّث محرك Paper داخل Fragment بدون إعادة تحميل الصفحة كاملة",
     )
-    refresh_seconds = st.slider("ثواني heartbeat", 30, 120, 30, step=15)
+    refresh_seconds = st.slider(
+        "ثواني heartbeat",
+        60,
+        180,
+        60,
+        step=15,
+        help="60 ثانية أو أكثر موصى بها مع خطة Twelve Data المجانية (8 credits/min).",
+    )
 
 if not st.session_state.auto_refresh:
-    refresh_seconds = 30
+    refresh_seconds = 60
 
 live_unlocked = truthy(secret("LIVE_TRADING_ENABLED", "false"))
 automation_backend_ready = truthy(secret("AUTOMATION_BACKEND_READY", "false"))
@@ -3415,7 +3523,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.8 PAPER FORWARD • live-market forward test • "
+    "X10 GOLD v4.8.2 API-SAFE PAPER FORWARD • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3423,8 +3531,16 @@ raw, data_status = fetch_market(instrument.symbol)
 if raw.empty:
     st.error("مصدر البيانات غير جاهز")
     st.info(data_status)
-    st.code('TWELVE_DATA_API_KEY = "ضع_المفتاح_هنا"', language="toml")
+    if not secret("TWELVE_DATA_API_KEY"):
+        st.code('TWELVE_DATA_API_KEY = "ضع_المفتاح_هنا"', language="toml")
+    else:
+        st.caption(
+            "المفتاح موجود. إذا كانت المشكلة حد API، اترك Auto Paper Forward يعمل "
+            "وسيعاود المحرك الطلب تلقائيًا بعد تجدد رصيد الدقيقة."
+        )
     st.stop()
+elif data_status != "OK":
+    st.warning(data_status)
 
 quality = data_quality(raw)
 quote = fetch_quote(instrument.symbol)
@@ -5167,7 +5283,8 @@ market_label = (
 health_rows = [
     {"Component": "Engine self-test", "Status": "ONLINE"},
     {"Component": "Analysis market data", "Status": "ONLINE" if not raw.empty else "BLOCKED"},
-    {"Component": "Paper quote API", "Status": "ONLINE" if quote.get("connected") else "CHECK"},
+    {"Component": "Paper quote API", "Status": "ONLINE" if quote.get("connected") else ("RATE GUARD" if quote.get("rate_guard") else "CHECK")},
+    {"Component": "Twelve Data budget", "Status": "PROTECTED (≤7/min)"},
     {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
     {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
     {"Component": "Paper engine", "Status": "ONLINE"},
@@ -5209,7 +5326,7 @@ with st.expander("Decision Log", expanded=False):
         st.info("لا يوجد سجل بعد")
 
 st.info(
-    "FINAL SAFETY v4.8.1: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+    "FINAL SAFETY v4.8.2: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
     "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
     "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
     "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
