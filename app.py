@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.6.0-x10-walkforward"
+VERSION = "4.6.1-x10-walkforward-sessionless"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -4326,7 +4326,7 @@ else:
 
 # ------------------- v4.6 walk-forward research lab -------------------
 st.divider()
-st.subheader("Walk-Forward Research Lab — v4.6")
+st.subheader("Walk-Forward Research Lab — v4.6.1")
 st.caption(
     "بعد فشل SELL_SESSION على النافذة المستقلة، نضم نافذتي التطوير والاختبار السابق "
     "إلى Research History واحدة (~360 يوم). نختبر فقط عائلة صغيرة مُعلنة مسبقًا عبر "
@@ -4336,11 +4336,12 @@ st.caption(
 dev_bt = st.session_state.get("backtest")
 old_iv = st.session_state.get("independent_validation")
 
-if not dev_bt or not old_iv:
-    st.info(
-        "يلزم وجود Research Audit 180d + Independent Validation السابقة أولًا."
-    )
-else:
+# v4.6.1: Walk-Forward no longer depends on browser/session_state.
+# If the prior Research Audit / Independent Validation objects are still in
+# the current Streamlit session, reuse their exact boundaries. Otherwise,
+# reconstruct the same research design directly from time and fetch history
+# again. This makes the lab usable after refresh/new browser session.
+if dev_bt and old_iv:
     dev_meta = dev_bt.get("history_meta", {})
     old_meta = old_iv.get("history_meta", {})
 
@@ -4348,318 +4349,328 @@ else:
     dev_last = dev_meta.get("last_bar")
     old_first = old_meta.get("first_bar")
     old_last = old_meta.get("last_bar")
+else:
+    anchor_end = now_utc().floor("5min")
+    dev_last = anchor_end.isoformat()
+    dev_first = (anchor_end - pd.Timedelta(days=180)).isoformat()
+    old_last = dev_first
+    old_first = (anchor_end - pd.Timedelta(days=360)).isoformat()
+    st.info(
+        "Session Recovery: نتائج الجلسة السابقة غير موجودة، "
+        "لكن Walk-Forward سيعيد بناء نافذة البحث 360 يوم مباشرةً بدون إعادة "
+        "Research Audit وIndependent Validation يدويًا."
+    )
 
-    if not all([dev_first, dev_last, old_first, old_last]):
-        st.warning("بيانات نافذتي البحث غير مكتملة.")
-    else:
-        research_start = pd.Timestamp(old_first)
-        research_end = pd.Timestamp(dev_last)
-        fresh_end = research_start
-        fresh_start = fresh_end - pd.Timedelta(days=180)
+if not all([dev_first, dev_last, old_first, old_last]):
+    st.warning("تعذر تحديد حدود نافذة Walk-Forward.")
+else:
+    research_start = pd.Timestamp(old_first)
+    research_end = pd.Timestamp(dev_last)
+    fresh_end = research_start
+    fresh_start = fresh_end - pd.Timedelta(days=180)
 
+    mini_grid(
+        [
+            ("Research Start", research_start.strftime("%Y-%m-%d"), ""),
+            ("Research End", research_end.strftime("%Y-%m-%d"), ""),
+            ("WF Folds", "6", "ok"),
+            ("Fresh Holdout", fresh_start.strftime("%Y-%m-%d"), "wait"),
+        ],
+        "tf-grid",
+    )
+
+    st.caption(
+        "Research history = النافذة المستقلة التي فشلت + نافذة التطوير الحالية. "
+        f"Fresh holdout المحجوز: {fresh_start.isoformat()} → {fresh_end.isoformat()}."
+    )
+
+    if st.button(
+        "تشغيل Walk-Forward Lab على 360 يوم",
+        use_container_width=True,
+    ):
+        wf_t0 = time.perf_counter()
+
+        with st.status(
+            "تشغيل Walk-Forward Research Lab...",
+            expanded=True,
+        ) as wf_status:
+            st.write("1/4 • جلب نافذة البحث الأقدم (المستخدمة سابقًا)")
+            try:
+                older_raw, older_meta = fetch_history_window(
+                    instrument.symbol,
+                    research_start.isoformat(),
+                    pd.Timestamp(dev_first).isoformat(),
+                    chunk_days=17,
+                )
+            except Exception as exc:
+                st.error(f"تعذر جلب الجزء الأقدم: {exc}")
+                older_raw = pd.DataFrame()
+                older_meta = {}
+
+            st.write("2/4 • جلب نافذة التطوير الحالية")
+            try:
+                dev_raw, dev_hist_meta = fetch_history_window(
+                    instrument.symbol,
+                    pd.Timestamp(dev_first).isoformat(),
+                    research_end.isoformat(),
+                    chunk_days=17,
+                )
+            except Exception as exc:
+                st.error(f"تعذر جلب جزء التطوير: {exc}")
+                dev_raw = pd.DataFrame()
+                dev_hist_meta = {}
+
+            if not older_raw.empty and not dev_raw.empty:
+                research_raw = (
+                    pd.concat([older_raw, dev_raw], ignore_index=True)
+                    .drop_duplicates("datetime")
+                    .sort_values("datetime")
+                    .reset_index(drop=True)
+                )
+
+                st.write(
+                    f"3/4 • تجهيز {len(research_raw):,} شمعة مرة واحدة"
+                )
+                wf_prepared = prepare_research_context(research_raw)
+
+                if not wf_prepared.get("ok", False):
+                    st.error(
+                        wf_prepared.get(
+                            "warning",
+                            "تعذر تجهيز Walk-Forward",
+                        )
+                    )
+                else:
+                    st.write("4/4 • تشغيل 5 مرشحين × 6 نوافذ + 2/5 bps")
+                    wf_result = run_walkforward_lab(
+                        wf_prepared,
+                        instrument,
+                        risk_pct=float(risk_pct),
+                        n_folds=6,
+                    )
+
+                    wf_result["elapsed_seconds"] = float(
+                        time.perf_counter() - wf_t0
+                    )
+                    wf_result["research_bars"] = int(len(research_raw))
+                    wf_result["fresh_start"] = fresh_start.isoformat()
+                    wf_result["fresh_end"] = fresh_end.isoformat()
+
+                    st.session_state.walkforward_lab = wf_result
+                    st.session_state.fresh_holdout = None
+
+                    wf_status.update(
+                        label=(
+                            "Walk-Forward Lab اكتمل خلال "
+                            f"{time.perf_counter()-wf_t0:.1f} ثانية"
+                        ),
+                        state="complete",
+                        expanded=False,
+                    )
+
+    wf = st.session_state.get("walkforward_lab")
+    if wf and wf.get("ok"):
+        st.markdown("### Walk-Forward Candidate Summary")
+        st.dataframe(
+            wf.get("summary", pd.DataFrame()),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.markdown("### Fold-by-Fold Matrix")
+        st.dataframe(
+            wf.get("folds", pd.DataFrame()),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        eligible = list(wf.get("eligible", []))
         mini_grid(
             [
-                ("Research Start", research_start.strftime("%Y-%m-%d"), ""),
-                ("Research End", research_end.strftime("%Y-%m-%d"), ""),
-                ("WF Folds", "6", "ok"),
-                ("Fresh Holdout", fresh_start.strftime("%Y-%m-%d"), "wait"),
+                ("Research Bars", f"{int(wf.get('research_bars',0)):,}", ""),
+                ("Elapsed", f"{float(wf.get('elapsed_seconds',0.0)):.1f}s", ""),
+                ("Eligible Candidates", str(len(eligible)), "ok" if eligible else "bad"),
+                ("Fresh Holdout Used?", "NO", "ok"),
             ],
             "tf-grid",
         )
 
-        st.caption(
-            "Research history = النافذة المستقلة التي فشلت + نافذة التطوير الحالية. "
-            f"Fresh holdout المحجوز: {fresh_start.isoformat()} → {fresh_end.isoformat()}."
+        if not eligible:
+            st.error(
+                "لا يوجد مرشح اجتاز Walk-Forward Gate. "
+                "لا نلمس Fresh Holdout؛ نحتاج منطق إشارة جديد بدل تعديل الشروط لإجبار PASS."
+            )
+        else:
+            st.success(
+                "يوجد مرشح/مرشحون اجتازوا Research Gate. "
+                "يمكن الآن تجميد واحد فقط ثم فتح Fresh Holdout الأقدم لأول مرة."
+            )
+
+            chosen = st.selectbox(
+                "اختر مرشحًا مؤهلًا لتجميده قبل Fresh Holdout",
+                eligible,
+                format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
+                key="wf_candidate_choice",
+            )
+
+            st.caption(
+                f"سيتم اختبار {chosen} على نافذة لم نستخدمها حتى الآن: "
+                f"{fresh_start.isoformat()} → {fresh_end.isoformat()}."
+            )
+
+            if st.button(
+                "تجميد المرشح وتشغيل Fresh Holdout 180 يوم",
+                use_container_width=True,
+            ):
+                fh_t0 = time.perf_counter()
+
+                with st.status(
+                    "تشغيل Fresh Holdout...",
+                    expanded=True,
+                ) as fh_status:
+                    try:
+                        fresh_raw, fresh_meta = fetch_history_window(
+                            instrument.symbol,
+                            fresh_start.isoformat(),
+                            fresh_end.isoformat(),
+                            chunk_days=17,
+                        )
+                    except Exception as exc:
+                        st.error(f"تعذر جلب Fresh Holdout: {exc}")
+                        fresh_raw = pd.DataFrame()
+                        fresh_meta = {}
+
+                    if not fresh_raw.empty:
+                        fresh_prepared = prepare_research_context(fresh_raw)
+
+                        if not fresh_prepared.get("ok", False):
+                            st.error(
+                                fresh_prepared.get(
+                                    "warning",
+                                    "تعذر تجهيز Fresh Holdout",
+                                )
+                            )
+                        else:
+                            fh_trades2, fh_stats2 = simulate_prepared_research(
+                                fresh_prepared,
+                                instrument,
+                                risk_pct=float(risk_pct),
+                                cost_bps_roundtrip=2.0,
+                                research_variant=chosen,
+                            )
+                            _, fh_stats5 = simulate_prepared_research(
+                                fresh_prepared,
+                                instrument,
+                                risk_pct=float(risk_pct),
+                                cost_bps_roundtrip=5.0,
+                                research_variant=chosen,
+                            )
+                            _, fh_stats10 = simulate_prepared_research(
+                                fresh_prepared,
+                                instrument,
+                                risk_pct=float(risk_pct),
+                                cost_bps_roundtrip=10.0,
+                                research_variant=chosen,
+                            )
+
+                            fh_robust = _research_robustness(fh_trades2)
+                            fh_gate = _fresh_holdout_gate(
+                                fh_stats2,
+                                fh_stats5,
+                                fh_robust,
+                                fresh_meta,
+                            )
+
+                            st.session_state.fresh_holdout = {
+                                "candidate": chosen,
+                                "history_meta": fresh_meta,
+                                "stats_2": fh_stats2,
+                                "stats_5": fh_stats5,
+                                "stats_10": fh_stats10,
+                                "trades_2": fh_trades2,
+                                "robustness": fh_robust,
+                                "gate": fh_gate,
+                                "elapsed_seconds": float(
+                                    time.perf_counter() - fh_t0
+                                ),
+                            }
+
+                            fh_status.update(
+                                label=(
+                                    "Fresh Holdout اكتمل خلال "
+                                    f"{time.perf_counter()-fh_t0:.1f} ثانية"
+                                ),
+                                state="complete",
+                                expanded=False,
+                            )
+
+    fh = st.session_state.get("fresh_holdout")
+    if fh:
+        st.markdown("### Fresh Holdout Result")
+        fh2 = fh.get("stats_2", {})
+        fh5 = fh.get("stats_5", {})
+        fh10 = fh.get("stats_10", {})
+        n2 = fh2.get("normalized", {})
+        n5 = fh5.get("normalized", {})
+        n10 = fh10.get("normalized", {})
+        fg = fh.get("gate", {})
+        fr = fh.get("robustness", {})
+
+        mini_grid(
+            [
+                ("Candidate", str(fh.get("candidate")), ""),
+                ("Trades", str(fh2.get("trades", 0)), ""),
+                ("2bps PF", f"{float(n2.get('profit_factor',0.0)):.2f}", "ok" if float(n2.get("profit_factor",0.0)) >= 1.2 else "bad"),
+                ("2bps Avg R", f"{float(n2.get('avg_r_net',0.0)):.3f}R", "ok" if float(n2.get("avg_r_net",0.0)) > 0 else "bad"),
+                ("2bps Net", f"${float(n2.get('net_pnl',0.0)):,.2f}", "ok" if float(n2.get("net_pnl",0.0)) > 0 else "bad"),
+                ("5bps PF", f"{float(n5.get('profit_factor',0.0)):.2f}", "ok" if float(n5.get("profit_factor",0.0)) >= 1.05 else "bad"),
+                ("10bps PF", f"{float(n10.get('profit_factor',0.0)):.2f}", "wait"),
+                ("DD", f"{float(n2.get('max_dd_pct',0.0)):.2f}%", "wait"),
+            ],
+            "plan-grid",
         )
 
-        if st.button(
-            "تشغيل Walk-Forward Lab على 360 يوم",
-            use_container_width=True,
-        ):
-            wf_t0 = time.perf_counter()
+        st.markdown("### Fresh Holdout Gate")
+        mini_grid(
+            [
+                (
+                    "Fresh Gate",
+                    "PASS → PAPER FORWARD" if fg.get("passed") else "FAIL / RESEARCH AGAIN",
+                    "ok" if fg.get("passed") else "bad",
+                )
+            ],
+            "tf-grid",
+        )
 
-            with st.status(
-                "تشغيل Walk-Forward Research Lab...",
-                expanded=True,
-            ) as wf_status:
-                st.write("1/4 • جلب نافذة البحث الأقدم (المستخدمة سابقًا)")
-                try:
-                    older_raw, older_meta = fetch_history_window(
-                        instrument.symbol,
-                        research_start.isoformat(),
-                        pd.Timestamp(dev_first).isoformat(),
-                        chunk_days=17,
-                    )
-                except Exception as exc:
-                    st.error(f"تعذر جلب الجزء الأقدم: {exc}")
-                    older_raw = pd.DataFrame()
-                    older_meta = {}
-
-                st.write("2/4 • جلب نافذة التطوير الحالية")
-                try:
-                    dev_raw, dev_hist_meta = fetch_history_window(
-                        instrument.symbol,
-                        pd.Timestamp(dev_first).isoformat(),
-                        research_end.isoformat(),
-                        chunk_days=17,
-                    )
-                except Exception as exc:
-                    st.error(f"تعذر جلب جزء التطوير: {exc}")
-                    dev_raw = pd.DataFrame()
-                    dev_hist_meta = {}
-
-                if not older_raw.empty and not dev_raw.empty:
-                    research_raw = (
-                        pd.concat([older_raw, dev_raw], ignore_index=True)
-                        .drop_duplicates("datetime")
-                        .sort_values("datetime")
-                        .reset_index(drop=True)
-                    )
-
-                    st.write(
-                        f"3/4 • تجهيز {len(research_raw):,} شمعة مرة واحدة"
-                    )
-                    wf_prepared = prepare_research_context(research_raw)
-
-                    if not wf_prepared.get("ok", False):
-                        st.error(
-                            wf_prepared.get(
-                                "warning",
-                                "تعذر تجهيز Walk-Forward",
-                            )
-                        )
-                    else:
-                        st.write("4/4 • تشغيل 5 مرشحين × 6 نوافذ + 2/5 bps")
-                        wf_result = run_walkforward_lab(
-                            wf_prepared,
-                            instrument,
-                            risk_pct=float(risk_pct),
-                            n_folds=6,
-                        )
-
-                        wf_result["elapsed_seconds"] = float(
-                            time.perf_counter() - wf_t0
-                        )
-                        wf_result["research_bars"] = int(len(research_raw))
-                        wf_result["fresh_start"] = fresh_start.isoformat()
-                        wf_result["fresh_end"] = fresh_end.isoformat()
-
-                        st.session_state.walkforward_lab = wf_result
-                        st.session_state.fresh_holdout = None
-
-                        wf_status.update(
-                            label=(
-                                "Walk-Forward Lab اكتمل خلال "
-                                f"{time.perf_counter()-wf_t0:.1f} ثانية"
-                            ),
-                            state="complete",
-                            expanded=False,
-                        )
-
-        wf = st.session_state.get("walkforward_lab")
-        if wf and wf.get("ok"):
-            st.markdown("### Walk-Forward Candidate Summary")
-            st.dataframe(
-                wf.get("summary", pd.DataFrame()),
-                hide_index=True,
-                use_container_width=True,
+        for rule in fg.get("rules", []):
+            st.write(
+                f"{'✅' if rule.get('pass') else '❌'} {rule.get('name')}"
             )
 
-            st.markdown("### Fold-by-Fold Matrix")
-            st.dataframe(
-                wf.get("folds", pd.DataFrame()),
-                hide_index=True,
-                use_container_width=True,
+        st.markdown("### Fresh Robustness")
+        mini_grid(
+            [
+                ("Bootstrap Low", f"{float(fr.get('bootstrap_low',0.0)):.3f}R", "ok" if float(fr.get("bootstrap_low",0.0)) > 0 else "bad"),
+                ("Bootstrap High", f"{float(fr.get('bootstrap_high',0.0)):.3f}R", ""),
+                ("Break-even", f"{float(fr.get('cost_break_even_bps',0.0)):.2f} bps RT", "wait"),
+            ],
+            "tf-grid",
+        )
+
+        qdf = pd.DataFrame(fr.get("quarters", []))
+        if not qdf.empty:
+            st.dataframe(qdf, hide_index=True, use_container_width=True)
+
+        if fg.get("passed"):
+            st.success(
+                "Fresh holdout نجح. الخطوة التالية Paper Forward فقط لمدة كافية؛ "
+                "لا يتم فتح Live تلقائيًا."
             )
-
-            eligible = list(wf.get("eligible", []))
-            mini_grid(
-                [
-                    ("Research Bars", f"{int(wf.get('research_bars',0)):,}", ""),
-                    ("Elapsed", f"{float(wf.get('elapsed_seconds',0.0)):.1f}s", ""),
-                    ("Eligible Candidates", str(len(eligible)), "ok" if eligible else "bad"),
-                    ("Fresh Holdout Used?", "NO", "ok"),
-                ],
-                "tf-grid",
+        else:
+            st.error(
+                "Fresh holdout فشل. لا نعدّل المرشح باستخدام هذه النافذة؛ "
+                "نرجع للبحث ونحجز نافذة أقدم جديدة لأي نسخة لاحقة."
             )
-
-            if not eligible:
-                st.error(
-                    "لا يوجد مرشح اجتاز Walk-Forward Gate. "
-                    "لا نلمس Fresh Holdout؛ نحتاج منطق إشارة جديد بدل تعديل الشروط لإجبار PASS."
-                )
-            else:
-                st.success(
-                    "يوجد مرشح/مرشحون اجتازوا Research Gate. "
-                    "يمكن الآن تجميد واحد فقط ثم فتح Fresh Holdout الأقدم لأول مرة."
-                )
-
-                chosen = st.selectbox(
-                    "اختر مرشحًا مؤهلًا لتجميده قبل Fresh Holdout",
-                    eligible,
-                    format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
-                    key="wf_candidate_choice",
-                )
-
-                st.caption(
-                    f"سيتم اختبار {chosen} على نافذة لم نستخدمها حتى الآن: "
-                    f"{fresh_start.isoformat()} → {fresh_end.isoformat()}."
-                )
-
-                if st.button(
-                    "تجميد المرشح وتشغيل Fresh Holdout 180 يوم",
-                    use_container_width=True,
-                ):
-                    fh_t0 = time.perf_counter()
-
-                    with st.status(
-                        "تشغيل Fresh Holdout...",
-                        expanded=True,
-                    ) as fh_status:
-                        try:
-                            fresh_raw, fresh_meta = fetch_history_window(
-                                instrument.symbol,
-                                fresh_start.isoformat(),
-                                fresh_end.isoformat(),
-                                chunk_days=17,
-                            )
-                        except Exception as exc:
-                            st.error(f"تعذر جلب Fresh Holdout: {exc}")
-                            fresh_raw = pd.DataFrame()
-                            fresh_meta = {}
-
-                        if not fresh_raw.empty:
-                            fresh_prepared = prepare_research_context(fresh_raw)
-
-                            if not fresh_prepared.get("ok", False):
-                                st.error(
-                                    fresh_prepared.get(
-                                        "warning",
-                                        "تعذر تجهيز Fresh Holdout",
-                                    )
-                                )
-                            else:
-                                fh_trades2, fh_stats2 = simulate_prepared_research(
-                                    fresh_prepared,
-                                    instrument,
-                                    risk_pct=float(risk_pct),
-                                    cost_bps_roundtrip=2.0,
-                                    research_variant=chosen,
-                                )
-                                _, fh_stats5 = simulate_prepared_research(
-                                    fresh_prepared,
-                                    instrument,
-                                    risk_pct=float(risk_pct),
-                                    cost_bps_roundtrip=5.0,
-                                    research_variant=chosen,
-                                )
-                                _, fh_stats10 = simulate_prepared_research(
-                                    fresh_prepared,
-                                    instrument,
-                                    risk_pct=float(risk_pct),
-                                    cost_bps_roundtrip=10.0,
-                                    research_variant=chosen,
-                                )
-
-                                fh_robust = _research_robustness(fh_trades2)
-                                fh_gate = _fresh_holdout_gate(
-                                    fh_stats2,
-                                    fh_stats5,
-                                    fh_robust,
-                                    fresh_meta,
-                                )
-
-                                st.session_state.fresh_holdout = {
-                                    "candidate": chosen,
-                                    "history_meta": fresh_meta,
-                                    "stats_2": fh_stats2,
-                                    "stats_5": fh_stats5,
-                                    "stats_10": fh_stats10,
-                                    "trades_2": fh_trades2,
-                                    "robustness": fh_robust,
-                                    "gate": fh_gate,
-                                    "elapsed_seconds": float(
-                                        time.perf_counter() - fh_t0
-                                    ),
-                                }
-
-                                fh_status.update(
-                                    label=(
-                                        "Fresh Holdout اكتمل خلال "
-                                        f"{time.perf_counter()-fh_t0:.1f} ثانية"
-                                    ),
-                                    state="complete",
-                                    expanded=False,
-                                )
-
-        fh = st.session_state.get("fresh_holdout")
-        if fh:
-            st.markdown("### Fresh Holdout Result")
-            fh2 = fh.get("stats_2", {})
-            fh5 = fh.get("stats_5", {})
-            fh10 = fh.get("stats_10", {})
-            n2 = fh2.get("normalized", {})
-            n5 = fh5.get("normalized", {})
-            n10 = fh10.get("normalized", {})
-            fg = fh.get("gate", {})
-            fr = fh.get("robustness", {})
-
-            mini_grid(
-                [
-                    ("Candidate", str(fh.get("candidate")), ""),
-                    ("Trades", str(fh2.get("trades", 0)), ""),
-                    ("2bps PF", f"{float(n2.get('profit_factor',0.0)):.2f}", "ok" if float(n2.get("profit_factor",0.0)) >= 1.2 else "bad"),
-                    ("2bps Avg R", f"{float(n2.get('avg_r_net',0.0)):.3f}R", "ok" if float(n2.get("avg_r_net",0.0)) > 0 else "bad"),
-                    ("2bps Net", f"${float(n2.get('net_pnl',0.0)):,.2f}", "ok" if float(n2.get("net_pnl",0.0)) > 0 else "bad"),
-                    ("5bps PF", f"{float(n5.get('profit_factor',0.0)):.2f}", "ok" if float(n5.get("profit_factor",0.0)) >= 1.05 else "bad"),
-                    ("10bps PF", f"{float(n10.get('profit_factor',0.0)):.2f}", "wait"),
-                    ("DD", f"{float(n2.get('max_dd_pct',0.0)):.2f}%", "wait"),
-                ],
-                "plan-grid",
-            )
-
-            st.markdown("### Fresh Holdout Gate")
-            mini_grid(
-                [
-                    (
-                        "Fresh Gate",
-                        "PASS → PAPER FORWARD" if fg.get("passed") else "FAIL / RESEARCH AGAIN",
-                        "ok" if fg.get("passed") else "bad",
-                    )
-                ],
-                "tf-grid",
-            )
-
-            for rule in fg.get("rules", []):
-                st.write(
-                    f"{'✅' if rule.get('pass') else '❌'} {rule.get('name')}"
-                )
-
-            st.markdown("### Fresh Robustness")
-            mini_grid(
-                [
-                    ("Bootstrap Low", f"{float(fr.get('bootstrap_low',0.0)):.3f}R", "ok" if float(fr.get("bootstrap_low",0.0)) > 0 else "bad"),
-                    ("Bootstrap High", f"{float(fr.get('bootstrap_high',0.0)):.3f}R", ""),
-                    ("Break-even", f"{float(fr.get('cost_break_even_bps',0.0)):.2f} bps RT", "wait"),
-                ],
-                "tf-grid",
-            )
-
-            qdf = pd.DataFrame(fr.get("quarters", []))
-            if not qdf.empty:
-                st.dataframe(qdf, hide_index=True, use_container_width=True)
-
-            if fg.get("passed"):
-                st.success(
-                    "Fresh holdout نجح. الخطوة التالية Paper Forward فقط لمدة كافية؛ "
-                    "لا يتم فتح Live تلقائيًا."
-                )
-            else:
-                st.error(
-                    "Fresh holdout فشل. لا نعدّل المرشح باستخدام هذه النافذة؛ "
-                    "نرجع للبحث ونحجز نافذة أقدم جديدة لأي نسخة لاحقة."
-                )
-
 
 
 # --------------------------- health ---------------------------
