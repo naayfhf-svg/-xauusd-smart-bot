@@ -28,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.9.1-x10-compact-arabic"
+VERSION = "4.9.2-x10-clean-sidebar"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -3530,32 +3530,140 @@ st.sidebar.caption(f"v{VERSION} • Gold • Stocks • Futures/Contracts")
 preset_name = st.sidebar.selectbox("السوق", list(PRESETS.keys()), index=0)
 base_spec = PRESETS[preset_name]
 
-with st.sidebar.expander("إعدادات الأصل", expanded=False):
-    custom_symbol = st.text_input("رمز البيانات/الوسيط", value=base_spec.symbol)
-    point_value = st.number_input(
-        "قيمة حركة سعر 1 لكل وحدة",
-        min_value=0.000001,
-        value=float(base_spec.point_value),
-        format="%.6f",
+st.sidebar.divider()
+mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
+
+risk_pct = st.sidebar.number_input(
+    "مخاطرة الصفقة %",
+    min_value=0.05,
+    max_value=0.50,
+    value=0.25,
+    step=0.05,
+)
+
+st.session_state.auto_paper = st.sidebar.toggle(
+    "التداول التجريبي التلقائي",
+    value=st.session_state.auto_paper,
+    help="يفتح صفقة Paper تلقائيًا فقط عند اكتمال الإشارة وبوابة المخاطر.",
+)
+persist_paper_state()
+
+advanced_settings = st.sidebar.toggle(
+    "إعدادات متقدمة",
+    value=False,
+    help="يعرض إعدادات الأصل، المرشح، KILL SWITCH، البحث والتشخيص وإعدادات التحديث.",
+)
+
+# Safe defaults while advanced settings are hidden.
+custom_symbol = base_spec.symbol
+point_value = float(base_spec.point_value)
+qty_step = float(base_spec.qty_step)
+min_qty = float(base_spec.min_qty)
+max_qty = float(base_spec.max_qty)
+forward_candidate = st.session_state.get("forward_candidate", "V47_B2_VOL")
+advanced_ui = False
+max_daily_loss_pct = 1.5
+max_open_positions = 1
+max_order_risk_pct = 0.50
+refresh_seconds = 60
+
+if advanced_settings:
+    st.sidebar.markdown("### الإعدادات المتقدمة")
+
+    advanced_ui = st.sidebar.toggle(
+        "إظهار أدوات البحث والتشخيص",
+        value=False,
+        help="فعّله فقط عند الاختبارات أو تشخيص مشكلة.",
     )
-    qty_step = st.number_input(
-        "خطوة الكمية",
-        min_value=0.000001,
-        value=float(base_spec.qty_step),
-        format="%.6f",
+
+    with st.sidebar.expander("إعدادات الأصل", expanded=False):
+        custom_symbol = st.text_input("رمز البيانات/الوسيط", value=base_spec.symbol)
+        point_value = st.number_input(
+            "قيمة حركة سعر 1 لكل وحدة",
+            min_value=0.000001,
+            value=float(base_spec.point_value),
+            format="%.6f",
+        )
+        qty_step = st.number_input(
+            "خطوة الكمية",
+            min_value=0.000001,
+            value=float(base_spec.qty_step),
+            format="%.6f",
+        )
+        min_qty = st.number_input(
+            "أقل كمية",
+            min_value=0.0,
+            value=float(base_spec.min_qty),
+            format="%.6f",
+        )
+        max_qty = st.number_input(
+            "أعلى كمية",
+            min_value=min_qty,
+            value=float(base_spec.max_qty),
+            format="%.6f",
+        )
+
+    st.session_state.forward_candidate = st.sidebar.selectbox(
+        "مرشح Paper Forward",
+        list(WF_CANDIDATES.keys()),
+        index=(
+            list(WF_CANDIDATES.keys()).index(st.session_state.forward_candidate)
+            if st.session_state.forward_candidate in WF_CANDIDATES
+            else 0
+        ),
+        format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
+        help="يُستخدم في Paper Forward. لا يفتح Live وحده.",
     )
-    min_qty = st.number_input(
-        "أقل كمية",
-        min_value=0.0,
-        value=float(base_spec.min_qty),
-        format="%.6f",
+    forward_candidate = st.session_state.forward_candidate
+    persist_paper_state()
+
+    st.session_state.kill_switch = st.sidebar.toggle(
+        "KILL SWITCH",
+        value=st.session_state.kill_switch,
+        help="ON يمنع أي أمر Live جديد",
     )
-    max_qty = st.number_input(
-        "أعلى كمية",
-        min_value=min_qty,
-        value=float(base_spec.max_qty),
-        format="%.6f",
-    )
+
+    with st.sidebar.expander("المخاطر والتحديث", expanded=False):
+        max_daily_loss_pct = st.number_input(
+            "حد الخسارة اليومية %",
+            min_value=0.5,
+            max_value=3.0,
+            value=1.5,
+            step=0.5,
+        )
+        max_open_positions = st.number_input(
+            "أقصى مراكز مفتوحة",
+            min_value=1,
+            max_value=3,
+            value=1,
+            step=1,
+        )
+        max_order_risk_pct = st.number_input(
+            "الحد الصلب لمخاطرة الأمر %",
+            min_value=0.05,
+            max_value=0.50,
+            value=0.50,
+            step=0.05,
+        )
+        st.session_state.auto_refresh = st.toggle(
+            "تحديث Paper تلقائي",
+            value=st.session_state.auto_refresh,
+            help="يحدّث محرك Paper بدون إعادة تحميل الصفحة كاملة.",
+        )
+        refresh_seconds = st.slider(
+            "ثواني التحديث",
+            60,
+            180,
+            60,
+            step=15,
+            help="60 ثانية أو أكثر موصى بها مع حد Twelve Data المجاني.",
+        )
+else:
+    # Simple mode: Auto Paper automatically keeps the safe 60s heartbeat alive.
+    st.session_state.auto_refresh = bool(st.session_state.auto_paper)
+
+if not st.session_state.auto_refresh:
+    refresh_seconds = 60
 
 instrument = InstrumentSpec(
     label=base_spec.label,
@@ -3566,81 +3674,6 @@ instrument = InstrumentSpec(
     min_qty=float(min_qty),
     max_qty=float(max_qty),
 )
-
-st.sidebar.divider()
-mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
-
-advanced_ui = st.sidebar.toggle(
-    "إظهار أدوات البحث والتشخيص",
-    value=False,
-    help="مغلق افتراضيًا لواجهة تداول أنظف. فعّله فقط عند الاختبارات أو التشخيص.",
-)
-
-st.session_state.forward_candidate = st.sidebar.selectbox(
-    "مرشح Paper Forward",
-    list(WF_CANDIDATES.keys()),
-    index=(
-        list(WF_CANDIDATES.keys()).index(st.session_state.forward_candidate)
-        if st.session_state.forward_candidate in WF_CANDIDATES
-        else 0
-    ),
-    format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
-    help="Paper يستخدم هذا المرشح على السوق الحالي. Live لا يعتمد عليه إلا بعد Fresh Holdout PASS.",
-)
-forward_candidate = st.session_state.forward_candidate
-persist_paper_state()
-
-risk_pct = st.sidebar.number_input(
-    "مخاطرة الصفقة %",
-    min_value=0.05,
-    max_value=0.50,
-    value=0.25,
-    step=0.05,
-)
-st.session_state.kill_switch = st.sidebar.toggle(
-    "KILL SWITCH",
-    value=st.session_state.kill_switch,
-    help="ON يمنع أي أمر Live جديد",
-)
-
-with st.sidebar.expander("إعدادات المخاطر والتحديث", expanded=False):
-    max_daily_loss_pct = st.number_input(
-        "حد الخسارة اليومية %",
-        min_value=0.5,
-        max_value=3.0,
-        value=1.5,
-        step=0.5,
-    )
-    max_open_positions = st.number_input(
-        "أقصى مراكز مفتوحة",
-        min_value=1,
-        max_value=3,
-        value=1,
-        step=1,
-    )
-    max_order_risk_pct = st.number_input(
-        "الحد الصلب لمخاطرة الأمر %",
-        min_value=0.05,
-        max_value=0.50,
-        value=0.50,
-        step=0.05,
-    )
-    st.session_state.auto_refresh = st.toggle(
-        "Paper heartbeat تلقائي",
-        value=st.session_state.auto_refresh,
-        help="يحدّث محرك Paper داخل Fragment بدون إعادة تحميل الصفحة كاملة",
-    )
-    refresh_seconds = st.slider(
-        "ثواني heartbeat",
-        60,
-        180,
-        60,
-        step=15,
-        help="60 ثانية أو أكثر موصى بها مع خطة Twelve Data المجانية (8 credits/min).",
-    )
-
-if not st.session_state.auto_refresh:
-    refresh_seconds = 60
 
 live_unlocked = truthy(secret("LIVE_TRADING_ENABLED", "false"))
 automation_backend_ready = truthy(secret("AUTOMATION_BACKEND_READY", "false"))
@@ -3673,7 +3706,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.9.1 COMPACT ARABIC • live-market forward test • "
+    "X10 GOLD v4.9.2 CLEAN SIDEBAR • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -4071,12 +4104,11 @@ if mode == "Paper":
             "tf-grid",
         )
 
-    st.session_state.auto_paper = st.toggle(
-        "التداول التجريبي التلقائي",
-        value=st.session_state.auto_paper,
-        help="يفتح Paper فقط عند وجود إشارة، خطة، وسعر تنفيذ حديث",
+    st.caption(
+        "التداول التجريبي التلقائي: "
+        + ("مفعّل" if st.session_state.auto_paper else "متوقف")
+        + " — التحكم من القائمة الجانبية."
     )
-    persist_paper_state()
 
     if paper_plan and not st.session_state.paper_position:
         if st.button(
@@ -5533,7 +5565,7 @@ if advanced_ui:
             st.info("لا يوجد سجل بعد")
 
     st.info(
-        "FINAL SAFETY v4.9.1: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+        "FINAL SAFETY v4.9.2: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
         "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
         "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
         "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
