@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.8.0-x10-paper-forward-ready"
+VERSION = "4.8.1-x10-near-entry-watch"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -198,6 +198,7 @@ def init_state() -> None:
         "last_auto_paper_candle": {},
         "last_auto_live_candle": {},
         "last_alert_candle": {},
+        "last_near_entry_alert": None,
         "paper_day": now_riyadh().date().isoformat(),
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
@@ -2534,6 +2535,17 @@ def analyze_forward_candidate(
     }
     passed_count = sum(bool(v) for v in gate_parts.values())
     strength = int(round(passed_count / len(gate_parts) * 100))
+    missing = [k for k, v in gate_parts.items() if not v]
+
+    # "Near entry" is INFORMATIONAL ONLY.
+    # It never changes the execution signal from WAIT to SELL.
+    near_entry = bool(
+        not final_ok
+        and session_ok
+        and trend25
+        and regime_ok
+        and not event_ok
+    )
 
     if final_ok:
         reason = (
@@ -2541,8 +2553,12 @@ def analyze_forward_candidate(
             "trend/vol/session confirmed"
         )
         signal = "SELL"
+    elif near_entry:
+        reason = (
+            f"{candidate}: قريب من الدخول • باقي حدث الدخول {event} فقط"
+        )
+        signal = "WAIT"
     else:
-        missing = [k for k, v in gate_parts.items() if not v]
         reason = f"{candidate}: WAIT • missing: " + ", ".join(missing)
         signal = "WAIT"
 
@@ -2560,6 +2576,10 @@ def analyze_forward_candidate(
         "event": event,
         "event_ok": event_ok,
         "session_ok": session_ok,
+        "near_entry": near_entry,
+        "missing_conditions": missing,
+        "readiness_pct": strength,
+        "gate_parts": gate_parts,
         "atr_pct": atr_now,
         "atr_q20": q20_now,
         "atr_q90": q90_now,
@@ -3545,27 +3565,75 @@ st.markdown(
 )
 
 
+near_entry = bool(forward_analysis.get("near_entry", False))
 forward_signal_class = (
     "sell" if forward_analysis.get("signal") == "SELL"
     else "state-wait"
 )
+forward_display = (
+    "SELL"
+    if forward_analysis.get("signal") == "SELL"
+    else ("قريب من الدخول" if near_entry else "WAIT")
+)
+
 st.markdown(
     f"<div class='card'><div class='kicker'>PAPER FORWARD CANDIDATE</div>"
-    f"<div class='big {forward_signal_class}'>{forward_analysis.get('signal','WAIT')}</div>"
+    f"<div class='big {forward_signal_class}'>{forward_display}</div>"
     f"<p>{forward_analysis.get('reason','')}</p>"
     f"<div class='muted'>{forward_candidate} • "
-    f"Event {forward_analysis.get('event','NONE')} • "
-    f"Trend25 {'YES' if forward_analysis.get('trend25') else 'NO'} • "
-    f"Vol {'YES' if forward_analysis.get('regime_ok') else 'NO'} • "
-    f"Session {'YES' if forward_analysis.get('session_ok') else 'NO'}</div></div>",
+    f"الجاهزية {int(forward_analysis.get('readiness_pct',0))}% • "
+    f"Event {forward_analysis.get('event','NONE')}</div></div>",
     unsafe_allow_html=True,
 )
+
+mini_grid(
+    [
+        (
+            "قوة الاتجاه",
+            "مكتمل" if forward_analysis.get("trend25") else "غير مكتمل",
+            "ok" if forward_analysis.get("trend25") else "wait",
+        ),
+        (
+            "نظام التذبذب",
+            "مكتمل" if forward_analysis.get("regime_ok") else "غير مكتمل",
+            "ok" if forward_analysis.get("regime_ok") else "wait",
+        ),
+        (
+            "وقت التداول",
+            "مكتمل" if forward_analysis.get("session_ok") else "خارج الجلسة",
+            "ok" if forward_analysis.get("session_ok") else "wait",
+        ),
+        (
+            "حدث الدخول",
+            "مكتمل" if forward_analysis.get("event_ok") else "ننتظر",
+            "ok" if forward_analysis.get("event_ok") else "wait",
+        ),
+    ],
+    "tf-grid",
+)
+
+if near_entry:
+    st.warning(
+        "🟡 قريب من الدخول: الاتجاه + التذبذب + وقت التداول مكتملة. "
+        "ننتظر حدث الدخول فقط. لن يفتح Paper قبل اكتماله."
+    )
+elif forward_analysis.get("signal") == "SELL":
+    st.success(
+        "🟢 اكتملت شروط SELL. إذا Auto Paper Forward مفعّل وRisk Gate يسمح، "
+        "سيتم فتح صفقة Paper تلقائيًا."
+    )
 
 if mode == "Paper":
     st.info(
         "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
         "المخاطرة الافتراضية 0.25%، ومركز واحد فقط."
     )
+
+if near_entry:
+    near_key = f"{instrument.symbol}:{candle_id}:{forward_candidate}:NEAR"
+    if st.session_state.get("last_near_entry_alert") != near_key:
+        st.session_state.last_near_entry_alert = near_key
+        st.toast("قريب من الدخول: باقي حدث الدخول فقط", icon="🟡")
 
 # ---------------------------- chart ---------------------------
 chart_df = raw.tail(288)[["datetime", "close"]].copy()
@@ -5141,7 +5209,7 @@ with st.expander("Decision Log", expanded=False):
         st.info("لا يوجد سجل بعد")
 
 st.info(
-    "FINAL SAFETY v4.8: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+    "FINAL SAFETY v4.8.1: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
     "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
     "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
     "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
