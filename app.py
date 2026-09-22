@@ -25,7 +25,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.6.1-x10-walkforward-sessionless"
+VERSION = "4.8.0-x10-paper-forward-ready"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -205,6 +205,7 @@ def init_state() -> None:
         "independent_validation": None,
         "walkforward_lab": None,
         "fresh_holdout": None,
+        "forward_candidate": "V47_B2_VOL",
         "research_gate": {
             "passed": False,
             "context": None,
@@ -2165,6 +2166,52 @@ def prepare_research_context(raw: pd.DataFrame) -> dict[str, Any]:
     )
     m5 = precompute_b2(m5)
 
+    # v4.7 entry events — all computed from the current CLOSED M5 bar and
+    # prior bars only. Execution still occurs on the next M5 open.
+    m5["touch_ema20"] = (
+        pd.to_numeric(m5["high"], errors="coerce")
+        >= pd.to_numeric(m5["ema20"], errors="coerce")
+    )
+    m5["ema_reject_raw"] = (
+        m5["touch_ema20"]
+        & (pd.to_numeric(m5["close"], errors="coerce") < pd.to_numeric(m5["ema20"], errors="coerce"))
+        & (pd.to_numeric(m5["close"], errors="coerce") < pd.to_numeric(m5["open"], errors="coerce"))
+    )
+    m5["ema_reject_event"] = (
+        m5["ema_reject_raw"]
+        & ~m5["ema_reject_raw"].shift(1).fillna(False)
+    )
+
+    touch_recent4 = (
+        m5["touch_ema20"].astype(np.int8)
+        .rolling(4, min_periods=1)
+        .max()
+        .astype(bool)
+    )
+    prev_low = pd.to_numeric(m5["low"], errors="coerce").shift(1)
+    m5["pullback_break_raw"] = (
+        touch_recent4
+        & (pd.to_numeric(m5["close"], errors="coerce") < prev_low)
+    )
+    m5["pullback_break_event"] = (
+        m5["pullback_break_raw"]
+        & ~m5["pullback_break_raw"].shift(1).fillna(False)
+    )
+
+    prior_low20 = (
+        pd.to_numeric(m5["low"], errors="coerce")
+        .shift(1)
+        .rolling(20, min_periods=20)
+        .min()
+    )
+    m5["break20_raw"] = (
+        pd.to_numeric(m5["close"], errors="coerce") < prior_low20
+    )
+    m5["break20_event"] = (
+        m5["break20_raw"]
+        & ~m5["break20_raw"].shift(1).fillna(False)
+    )
+
     m5["atr_pct"] = (m5["atr"] / m5["close"].replace(0, np.nan)) * 100.0
     vol_window = 288 * 10
     m5["atr_pct_q20"] = m5["atr_pct"].shift(1).rolling(vol_window, min_periods=288 * 3).quantile(0.20)
@@ -2172,11 +2219,14 @@ def prepare_research_context(raw: pd.DataFrame) -> dict[str, Any]:
     m5["effective_time"] = m5["datetime"] + pd.Timedelta("5min")
 
     bt = m5[[
-        "effective_time", "datetime", "close", "ema20", "ema50", "rsi", "adx", "atr",
+        "effective_time", "datetime", "open", "high", "low", "close",
+        "ema20", "ema50", "rsi", "adx", "atr",
         "momentum", "macd_hist", "trend", "atr_pct", "atr_pct_q20", "atr_pct_q90",
         "b2_valid", "b2_side",
+        "ema_reject_event", "pullback_break_event", "break20_event",
     ]].copy().rename(columns={
-        "datetime": "datetime_m5", "close": "close_m5", "ema20": "ema20_m5", "ema50": "ema50_m5",
+        "datetime": "datetime_m5", "open": "open_m5", "high": "high_m5", "low": "low_m5",
+        "close": "close_m5", "ema20": "ema20_m5", "ema50": "ema50_m5",
         "rsi": "rsi_m5", "adx": "adx_m5", "atr": "atr_m5", "momentum": "momentum_m5",
         "macd_hist": "macd_hist_m5", "trend": "trend_m5", "atr_pct": "atr_pct_m5",
         "atr_pct_q20": "atr_pct_q20_m5", "atr_pct_q90": "atr_pct_q90_m5",
@@ -2210,7 +2260,9 @@ def prepare_research_context(raw: pd.DataFrame) -> dict[str, Any]:
         bt["b2_valid"].astype(bool) & bt["b2_side"].eq("SELL"),
     ]
     buy_count = sum(c.astype(np.int8) for c in buy_conditions)
-    sell_count = sum(c.astype(np.int8) for c in sell_conditions)
+    sell_core_count = sum(c.astype(np.int8) for c in sell_conditions[:-1])
+    sell_count = sell_core_count + sell_conditions[-1].astype(np.int8)
+    bt["sell_core_no_b2"] = sell_core_count.eq(9)
     bt["buy_score"] = (buy_count * 10).astype(np.int16)
     bt["sell_score"] = (sell_count * 10).astype(np.int16)
     bt["base_signal"] = np.select(
@@ -2250,12 +2302,15 @@ def _variant_signal(base_signal: str, hour: int, regime_ok: bool, variant: str) 
 # These are intentionally few and interpretable. We do NOT grid-search hundreds
 # of thresholds after seeing the old holdout.
 WF_CANDIDATES = {
-    "WF_SELL_SESSION": "SELL session 06:00–20:00 UTC",
-    "WF_SELL_TREND25": "SELL session + H1 ADX≥25 + H4 ADX≥20",
-    "WF_SELL_PULLBACK40": "SELL session + RSI M5 40–48",
-    "WF_SELL_TREND25_PULLBACK40": "SELL session + trend strength + RSI 40–48",
-    "WF_SELL_TREND25_VOL": "SELL session + trend strength + prior-only volatility regime",
+    # Benchmark: the strongest v4.6 candidate, unchanged.
+    "V47_B2_VOL": "Benchmark: B2 + trend strength + prior-only volatility",
+    # New entry logic: same regime, different entry events.
+    "V47_EMA_REJECT": "EMA20 bearish rejection event + trend/vol regime",
+    "V47_PULLBACK_BREAK": "Recent EMA20 pullback then prior-low break + trend/vol regime",
+    "V47_BREAK20": "Fresh 20-bar downside breakout + trend/vol regime",
+    "V47_MULTI_EVENT": "Any v4.7 event + trend/vol regime",
 }
+
 
 
 def _research_signal_from_row(row: Any, variant: str) -> str:
@@ -2263,36 +2318,252 @@ def _research_signal_from_row(row: Any, variant: str) -> str:
     hour = int(row.entry_hour_utc)
     regime_ok = bool(row.regime_ok)
 
-    # Preserve all v4.4/v4.5 variants exactly.
+    # Preserve legacy research variants exactly.
     if variant in {"STRICT_BOTH", "SELL_ONLY", "SELL_SESSION", "SELL_SESSION_VOL"}:
         return _variant_signal(base_signal, hour, regime_ok, variant)
 
     if variant not in WF_CANDIDATES:
         return base_signal
 
-    # Every v4.6 candidate is SELL-only during the same frozen session.
-    if base_signal != "SELL" or not (6 <= hour < 20):
+    # v4.7 remains SELL-only and preserves the same session used in research.
+    if not (6 <= hour < 20):
         return "WAIT"
 
     adx_h1 = float(getattr(row, "adx_h1", 0.0))
     adx_h4 = float(getattr(row, "adx_h4", 0.0))
-    rsi_m5 = float(getattr(row, "rsi_m5", 0.0))
-
     trend25 = adx_h1 >= 25.0 and adx_h4 >= 20.0
-    pullback40 = 40.0 <= rsi_m5 <= 48.0
 
-    if variant == "WF_SELL_SESSION":
-        return "SELL"
-    if variant == "WF_SELL_TREND25":
-        return "SELL" if trend25 else "WAIT"
-    if variant == "WF_SELL_PULLBACK40":
-        return "SELL" if pullback40 else "WAIT"
-    if variant == "WF_SELL_TREND25_PULLBACK40":
-        return "SELL" if trend25 and pullback40 else "WAIT"
-    if variant == "WF_SELL_TREND25_VOL":
-        return "SELL" if trend25 and regime_ok else "WAIT"
+    # Strong v4.6 regime is retained; only the ENTRY EVENT changes.
+    if not trend25 or not regime_ok:
+        return "WAIT"
+
+    if variant == "V47_B2_VOL":
+        return "SELL" if base_signal == "SELL" else "WAIT"
+
+    sell_core = bool(getattr(row, "sell_core_no_b2", False))
+    if not sell_core:
+        return "WAIT"
+
+    ema_reject = bool(getattr(row, "ema_reject_event", False))
+    pullback_break = bool(getattr(row, "pullback_break_event", False))
+    break20 = bool(getattr(row, "break20_event", False))
+
+    if variant == "V47_EMA_REJECT":
+        return "SELL" if ema_reject else "WAIT"
+    if variant == "V47_PULLBACK_BREAK":
+        return "SELL" if pullback_break else "WAIT"
+    if variant == "V47_BREAK20":
+        return "SELL" if break20 else "WAIT"
+    if variant == "V47_MULTI_EVENT":
+        return "SELL" if (ema_reject or pullback_break or break20) else "WAIT"
 
     return "WAIT"
+
+
+def analyze_forward_candidate(
+    raw: pd.DataFrame,
+    candidate: str,
+) -> dict[str, Any]:
+    """
+    Forward-only version of the v4.7 research candidate logic.
+
+    It uses CLOSED bars only and emits a signal for the next/current quote.
+    No future bar or execution-bar information is used.
+    """
+    base = closed_m5(raw)
+    frames = {
+        "M5": base,
+        "M15": resample_closed(base, "15min"),
+        "H1": resample_closed(base, "1h"),
+        "H4": resample_closed(base, "4h"),
+    }
+    snaps = {name: snapshot(frame) for name, frame in frames.items()}
+
+    if any(v is None for v in snaps.values()):
+        return {
+            "signal": "WAIT",
+            "strength": 0,
+            "reason": "Forward candidate: بيانات غير كافية",
+            "candidate": candidate,
+            "snapshots": snaps,
+            "b2": {},
+            "buy_score": 0,
+            "sell_score": 0,
+            "regime_ok": False,
+            "trend25": False,
+            "event": "NONE",
+        }
+
+    m5 = snaps["M5"]
+    m15 = snaps["M15"]
+    h1 = snaps["H1"]
+    h4 = snaps["H4"]
+
+    # Same strict baseline/B2 calculation used by the research benchmark.
+    b2 = b2_signal(m5["frame"])
+    base_signal, buy_score, sell_score, _ = score_signal(snaps, b2)
+
+    # Session rule is evaluated on the latest fully closed M5 candle.
+    candle_ts = pd.Timestamp(m5["candle"])
+    if candle_ts.tzinfo is None:
+        candle_ts = candle_ts.tz_localize("UTC")
+    else:
+        candle_ts = candle_ts.tz_convert("UTC")
+    hour = int(candle_ts.hour)
+
+    trend25 = float(h1["adx"]) >= 25.0 and float(h4["adx"]) >= 20.0
+
+    # Prior-only volatility regime, matching research methodology.
+    calc = add_indicators(base).dropna(
+        subset=["ema20", "ema50", "rsi", "atr", "momentum", "macd_hist", "adx"]
+    ).reset_index(drop=True)
+
+    if len(calc) < 288 * 3 + 25:
+        return {
+            "signal": "WAIT",
+            "strength": 0,
+            "reason": "Forward candidate: تاريخ M5 غير كافٍ لحساب volatility regime",
+            "candidate": candidate,
+            "snapshots": snaps,
+            "b2": b2,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "regime_ok": False,
+            "trend25": trend25,
+            "event": "NONE",
+        }
+
+    atr_pct = (
+        pd.to_numeric(calc["atr"], errors="coerce")
+        / pd.to_numeric(calc["close"], errors="coerce").replace(0, np.nan)
+    ) * 100.0
+    vol_window = 288 * 10
+    q20 = atr_pct.shift(1).rolling(
+        vol_window, min_periods=288 * 3
+    ).quantile(0.20)
+    q90 = atr_pct.shift(1).rolling(
+        vol_window, min_periods=288 * 3
+    ).quantile(0.90)
+
+    atr_now = float(atr_pct.iloc[-1]) if finite(atr_pct.iloc[-1]) else math.nan
+    q20_now = float(q20.iloc[-1]) if finite(q20.iloc[-1]) else math.nan
+    q90_now = float(q90.iloc[-1]) if finite(q90.iloc[-1]) else math.nan
+    regime_ok = bool(
+        finite(atr_now)
+        and finite(q20_now)
+        and finite(q90_now)
+        and q20_now <= atr_now <= q90_now
+    )
+
+    # Core SELL logic without B2 — exactly the 9 research conditions.
+    sell_core_conditions = [
+        h4["trend"] == "DOWN",
+        h1["trend"] == "DOWN",
+        m15["trend"] == "DOWN",
+        m5["close"] < m5["ema20"] < m5["ema50"],
+        finite(h1.get("ema100")) and h1["close"] < h1["ema100"],
+        32 <= m5["rsi"] <= 48,
+        m5["momentum"] < 0,
+        m5["macd_hist"] < 0,
+        max(m15["adx"], h1["adx"]) >= 20,
+    ]
+    sell_core = all(bool(x) for x in sell_core_conditions)
+
+    # v4.7 event family on the latest CLOSED M5 bar only.
+    close = pd.to_numeric(calc["close"], errors="coerce")
+    open_ = pd.to_numeric(calc["open"], errors="coerce")
+    high = pd.to_numeric(calc["high"], errors="coerce")
+    low = pd.to_numeric(calc["low"], errors="coerce")
+    ema20 = pd.to_numeric(calc["ema20"], errors="coerce")
+
+    touch = high >= ema20
+    ema_reject_raw = touch & (close < ema20) & (close < open_)
+    ema_reject_event = bool(
+        ema_reject_raw.iloc[-1]
+        and not bool(ema_reject_raw.shift(1).fillna(False).iloc[-1])
+    )
+
+    touch_recent4 = (
+        touch.astype(np.int8)
+        .rolling(4, min_periods=1)
+        .max()
+        .astype(bool)
+    )
+    pullback_break_raw = touch_recent4 & (close < low.shift(1))
+    pullback_break_event = bool(
+        pullback_break_raw.iloc[-1]
+        and not bool(pullback_break_raw.shift(1).fillna(False).iloc[-1])
+    )
+
+    prior_low20 = low.shift(1).rolling(20, min_periods=20).min()
+    break20_raw = close < prior_low20
+    break20_event = bool(
+        break20_raw.iloc[-1]
+        and not bool(break20_raw.shift(1).fillna(False).iloc[-1])
+    )
+
+    event = "NONE"
+    event_ok = False
+
+    if candidate == "V47_B2_VOL":
+        event = "B2"
+        event_ok = base_signal == "SELL"
+    elif candidate == "V47_EMA_REJECT":
+        event = "EMA_REJECT"
+        event_ok = sell_core and ema_reject_event
+    elif candidate == "V47_PULLBACK_BREAK":
+        event = "PULLBACK_BREAK"
+        event_ok = sell_core and pullback_break_event
+    elif candidate == "V47_BREAK20":
+        event = "BREAK20"
+        event_ok = sell_core and break20_event
+    elif candidate == "V47_MULTI_EVENT":
+        event = "MULTI_EVENT"
+        event_ok = sell_core and (
+            ema_reject_event or pullback_break_event or break20_event
+        )
+
+    session_ok = 6 <= hour < 20
+    final_ok = bool(session_ok and trend25 and regime_ok and event_ok)
+
+    gate_parts = {
+        "Session 06–20 UTC": session_ok,
+        "Trend strength": trend25,
+        "Volatility regime": regime_ok,
+        "Entry event": event_ok,
+    }
+    passed_count = sum(bool(v) for v in gate_parts.values())
+    strength = int(round(passed_count / len(gate_parts) * 100))
+
+    if final_ok:
+        reason = (
+            f"{candidate}: SELL forward signal • {event} • "
+            "trend/vol/session confirmed"
+        )
+        signal = "SELL"
+    else:
+        missing = [k for k, v in gate_parts.items() if not v]
+        reason = f"{candidate}: WAIT • missing: " + ", ".join(missing)
+        signal = "WAIT"
+
+    return {
+        "signal": signal,
+        "strength": strength,
+        "reason": reason,
+        "candidate": candidate,
+        "snapshots": snaps,
+        "b2": b2,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "regime_ok": regime_ok,
+        "trend25": trend25,
+        "event": event,
+        "event_ok": event_ok,
+        "session_ok": session_ok,
+        "atr_pct": atr_now,
+        "atr_q20": q20_now,
+        "atr_q90": q90_now,
+    }
 
 
 def simulate_prepared_research(
@@ -2702,9 +2973,11 @@ def _walkforward_candidate_gate(
         ("Normalized DD ≤ 5%", float(norm2.get("max_dd_pct", 999.0)) <= 5.0),
     ]
 
+    failed_rules = [name for name, ok in rules if not ok]
     return {
         "eligible": all(ok for _, ok in rules),
         "rules": [{"name": name, "pass": ok} for name, ok in rules],
+        "failed_rules": failed_rules,
         "positive_folds": int(positive_folds),
         "median_avg_r": median_avg_r,
         "worst_avg_r": worst_avg_r,
@@ -2807,6 +3080,7 @@ def run_walkforward_lab(
                 "Worst Avg R": round(gate["worst_avg_r"], 4),
                 "Min Fold Trades": int(gate["min_fold_trades"]),
                 "Eligible": "YES" if gate["eligible"] else "NO",
+                "Gate Fails": " | ".join(gate.get("failed_rules", [])) or "—",
             }
         )
         details[variant] = {
@@ -3031,6 +3305,20 @@ instrument = InstrumentSpec(
 
 st.sidebar.divider()
 mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
+
+st.session_state.forward_candidate = st.sidebar.selectbox(
+    "مرشح Paper Forward",
+    list(WF_CANDIDATES.keys()),
+    index=(
+        list(WF_CANDIDATES.keys()).index(st.session_state.forward_candidate)
+        if st.session_state.forward_candidate in WF_CANDIDATES
+        else 0
+    ),
+    format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
+    help="Paper يستخدم هذا المرشح على السوق الحالي. Live لا يعتمد عليه إلا بعد Fresh Holdout PASS.",
+)
+forward_candidate = st.session_state.forward_candidate
+
 risk_pct = st.sidebar.number_input(
     "مخاطرة الصفقة %",
     min_value=0.05,
@@ -3107,7 +3395,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.6 WALK-FORWARD • Temporal robustness research • "
+    "X10 GOLD v4.8 PAPER FORWARD • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3128,12 +3416,23 @@ reference_price = (
 )
 
 analysis = analyze_mtf(raw)
-if not feed.get("trusted", False) and analysis.get("signal") in {"BUY", "SELL"}:
-    analysis = {
-        **analysis,
-        "signal": "WAIT",
-        "reason": "تم حجب الإشارة بسبب فشل فحص بنية بيانات السوق",
-    }
+forward_analysis = analyze_forward_candidate(raw, forward_candidate)
+
+if not feed.get("trusted", False):
+    if analysis.get("signal") in {"BUY", "SELL"}:
+        analysis = {
+            **analysis,
+            "signal": "WAIT",
+            "reason": "تم حجب الإشارة بسبب فشل فحص بنية بيانات السوق",
+        }
+    if forward_analysis.get("signal") in {"BUY", "SELL"}:
+        forward_analysis = {
+            **forward_analysis,
+            "signal": "WAIT",
+            "reason": "Forward candidate blocked: feed structure check failed",
+        }
+
+execution_analysis = forward_analysis if mode in {"Paper", "Live"} else analysis
 
 candle_id = str(raw["datetime"].iloc[-1])
 research_context = hashlib.sha256(
@@ -3157,30 +3456,31 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
             "time": now_riyadh().isoformat(),
             "symbol": instrument.symbol,
             "candle": candle_id,
-            "signal": analysis["signal"],
-            "strength": analysis["strength"],
-            "buy_score": analysis.get("buy_score", 0),
-            "sell_score": analysis.get("sell_score", 0),
+            "signal": execution_analysis["signal"],
+            "strength": execution_analysis["strength"],
+            "buy_score": execution_analysis.get("buy_score", 0),
+            "sell_score": execution_analysis.get("sell_score", 0),
             "feed_execution_ready": feed.get("execution_ok", False),
-            "reason": analysis["reason"],
+            "reason": execution_analysis["reason"],
+            "candidate": forward_candidate if mode in {"Paper", "Live"} else "LEGACY_ANALYSIS",
         },
     )
     st.session_state.decisions = st.session_state.decisions[:500]
 
-    if analysis["signal"] in {"BUY", "SELL"}:
-        alert_key = f"{instrument.symbol}:{candle_id}:{analysis['signal']}"
+    if execution_analysis["signal"] in {"BUY", "SELL"}:
+        alert_key = f"{instrument.symbol}:{candle_id}:{execution_analysis['signal']}"
         if st.session_state.last_alert_candle.get(instrument.symbol) != alert_key:
             st.session_state.last_alert_candle[instrument.symbol] = alert_key
             st.toast(
-                f"{instrument.symbol} • {analysis['signal']} • قوة {analysis['strength']}%",
+                f"{instrument.symbol} • {execution_analysis['signal']} • قوة {execution_analysis['strength']}%",
                 icon="⚡",
             )
 
 mini_grid(
     [
         ("السعر", fmt(reference_price, 4), ""),
-        ("القرار", analysis["signal"], "ok" if analysis["signal"] in {"BUY", "SELL"} else "wait"),
-        ("القوة", f"{analysis['strength']}%", ""),
+        ("القرار", execution_analysis["signal"], "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"),
+        ("القوة", f"{execution_analysis['strength']}%", ""),
         ("Execution Feed", "READY" if feed.get("execution_ok") else "BLOCKED", "ok" if feed.get("execution_ok") else "bad"),
         ("Live", "UNLOCKED" if live_unlocked else "LOCKED", "ok" if live_unlocked else "wait"),
         ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF", "wait" if st.session_state.kill_switch else "ok"),
@@ -3244,6 +3544,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+forward_signal_class = (
+    "sell" if forward_analysis.get("signal") == "SELL"
+    else "state-wait"
+)
+st.markdown(
+    f"<div class='card'><div class='kicker'>PAPER FORWARD CANDIDATE</div>"
+    f"<div class='big {forward_signal_class}'>{forward_analysis.get('signal','WAIT')}</div>"
+    f"<p>{forward_analysis.get('reason','')}</p>"
+    f"<div class='muted'>{forward_candidate} • "
+    f"Event {forward_analysis.get('event','NONE')} • "
+    f"Trend25 {'YES' if forward_analysis.get('trend25') else 'NO'} • "
+    f"Vol {'YES' if forward_analysis.get('regime_ok') else 'NO'} • "
+    f"Session {'YES' if forward_analysis.get('session_ok') else 'NO'}</div></div>",
+    unsafe_allow_html=True,
+)
+
+if mode == "Paper":
+    st.info(
+        "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
+        "المخاطرة الافتراضية 0.25%، ومركز واحد فقط."
+    )
+
 # ---------------------------- chart ---------------------------
 chart_df = raw.tail(288)[["datetime", "close"]].copy()
 chart_min = float(chart_df["close"].min())
@@ -3305,11 +3628,11 @@ with st.expander("لماذا هذا القرار؟", expanded=False):
 
 # ----------------------- analysis trade plan ------------------
 paper_plan: dict[str, Any] | None = None
-m5_snap = analysis.get("snapshots", {}).get("M5")
-if analysis["signal"] in {"BUY", "SELL"} and m5_snap:
+m5_snap = forward_analysis.get("snapshots", {}).get("M5")
+if forward_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
     try:
         paper_plan = build_trade_plan(
-            analysis["signal"],
+            forward_analysis["signal"],
             reference_price,
             float(m5_snap["atr"]),
             float(st.session_state.paper_balance),
@@ -3337,7 +3660,7 @@ if paper_plan:
 
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
-    st.subheader("Paper Trading")
+    st.subheader("Paper Forward Trading — Live Market / Simulated Money")
     day_pnl = float(st.session_state.paper_balance) - float(st.session_state.paper_day_start_balance)
     p_open = 1 if st.session_state.paper_position else 0
     p_gate_ok = False
@@ -3374,10 +3697,13 @@ if mode == "Paper":
         "paper-grid",
     )
 
-    st.caption("حالة Paper محفوظة داخل جلسة Streamlit الحالية وليست قاعدة بيانات دائمة.")
+    st.caption(
+        f"Candidate: {forward_candidate} • Risk {float(risk_pct):.2f}% • "
+        "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. حالة Paper داخل جلسة Streamlit الحالية."
+    )
 
     st.session_state.auto_paper = st.toggle(
-        "Auto Paper",
+        "Auto Paper Forward",
         value=st.session_state.auto_paper,
         help="يفتح Paper فقط عند وجود إشارة، خطة، وسعر تنفيذ حديث",
     )
@@ -3440,6 +3766,21 @@ if mode == "Live":
         "في Live: Twelve Data للتحليل فقط. سعر الدخول وحالة الحساب والمراكز يجب أن تأتي من Broker Bridge."
     )
 
+
+    fresh = st.session_state.get("fresh_holdout") or {}
+    fresh_gate_preview = fresh.get("gate") or {}
+    paper_closed_preview = list(st.session_state.get("paper_history", []))
+    paper_net_preview = sum(float(x.get("PnL", 0.0)) for x in paper_closed_preview)
+    mini_grid(
+        [
+            ("Candidate", forward_candidate, ""),
+            ("Fresh Holdout", "PASS" if fresh_gate_preview.get("passed") else "NOT PASSED", "ok" if fresh_gate_preview.get("passed") else "bad"),
+            ("Paper Trades", str(len(paper_closed_preview)), "ok" if len(paper_closed_preview) >= 20 else "wait"),
+            ("Paper Net", f"${paper_net_preview:,.2f}", "ok" if paper_net_preview > 0 else "wait"),
+        ],
+        "tf-grid",
+    )
+
     if not live_unlocked:
         st.warning("LIVE_TRADING_ENABLED=false — التنفيذ الحقيقي مقفول.")
     if not bridge:
@@ -3495,14 +3836,14 @@ if mode == "Live":
 
         live_plan = None
         if (
-            analysis["signal"] in {"BUY", "SELL"}
+            forward_analysis["signal"] in {"BUY", "SELL"}
             and m5_snap
             and broker_quote.get("ok")
             and equity > 0
         ):
             try:
                 live_plan = build_trade_plan(
-                    analysis["signal"],
+                    forward_analysis["signal"],
                     float(broker_quote["price"]),
                     float(m5_snap["atr"]),
                     equity,
@@ -3544,13 +3885,35 @@ if mode == "Live":
                 day_start_equity,
             )
 
-        research_gate = st.session_state.get("research_gate", {})
-        if not research_gate.get("passed", False):
+        # v4.8 Live qualification chain:
+        # 1) the exact selected candidate must pass a fresh untouched holdout;
+        # 2) forward paper sample must be large enough and positive;
+        # 3) all broker/risk controls below must also pass.
+        fresh = st.session_state.get("fresh_holdout") or {}
+        fresh_gate = fresh.get("gate") or {}
+        fresh_candidate = fresh.get("candidate")
+
+        if not fresh_gate.get("passed", False):
             live_gate_ok = False
-            live_reasons.append("Final Research Gate لم يجتز الاختبارات")
-        elif research_gate.get("context") != research_context:
+            live_reasons.append("Fresh Holdout للمرشح لم يجتز بعد")
+        elif fresh_candidate != forward_candidate:
             live_gate_ok = False
-            live_reasons.append("إعدادات الأصل/المخاطرة تغيّرت بعد الاختبار؛ أعد Final Research Audit")
+            live_reasons.append("مرشح Live الحالي لا يطابق المرشح الذي اجتاز Fresh Holdout")
+
+        closed_forward = list(st.session_state.get("paper_history", []))
+        forward_trade_count = len(closed_forward)
+        forward_net = sum(float(x.get("PnL", 0.0)) for x in closed_forward)
+
+        if forward_trade_count < 20:
+            live_gate_ok = False
+            live_reasons.append(
+                f"Paper Forward يحتاج 20 صفقة مغلقة على الأقل — الحالي {forward_trade_count}"
+            )
+        if forward_trade_count >= 20 and forward_net <= 0:
+            live_gate_ok = False
+            live_reasons.append(
+                f"Paper Forward Net يجب أن يكون موجبًا — الحالي ${forward_net:,.2f}"
+            )
 
         if not positions_verified:
             live_gate_ok = False
@@ -3599,7 +3962,7 @@ if mode == "Live":
         ):
             payload = live_payload(
                 live_plan,
-                analysis,
+                forward_analysis,
                 instrument,
                 candle_id,
                 broker_quote_payload or {},
@@ -3635,7 +3998,7 @@ if mode == "Live":
             if st.session_state.last_auto_live_candle.get(instrument.symbol) != candle_id:
                 payload = live_payload(
                     live_plan,
-                    analysis,
+                    forward_analysis,
                     instrument,
                     candle_id,
                     broker_quote_payload or {},
@@ -4326,11 +4689,11 @@ else:
 
 # ------------------- v4.6 walk-forward research lab -------------------
 st.divider()
-st.subheader("Walk-Forward Research Lab — v4.6.1")
+st.subheader("Walk-Forward Research Lab — v4.8")
 st.caption(
-    "بعد فشل SELL_SESSION على النافذة المستقلة، نضم نافذتي التطوير والاختبار السابق "
-    "إلى Research History واحدة (~360 يوم). نختبر فقط عائلة صغيرة مُعلنة مسبقًا عبر "
-    "6 نوافذ زمنية. لا يتم فتح Live من هذه الشاشة."
+    "v4.7 يثبت Regime القوي من v4.6 (trend strength + prior-only volatility) لكنه يغيّر "
+    "منطق الدخول نفسه إلى أحداث EMA rejection / pullback break / fresh breakout. "
+    "الهدف زيادة العينة والثبات عبر 6 نوافذ بدون تخفيف Gate أو لمس Fresh Holdout."
 )
 
 dev_bt = st.session_state.get("backtest")
@@ -4441,7 +4804,7 @@ else:
                         )
                     )
                 else:
-                    st.write("4/4 • تشغيل 5 مرشحين × 6 نوافذ + 2/5 bps")
+                    st.write("4/4 • تشغيل 5 Entry Models × 6 نوافذ + 2/5 bps")
                     wf_result = run_walkforward_lab(
                         wf_prepared,
                         instrument,
@@ -4471,18 +4834,59 @@ else:
     wf = st.session_state.get("walkforward_lab")
     if wf and wf.get("ok"):
         st.markdown("### Walk-Forward Candidate Summary")
+        summary_df = wf.get("summary", pd.DataFrame())
         st.dataframe(
-            wf.get("summary", pd.DataFrame()),
+            summary_df,
             hide_index=True,
             use_container_width=True,
         )
 
+        if not summary_df.empty:
+            st.markdown("### Mobile Candidate Audit")
+            for _, sr in summary_df.iterrows():
+                variant_name = str(sr.get("Variant", ""))
+                d = (wf.get("details", {}) or {}).get(variant_name, {})
+                gate = d.get("gate", {})
+                mini_grid(
+                    [
+                        ("Candidate", variant_name, ""),
+                        ("Trades", str(int(sr.get("Trades", 0))), ""),
+                        ("2bps PF", f"{float(sr.get('2bps PF',0.0)):.3f}", "ok" if float(sr.get("2bps PF",0.0)) >= 1.2 else "bad"),
+                        ("2bps Avg R", f"{float(sr.get('2bps Avg R',0.0)):.3f}R", "ok" if float(sr.get("2bps Avg R",0.0)) >= 0.05 else "bad"),
+                        ("5bps PF", f"{float(sr.get('5bps PF',0.0)):.3f}", "ok" if float(sr.get("5bps PF",0.0)) >= 1.05 else "bad"),
+                        ("Positive Folds", str(sr.get("Positive Folds","")), ""),
+                        ("Min Fold Trades", str(int(sr.get("Min Fold Trades",0))), ""),
+                        ("Gate", "PASS" if gate.get("eligible") else "FAIL", "ok" if gate.get("eligible") else "bad"),
+                    ],
+                    "plan-grid",
+                )
+                failed = gate.get("failed_rules", [])
+                if failed:
+                    st.caption("Gate fails: " + " • ".join(failed))
+                else:
+                    st.caption("Gate fails: none")
+                st.divider()
+
         st.markdown("### Fold-by-Fold Matrix")
-        st.dataframe(
-            wf.get("folds", pd.DataFrame()),
-            hide_index=True,
-            use_container_width=True,
-        )
+        folds_df = wf.get("folds", pd.DataFrame())
+        if not folds_df.empty:
+            fold_variant = st.selectbox(
+                "اعرض Folds لمرشح واحد",
+                list(WF_CANDIDATES.keys()),
+                key="wf_fold_variant_view",
+            )
+            st.dataframe(
+                folds_df[folds_df["Variant"] == fold_variant],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        with st.expander("عرض كل Fold-by-Fold Matrix", expanded=False):
+            st.dataframe(
+                folds_df,
+                hide_index=True,
+                use_container_width=True,
+            )
 
         eligible = list(wf.get("eligible", []))
         mini_grid(
@@ -4497,8 +4901,8 @@ else:
 
         if not eligible:
             st.error(
-                "لا يوجد مرشح اجتاز Walk-Forward Gate. "
-                "لا نلمس Fresh Holdout؛ نحتاج منطق إشارة جديد بدل تعديل الشروط لإجبار PASS."
+                "لا يوجد مرشح اجتاز Walk-Forward Gate. Fresh Holdout يبقى غير مستخدم. "
+                "لا نخفف Gate ولا نعدّل Fresh Holdout لإجبار PASS؛ نغيّر منطق الدخول فقط."
             )
         else:
             st.success(
@@ -4705,6 +5109,7 @@ health_rows = [
     {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
     {"Component": "Independent validation", "Status": "PASS" if ((st.session_state.get("independent_validation") or {}).get("gate") or {}).get("passed", False) else "NOT PASSED"},
     {"Component": "Walk-forward lab", "Status": "CANDIDATE READY" if ((st.session_state.get("walkforward_lab") or {}).get("eligible")) else "RESEARCH"},
+    {"Component": "Paper Forward", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
     {"Component": "Fresh holdout", "Status": "PASS" if ((st.session_state.get("fresh_holdout") or {}).get("gate") or {}).get("passed", False) else "UNUSED/FAIL"},
     {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
     {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
@@ -4736,10 +5141,11 @@ with st.expander("Decision Log", expanded=False):
         st.info("لا يوجد سجل بعد")
 
 st.info(
-    "FINAL SAFETY: نتائج Walk-Forward أو Fresh Holdout لا تفتح Live تلقائيًا. "
-    "Live يبقى مشروطًا بـ Broker Bridge فعلي + Broker Quote حديث + positions موثقة + "
-    "بيانات عقد موثقة + LIVE_UI_PIN + بوابات الأمان الحالية. "
-    "أي PASS بحثي يعني الانتقال إلى Paper Forward، وليس ضمان ربح."
+    "FINAL SAFETY v4.8: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+    "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
+    "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
+    "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
+    "هذه البوابات لا تعني ضمان الربح؛ هي شروط تحقق وتشغيل فقط."
 )
 
 if st.session_state.auto_refresh:
@@ -4776,7 +5182,7 @@ if st.session_state.auto_refresh:
             and not st.session_state.paper_position
             and hb_feed.get("execution_ok", False)
         ):
-            hb_analysis = analyze_mtf(hb_raw)
+            hb_analysis = analyze_forward_candidate(hb_raw, forward_candidate)
             hb_m5 = hb_analysis.get("snapshots", {}).get("M5")
             hb_candle = str(hb_raw["datetime"].iloc[-1])
 
