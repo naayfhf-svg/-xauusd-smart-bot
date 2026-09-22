@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 import threading
+import sqlite3
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.8.2-x10-api-safe"
+VERSION = "4.9.0-x10-persistent-paper"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -185,6 +186,126 @@ def mini_grid(items: list[tuple[str, str, str]], css_class: str = "status-grid")
     st.markdown(f"<div class='{css_class}'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
+
+# ---------------------- persistent Paper state ----------------------
+# This SQLite layer survives browser refreshes / normal Streamlit reruns.
+# On hosts with ephemeral disks (including some Streamlit deployments),
+# a full container rebuild can still reset the local DB. If a durable
+# external volume is available, set GOLD_AI_STATE_DB_PATH to that path.
+
+PERSIST_KEYS = (
+    "paper_balance",
+    "paper_position",
+    "paper_history",
+    "paper_day",
+    "paper_day_start_balance",
+    "paper_trades_today",
+    "auto_paper",
+    "forward_candidate",
+    "last_auto_paper_candle",
+    "paper_order_keys",
+)
+
+
+def _state_db_path() -> str:
+    configured = str(secret("GOLD_AI_STATE_DB_PATH", "") or "").strip()
+    return configured or "/tmp/gold_ai_x10_state.sqlite3"
+
+
+@st.cache_resource
+def state_db() -> dict[str, Any]:
+    path = _state_db_path()
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kv_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return {
+        "conn": conn,
+        "lock": threading.RLock(),
+        "path": path,
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
+
+def state_write(key: str, value: Any) -> None:
+    db = state_db()
+    payload = json.dumps(value, ensure_ascii=False, default=_jsonable)
+    with db["lock"]:
+        db["conn"].execute(
+            """
+            INSERT INTO kv_state(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (key, payload, now_riyadh().isoformat()),
+        )
+        db["conn"].commit()
+
+
+def state_read(key: str, default: Any = None) -> Any:
+    db = state_db()
+    with db["lock"]:
+        row = db["conn"].execute(
+            "SELECT value FROM kv_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default
+
+
+def restore_persistent_state() -> None:
+    for key in PERSIST_KEYS:
+        saved = state_read(key, None)
+        if saved is not None:
+            st.session_state[key] = saved
+
+
+def persist_paper_state() -> None:
+    for key in PERSIST_KEYS:
+        if key in st.session_state:
+            try:
+                state_write(key, st.session_state.get(key))
+            except Exception:
+                # Never break trading/Paper UI because persistence failed.
+                pass
+
+
+def remember_paper_order(order_key: str) -> bool:
+    """
+    Idempotency guard.
+    Returns True only the first time an auto-paper order key is seen.
+    """
+    keys = list(st.session_state.get("paper_order_keys", []))
+    if order_key in keys:
+        return False
+    keys.append(order_key)
+    st.session_state.paper_order_keys = keys[-500:]
+    persist_paper_state()
+    return True
+
+
 def init_state() -> None:
     defaults = {
         "kill_switch": True,
@@ -204,6 +325,7 @@ def init_state() -> None:
         "paper_day": now_riyadh().date().isoformat(),
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
+        "paper_order_keys": [],
         "backtest": None,
         "independent_validation": None,
         "walkforward_lab": None,
@@ -219,11 +341,15 @@ def init_state() -> None:
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
+    # Restore Paper state after defaults are present.
+    restore_persistent_state()
+
     today = now_riyadh().date().isoformat()
     if st.session_state.paper_day != today:
         st.session_state.paper_day = today
         st.session_state.paper_day_start_balance = float(st.session_state.paper_balance)
         st.session_state.paper_trades_today = 0
+        persist_paper_state()
 
 
 init_state()
@@ -1246,9 +1372,17 @@ def paper_unrealized_r(position: dict[str, Any], price: float) -> float:
     return direction * (price - position["entry"]) / distance
 
 
-def open_paper(plan: dict[str, Any], instrument: InstrumentSpec) -> None:
+def open_paper(
+    plan: dict[str, Any],
+    instrument: InstrumentSpec,
+    order_key: str | None = None,
+) -> bool:
     if st.session_state.paper_position:
-        return
+        return False
+
+    if order_key and not remember_paper_order(order_key):
+        return False
+
     st.session_state.paper_position = {
         "id": uuid.uuid4().hex[:12],
         "opened_at": now_riyadh().isoformat(),
@@ -1266,8 +1400,12 @@ def open_paper(plan: dict[str, Any], instrument: InstrumentSpec) -> None:
         "tp1_hit": False,
         "remaining": 1.0,
         "realized_r": 0.0,
+        "candidate": st.session_state.get("forward_candidate", "UNKNOWN"),
+        "order_key": order_key,
     }
     st.session_state.paper_trades_today += 1
+    persist_paper_state()
+    return True
 
 
 def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_value: float) -> None:
@@ -1286,9 +1424,12 @@ def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_valu
             "R": round(r_value, 4),
             "PnL": round(pnl, 2),
             "reason": reason,
+            "candidate": position.get("candidate"),
+            "order_key": position.get("order_key"),
         },
     )
     st.session_state.paper_position = None
+    persist_paper_state()
 
 
 def manage_paper(price: float) -> None:
@@ -1309,6 +1450,7 @@ def manage_paper(price: float) -> None:
             p["remaining"] = 0.5
             p["realized_r"] = 0.5
             p["stop"] = p["entry"]
+            persist_paper_state()
         if p["tp1_hit"] and price >= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["tp2"] - p["entry"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
@@ -1322,6 +1464,7 @@ def manage_paper(price: float) -> None:
             p["remaining"] = 0.5
             p["realized_r"] = 0.5
             p["stop"] = p["entry"]
+            persist_paper_state()
         if p["tp1_hit"] and price <= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["entry"] - p["tp2"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
@@ -3439,6 +3582,7 @@ st.session_state.forward_candidate = st.sidebar.selectbox(
     help="Paper يستخدم هذا المرشح على السوق الحالي. Live لا يعتمد عليه إلا بعد Fresh Holdout PASS.",
 )
 forward_candidate = st.session_state.forward_candidate
+persist_paper_state()
 
 risk_pct = st.sidebar.number_input(
     "مخاطرة الصفقة %",
@@ -3523,7 +3667,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.8.2 API-SAFE PAPER FORWARD • live-market forward test • "
+    "X10 GOLD v4.9 PERSISTENT PAPER FORWARD • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3883,7 +4027,18 @@ if mode == "Paper":
 
     st.caption(
         f"Candidate: {forward_candidate} • Risk {float(risk_pct):.2f}% • "
-        "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. حالة Paper داخل جلسة Streamlit الحالية."
+        "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
+        "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
+    )
+
+    mini_grid(
+        [
+            ("حفظ Paper", "مفعّل", "ok"),
+            ("منع تكرار الأوامر", "مفعّل", "ok"),
+            ("DB", "SQLite", ""),
+            ("سجل الصفقات", str(len(st.session_state.paper_history)), ""),
+        ],
+        "tf-grid",
     )
 
     st.session_state.auto_paper = st.toggle(
@@ -3891,6 +4046,7 @@ if mode == "Paper":
         value=st.session_state.auto_paper,
         help="يفتح Paper فقط عند وجود إشارة، خطة، وسعر تنفيذ حديث",
     )
+    persist_paper_state()
 
     if paper_plan and not st.session_state.paper_position:
         if st.button(
@@ -3899,7 +4055,11 @@ if mode == "Paper":
             use_container_width=True,
             disabled=not p_gate_ok,
         ):
-            open_paper(paper_plan, instrument)
+            manual_key = (
+                f"MANUAL:{instrument.symbol}:{forward_candidate}:"
+                f"{now_riyadh().isoformat()}:{uuid.uuid4().hex[:8]}"
+            )
+            open_paper(paper_plan, instrument, order_key=manual_key)
             st.rerun()
 
     if (
@@ -3909,9 +4069,13 @@ if mode == "Paper":
         and not st.session_state.paper_position
     ):
         if st.session_state.last_auto_paper_candle.get(instrument.symbol) != candle_id:
-            st.session_state.last_auto_paper_candle[instrument.symbol] = candle_id
-            open_paper(paper_plan, instrument)
-            st.rerun()
+            auto_key = (
+                f"AUTO:{instrument.symbol}:{forward_candidate}:{candle_id}"
+            )
+            if open_paper(paper_plan, instrument, order_key=auto_key):
+                st.session_state.last_auto_paper_candle[instrument.symbol] = candle_id
+                persist_paper_state()
+                st.rerun()
 
     for reason in dict.fromkeys(p_gate_reasons):
         st.warning(reason)
@@ -3931,6 +4095,13 @@ if mode == "Paper":
                 st.rerun()
         else:
             st.warning("المركز Paper مفتوح لكن تحديثه موقوف لأن سعر التنفيذ غير جاهز.")
+
+    with st.expander("حالة الحفظ", expanded=False):
+        st.write(f"مسار قاعدة البيانات: `{state_db()['path']}`")
+        st.write(
+            "الحفظ يستمر مع Refresh وRerun. إذا أعاد مزود الاستضافة بناء الحاوية بالكامل، "
+            "فقد تحتاج لاحقًا قاعدة بيانات خارجية دائمة."
+        )
 
     if st.session_state.paper_history:
         paper_df = pd.DataFrame(st.session_state.paper_history)
@@ -5288,6 +5459,8 @@ health_rows = [
     {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
     {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
     {"Component": "Paper engine", "Status": "ONLINE"},
+    {"Component": "Paper persistence", "Status": "ACTIVE"},
+    {"Component": "Order idempotency", "Status": "ACTIVE"},
     {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
     {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
     {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
@@ -5326,7 +5499,7 @@ with st.expander("Decision Log", expanded=False):
         st.info("لا يوجد سجل بعد")
 
 st.info(
-    "FINAL SAFETY v4.8.2: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+    "FINAL SAFETY v4.9: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
     "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
     "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
     "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
@@ -5401,8 +5574,16 @@ if st.session_state.auto_refresh:
                         and st.session_state.last_auto_paper_candle.get(instrument.symbol)
                         != hb_candle
                     ):
-                        st.session_state.last_auto_paper_candle[instrument.symbol] = hb_candle
-                        open_paper(hb_plan, instrument)
+                        hb_key = (
+                            f"AUTO:{instrument.symbol}:{forward_candidate}:{hb_candle}"
+                        )
+                        if open_paper(
+                            hb_plan,
+                            instrument,
+                            order_key=hb_key,
+                        ):
+                            st.session_state.last_auto_paper_candle[instrument.symbol] = hb_candle
+                            persist_paper_state()
                 except ValueError:
                     pass
 
