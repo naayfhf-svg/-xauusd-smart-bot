@@ -28,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.9.2-x10-clean-sidebar"
+VERSION = "4.11.0-x10-smart-autopilot"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -202,6 +202,7 @@ PERSIST_KEYS = (
     "paper_trades_today",
     "auto_paper",
     "forward_candidate",
+    "adaptive_profile_choice",
     "last_auto_paper_candle",
     "paper_order_keys",
 )
@@ -331,6 +332,7 @@ def init_state() -> None:
         "walkforward_lab": None,
         "fresh_holdout": None,
         "forward_candidate": "V47_B2_VOL",
+        "adaptive_profile_choice": "ذكي تلقائي",
         "research_gate": {
             "passed": False,
             "context": None,
@@ -2683,21 +2685,129 @@ def analyze_forward_candidate(
         / pd.to_numeric(calc["close"], errors="coerce").replace(0, np.nan)
     ) * 100.0
     vol_window = 288 * 10
+    q10 = atr_pct.shift(1).rolling(
+        vol_window, min_periods=288 * 3
+    ).quantile(0.10)
     q20 = atr_pct.shift(1).rolling(
         vol_window, min_periods=288 * 3
     ).quantile(0.20)
     q90 = atr_pct.shift(1).rolling(
         vol_window, min_periods=288 * 3
     ).quantile(0.90)
+    q95 = atr_pct.shift(1).rolling(
+        vol_window, min_periods=288 * 3
+    ).quantile(0.95)
 
     atr_now = float(atr_pct.iloc[-1]) if finite(atr_pct.iloc[-1]) else math.nan
+    q10_now = float(q10.iloc[-1]) if finite(q10.iloc[-1]) else math.nan
     q20_now = float(q20.iloc[-1]) if finite(q20.iloc[-1]) else math.nan
     q90_now = float(q90.iloc[-1]) if finite(q90.iloc[-1]) else math.nan
+    q95_now = float(q95.iloc[-1]) if finite(q95.iloc[-1]) else math.nan
     regime_ok = bool(
         finite(atr_now)
         and finite(q20_now)
         and finite(q90_now)
         and q20_now <= atr_now <= q90_now
+    )
+    fast_regime_ok = bool(
+        finite(atr_now)
+        and finite(q10_now)
+        and finite(q95_now)
+        and q10_now <= atr_now <= q95_now
+    )
+
+
+    # Adaptive Paper thresholds from PRIOR closed bars only.
+    # Nothing here is manually chosen by the user at runtime.
+    h1_frame = add_indicators(frames["H1"]).dropna(subset=["adx"]).reset_index(drop=True)
+    h4_frame = add_indicators(frames["H4"]).dropna(subset=["adx"]).reset_index(drop=True)
+
+    def _prior_quantile(series: pd.Series, q: float, lookback: int, fallback: float) -> float:
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        if len(values) < 20:
+            return float(fallback)
+        prior = values.iloc[:-1].tail(int(lookback))
+        if len(prior) < 10:
+            return float(fallback)
+        v = float(prior.quantile(q))
+        return v if finite(v) else float(fallback)
+
+    adaptive_candidate_profiles = {
+        "V410_ADAPTIVE_STRICT": {
+            "profile": "صارم",
+            "h1_q": 0.60,
+            "h4_q": 0.55,
+            "h1_clip": (20.0, 30.0),
+            "h4_clip": (17.0, 26.0),
+            "vol_low_q": 0.20,
+            "vol_high_q": 0.90,
+        },
+        "V410_ADAPTIVE_BALANCED": {
+            "profile": "متوازن",
+            "h1_q": 0.45,
+            "h4_q": 0.40,
+            "h1_clip": (18.0, 28.0),
+            "h4_clip": (15.0, 24.0),
+            "vol_low_q": 0.12,
+            "vol_high_q": 0.93,
+        },
+        "V410_ADAPTIVE_FLEX": {
+            "profile": "مرن",
+            "h1_q": 0.35,
+            "h4_q": 0.30,
+            "h1_clip": (16.0, 25.0),
+            "h4_clip": (14.0, 22.0),
+            "vol_low_q": 0.08,
+            "vol_high_q": 0.97,
+        },
+    }
+    adaptive_cfg = adaptive_candidate_profiles.get(
+        candidate,
+        adaptive_candidate_profiles["V410_ADAPTIVE_BALANCED"],
+    )
+
+    adaptive_h1_adx = float(np.clip(
+        _prior_quantile(
+            h1_frame["adx"],
+            adaptive_cfg["h1_q"],
+            240,
+            22.0,
+        ),
+        adaptive_cfg["h1_clip"][0],
+        adaptive_cfg["h1_clip"][1],
+    ))
+    adaptive_h4_adx = float(np.clip(
+        _prior_quantile(
+            h4_frame["adx"],
+            adaptive_cfg["h4_q"],
+            180,
+            18.0,
+        ),
+        adaptive_cfg["h4_clip"][0],
+        adaptive_cfg["h4_clip"][1],
+    ))
+
+    adaptive_vol_low = float(
+        _prior_quantile(
+            atr_pct,
+            adaptive_cfg["vol_low_q"],
+            2880,
+            q10_now if finite(q10_now) else atr_now,
+        )
+    )
+    adaptive_vol_high = float(
+        _prior_quantile(
+            atr_pct,
+            adaptive_cfg["vol_high_q"],
+            2880,
+            q95_now if finite(q95_now) else atr_now,
+        )
+    )
+    adaptive_regime_ok = bool(
+        finite(atr_now)
+        and finite(adaptive_vol_low)
+        and finite(adaptive_vol_high)
+        and adaptive_vol_low <= atr_now <= adaptive_vol_high
     )
 
     # Core SELL logic without B2 — exactly the 9 research conditions.
@@ -2750,7 +2860,55 @@ def analyze_forward_candidate(
     event = "NONE"
     event_ok = False
 
-    if candidate == "V47_B2_VOL":
+    if candidate in {
+        "V410_ADAPTIVE_STRICT",
+        "V410_ADAPTIVE_BALANCED",
+        "V410_ADAPTIVE_FLEX",
+    }:
+        adaptive_profile_name = adaptive_cfg["profile"]
+
+        h4_structure_ok = (
+            h4["trend"] == "DOWN"
+            if adaptive_profile_name == "صارم"
+            else h4["trend"] != "UP"
+        )
+        adaptive_trend_ok = bool(
+            h1["trend"] == "DOWN"
+            and m15["trend"] == "DOWN"
+            and h4_structure_ok
+            and float(h1["adx"]) >= adaptive_h1_adx
+            and float(h4["adx"]) >= adaptive_h4_adx
+        )
+
+        if adaptive_profile_name == "صارم":
+            # Stronger entry confirmation; fewer trades.
+            adaptive_event_ok = bool(
+                base_signal == "SELL"
+                or pullback_break_event
+            )
+            event = "ADAPTIVE_STRICT"
+        elif adaptive_profile_name == "مرن":
+            # More opportunities, but risk is automatically smallest.
+            adaptive_event_ok = bool(
+                base_signal == "SELL"
+                or ema_reject_event
+                or pullback_break_event
+                or break20_event
+            )
+            event = "ADAPTIVE_FLEX"
+        else:
+            adaptive_event_ok = bool(
+                base_signal == "SELL"
+                or ema_reject_event
+                or pullback_break_event
+                or break20_event
+            )
+            event = "ADAPTIVE_BALANCED"
+
+        event_ok = adaptive_event_ok
+        trend25 = adaptive_trend_ok
+        regime_ok = adaptive_regime_ok
+    elif candidate == "V47_B2_VOL":
         event = "B2"
         event_ok = base_signal == "SELL"
     elif candidate == "V47_EMA_REJECT":
@@ -2768,11 +2926,16 @@ def analyze_forward_candidate(
             ema_reject_event or pullback_break_event or break20_event
         )
 
-    session_ok = 6 <= hour < 20
+    adaptive_profile_candidate = candidate in {
+        "V410_ADAPTIVE_STRICT",
+        "V410_ADAPTIVE_BALANCED",
+        "V410_ADAPTIVE_FLEX",
+    }
+    session_ok = True if adaptive_profile_candidate else (6 <= hour < 20)
     final_ok = bool(session_ok and trend25 and regime_ok and event_ok)
 
     gate_parts = {
-        "Session 06–20 UTC": session_ok,
+        ("Market-open feed" if adaptive_profile_candidate else "Session 06–20 UTC"): session_ok,
         "Trend strength": trend25,
         "Volatility regime": regime_ok,
         "Entry event": event_ok,
@@ -2827,6 +2990,11 @@ def analyze_forward_candidate(
         "atr_pct": atr_now,
         "atr_q20": q20_now,
         "atr_q90": q90_now,
+        "adaptive_h1_adx": adaptive_h1_adx,
+        "adaptive_h4_adx": adaptive_h4_adx,
+        "adaptive_vol_low": adaptive_vol_low,
+        "adaptive_vol_high": adaptive_vol_high,
+        "adaptive_profile": adaptive_cfg.get("profile", "متوازن"),
     }
 
 
@@ -3546,6 +3714,33 @@ st.session_state.auto_paper = st.sidebar.toggle(
     value=st.session_state.auto_paper,
     help="يفتح صفقة Paper تلقائيًا فقط عند اكتمال الإشارة وبوابة المخاطر.",
 )
+
+adaptive_paper_mode = st.sidebar.toggle(
+    "الوضع الذكي التكيفي — Paper",
+    value=(mode == "Paper"),
+    disabled=(mode != "Paper"),
+    help=(
+        "يضبط شروط الاتجاه والتذبذب تلقائيًا من البيانات السابقة، "
+        "ويخفّض المخاطرة بعد الخسائر. لا يعمل في Live."
+    ),
+)
+
+profile_options = ["ذكي تلقائي", "صارم", "متوازن", "مرن"]
+current_profile = st.session_state.get("adaptive_profile_choice", "ذكي تلقائي")
+if current_profile not in profile_options:
+    current_profile = "ذكي تلقائي"
+
+st.session_state.adaptive_profile_choice = st.sidebar.selectbox(
+    "نمط الدخول",
+    profile_options,
+    index=profile_options.index(current_profile),
+    disabled=(mode != "Paper" or not adaptive_paper_mode),
+    help=(
+        "ذكي تلقائي يفحص صارم ومتوازن ومرن معًا ويختار الأنسب كل دورة. "
+        "لا تحتاج ضبط ADX أو التذبذب أو المخاطرة يدويًا."
+    ),
+)
+
 persist_paper_state()
 
 advanced_settings = st.sidebar.toggle(
@@ -3675,6 +3870,132 @@ instrument = InstrumentSpec(
     max_qty=float(max_qty),
 )
 
+ADAPTIVE_PROFILE_CANDIDATES = {
+    "صارم": "V410_ADAPTIVE_STRICT",
+    "متوازن": "V410_ADAPTIVE_BALANCED",
+    "مرن": "V410_ADAPTIVE_FLEX",
+}
+ADAPTIVE_CANDIDATES = set(ADAPTIVE_PROFILE_CANDIDATES.values())
+
+def recent_paper_loss_streak() -> int:
+    streak = 0
+    for item in list(st.session_state.get("paper_history", []))[:5]:
+        if float(item.get("PnL", 0.0)) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+selected_profile = st.session_state.get("adaptive_profile_choice", "ذكي تلقائي")
+adaptive_profile = (
+    "متوازن" if selected_profile == "ذكي تلقائي" else selected_profile
+)
+
+active_candidate = (
+    ADAPTIVE_PROFILE_CANDIDATES[adaptive_profile]
+    if (mode == "Paper" and adaptive_paper_mode and instrument.symbol.upper() == "XAU/USD")
+    else forward_candidate
+)
+
+def adaptive_paper_risk_pct(profile: str) -> float:
+    """
+    Risk is automatic and moves opposite to permissiveness:
+    strict <= 0.10%, balanced <= 0.075%, flexible <= 0.05%.
+    Recent losses reduce it further. No martingale.
+    """
+    base = {"صارم": 0.10, "متوازن": 0.075, "مرن": 0.05}.get(profile, 0.075)
+    recent = list(st.session_state.get("paper_history", []))[:5]
+    recent_losses = sum(1 for x in recent if float(x.get("PnL", 0.0)) < 0)
+    if recent_losses >= 2:
+        return min(base, 0.05)
+    if recent_losses == 1:
+        return min(base, 0.075)
+    return base
+
+paper_risk_pct = (
+    adaptive_paper_risk_pct(adaptive_profile)
+    if active_candidate in ADAPTIVE_CANDIDATES
+    else float(risk_pct)
+)
+
+def choose_smart_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    """
+    Evaluate all adaptive Paper profiles on the same CLOSED market data.
+
+    Selection logic:
+    1) After any recent loss, allow STRICT only until the sequence stabilizes.
+    2) Otherwise, if one or more profiles have a valid SELL, choose the
+       strongest profile in order: strict -> balanced -> flexible.
+    3) If no profile has a valid entry, display the closest profile by
+       readiness, preferring the stricter profile on ties.
+
+    This does not predict profit and never increases risk after a loss.
+    """
+    profile_order = ["صارم", "متوازن", "مرن"]
+    evaluations: dict[str, dict[str, Any]] = {}
+
+    for profile in profile_order:
+        candidate = ADAPTIVE_PROFILE_CANDIDATES[profile]
+        evaluations[profile] = analyze_forward_candidate(raw_df, candidate)
+
+    loss_streak = recent_paper_loss_streak()
+    allowed = ["صارم"] if loss_streak >= 1 else profile_order
+
+    # Strongest valid signal wins.
+    for profile in allowed:
+        result = evaluations[profile]
+        if result.get("signal") == "SELL":
+            return (
+                profile,
+                ADAPTIVE_PROFILE_CANDIDATES[profile],
+                result,
+                {
+                    "mode": "AUTO_SIGNAL",
+                    "loss_streak": loss_streak,
+                    "reason": f"اختير {profile} لأنه أقوى نمط لديه إشارة مكتملة",
+                    "evaluations": {
+                        p: {
+                            "signal": evaluations[p].get("signal"),
+                            "readiness": int(evaluations[p].get("readiness_pct", 0)),
+                            "event": evaluations[p].get("event"),
+                        }
+                        for p in profile_order
+                    },
+                },
+            )
+
+    # No entry yet: show the candidate nearest to completion.
+    priority = {"صارم": 3, "متوازن": 2, "مرن": 1}
+    best_profile = max(
+        allowed,
+        key=lambda p: (
+            int(evaluations[p].get("readiness_pct", 0)),
+            priority[p],
+        ),
+    )
+    return (
+        best_profile,
+        ADAPTIVE_PROFILE_CANDIDATES[best_profile],
+        evaluations[best_profile],
+        {
+            "mode": "AUTO_WAIT",
+            "loss_streak": loss_streak,
+            "reason": (
+                "بعد خسارة حديثة: النظام مقفل على صارم"
+                if loss_streak >= 1
+                else f"لا توجد إشارة مكتملة؛ الأقرب الآن {best_profile}"
+            ),
+            "evaluations": {
+                p: {
+                    "signal": evaluations[p].get("signal"),
+                    "readiness": int(evaluations[p].get("readiness_pct", 0)),
+                    "event": evaluations[p].get("event"),
+                }
+                for p in profile_order
+            },
+        },
+    )
+
 live_unlocked = truthy(secret("LIVE_TRADING_ENABLED", "false"))
 automation_backend_ready = truthy(secret("AUTOMATION_BACKEND_READY", "false"))
 auto_live_unlocked = (
@@ -3706,7 +4027,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.9.2 CLEAN SIDEBAR • live-market forward test • "
+    "X10 GOLD v4.11 SMART AUTOPILOT • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3735,7 +4056,31 @@ reference_price = (
 )
 
 analysis = analyze_mtf(raw)
-forward_analysis = analyze_forward_candidate(raw, forward_candidate)
+
+smart_autopilot_meta: dict[str, Any] = {
+    "mode": "MANUAL_PROFILE",
+    "reason": "نمط يدوي",
+    "evaluations": {},
+    "loss_streak": recent_paper_loss_streak(),
+}
+
+if (
+    mode == "Paper"
+    and adaptive_paper_mode
+    and instrument.symbol.upper() == "XAU/USD"
+    and selected_profile == "ذكي تلقائي"
+):
+    (
+        adaptive_profile,
+        active_candidate,
+        forward_analysis,
+        smart_autopilot_meta,
+    ) = choose_smart_autopilot(raw)
+    paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile)
+else:
+    forward_analysis = analyze_forward_candidate(raw, active_candidate)
+    if active_candidate in ADAPTIVE_CANDIDATES:
+        paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile)
 
 if not feed.get("trusted", False):
     if analysis.get("signal") in {"BUY", "SELL"}:
@@ -3879,7 +4224,7 @@ st.markdown(
     f"<div class='card'><div class='kicker'>PAPER FORWARD CANDIDATE</div>"
     f"<div class='big {forward_signal_class}'>{forward_display}</div>"
     f"<p>{forward_analysis.get('reason','')}</p>"
-    f"<div class='muted'>{forward_candidate} • "
+    f"<div class='muted'>{active_candidate} • "
     f"الجاهزية {int(forward_analysis.get('readiness_pct',0))}% • "
     f"Event {forward_analysis.get('event','NONE')}</div></div>",
     unsafe_allow_html=True,
@@ -4003,7 +4348,7 @@ if forward_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
             reference_price,
             float(m5_snap["atr"]),
             float(st.session_state.paper_balance),
-            float(risk_pct),
+            float(paper_risk_pct),
             instrument,
         )
     except ValueError as exc:
@@ -4044,6 +4389,15 @@ mini_grid(
             "مفعّل" if st.session_state.auto_paper else "متوقف",
             "ok" if st.session_state.auto_paper else "wait",
         ),
+        (
+            "نمط الدخول",
+            (
+                adaptive_profile
+                if active_candidate in ADAPTIVE_CANDIDATES
+                else "محافظ"
+            ),
+            "wait" if active_candidate in ADAPTIVE_CANDIDATES else "ok",
+        ),
     ],
     "status-grid",
 )
@@ -4051,10 +4405,39 @@ mini_grid(
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
     st.subheader("التداول التجريبي — السوق الحي")
+    if active_candidate in ADAPTIVE_CANDIDATES:
+        if selected_profile == "ذكي تلقائي":
+            st.info(
+                f"🧠 الطيار الذكي اختار الآن: {adaptive_profile} • "
+                f"المخاطرة {float(paper_risk_pct):.3f}% • "
+                f"{smart_autopilot_meta.get('reason','')}. "
+                "يفحص صارم/متوازن/مرن في كل دورة ولا يضاعف المخاطرة بعد الخسارة."
+            )
+        else:
+            st.info(
+                f"🤖 النمط التكيفي: {adaptive_profile}. "
+                f"النظام يحدد ADX والتذبذب تلقائيًا، والمخاطرة الحالية "
+                f"{float(paper_risk_pct):.3f}% بدون مضاعفات أو تعزيز بعد الخسارة."
+            )
     day_pnl = float(st.session_state.paper_balance) - float(st.session_state.paper_day_start_balance)
     p_open = 1 if st.session_state.paper_position else 0
     p_gate_ok = False
     p_gate_reasons: list[str] = []
+
+    recent_closed = list(st.session_state.get("paper_history", []))[:5]
+    recent_loss_count = sum(1 for x in recent_closed if float(x.get("PnL", 0.0)) < 0)
+    recent_loss_streak = 0
+    for x in recent_closed:
+        if float(x.get("PnL", 0.0)) < 0:
+            recent_loss_streak += 1
+        else:
+            break
+
+    profile_loss_limit = 2 if adaptive_profile == "مرن" else 3
+    adaptive_circuit_block = bool(
+        active_candidate in ADAPTIVE_CANDIDATES
+        and recent_loss_streak >= profile_loss_limit
+    )
 
     if paper_plan:
         p_gate_ok, p_gate_reasons = risk_gate(
@@ -4074,6 +4457,28 @@ if mode == "Paper":
                 "Execution Feed غير جاهز؛ لا يتم فتح Paper على سعر قديم/غير قابل للتحقق"
             )
 
+        # Adaptive safety brakes.
+        if active_candidate in ADAPTIVE_CANDIDATES:
+            daily_stop_pct = {
+                "صارم": 0.40,
+                "متوازن": 0.35,
+                "مرن": 0.25,
+            }.get(adaptive_profile, 0.35)
+            if day_pnl <= -(
+                float(st.session_state.paper_day_start_balance)
+                * daily_stop_pct
+                / 100.0
+            ):
+                p_gate_ok = False
+                p_gate_reasons.append(
+                    f"توقف تكيفي: وصلت خسارة اليوم إلى {daily_stop_pct:.2f}%"
+                )
+            if adaptive_circuit_block:
+                p_gate_ok = False
+                p_gate_reasons.append(
+                    f"توقف تكيفي: {profile_loss_limit} خسائر متتالية — يحتاج مراجعة"
+                )
+
     gate_label = "انتظار إشارة" if not paper_plan else ("جاهز" if p_gate_ok else "محجوب")
     gate_state = "wait" if not paper_plan else ("ok" if p_gate_ok else "bad")
     mini_grid(
@@ -4088,10 +4493,46 @@ if mode == "Paper":
     )
 
     st.caption(
-        f"Candidate: {forward_candidate} • Risk {float(risk_pct):.2f}% • "
+        f"Candidate: {active_candidate} • Risk {float(paper_risk_pct):.2f}% • "
         "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
         "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
     )
+
+
+    if active_candidate in ADAPTIVE_CANDIDATES and advanced_ui:
+        mini_grid(
+            [
+                ("النمط", adaptive_profile, ""),
+                ("H1 ADX تلقائي", f"{float(forward_analysis.get('adaptive_h1_adx',0.0)):.1f}", ""),
+                ("H4 ADX تلقائي", f"{float(forward_analysis.get('adaptive_h4_adx',0.0)):.1f}", ""),
+                ("مخاطرة تلقائية", f"{float(paper_risk_pct):.3f}%", "ok"),
+                ("خسائر آخر 5", str(recent_loss_count), "wait" if recent_loss_count else "ok"),
+            ],
+            "tf-grid",
+        )
+
+        if selected_profile == "ذكي تلقائي":
+            auto_eval = smart_autopilot_meta.get("evaluations", {})
+            mini_grid(
+                [
+                    (
+                        "صارم",
+                        f"{int((auto_eval.get('صارم') or {}).get('readiness',0))}% • {(auto_eval.get('صارم') or {}).get('signal','WAIT')}",
+                        "ok" if (auto_eval.get("صارم") or {}).get("signal") == "SELL" else "wait",
+                    ),
+                    (
+                        "متوازن",
+                        f"{int((auto_eval.get('متوازن') or {}).get('readiness',0))}% • {(auto_eval.get('متوازن') or {}).get('signal','WAIT')}",
+                        "ok" if (auto_eval.get("متوازن") or {}).get("signal") == "SELL" else "wait",
+                    ),
+                    (
+                        "مرن",
+                        f"{int((auto_eval.get('مرن') or {}).get('readiness',0))}% • {(auto_eval.get('مرن') or {}).get('signal','WAIT')}",
+                        "ok" if (auto_eval.get("مرن") or {}).get("signal") == "SELL" else "wait",
+                    ),
+                ],
+                "tf-grid",
+            )
 
     if advanced_ui:
         mini_grid(
@@ -4118,7 +4559,7 @@ if mode == "Paper":
             disabled=not p_gate_ok,
         ):
             manual_key = (
-                f"MANUAL:{instrument.symbol}:{forward_candidate}:"
+                f"MANUAL:{instrument.symbol}:{active_candidate}:"
                 f"{now_riyadh().isoformat()}:{uuid.uuid4().hex[:8]}"
             )
             open_paper(paper_plan, instrument, order_key=manual_key)
@@ -4132,7 +4573,7 @@ if mode == "Paper":
     ):
         if st.session_state.last_auto_paper_candle.get(instrument.symbol) != candle_id:
             auto_key = (
-                f"AUTO:{instrument.symbol}:{forward_candidate}:{candle_id}"
+                f"AUTO:{instrument.symbol}:{active_candidate}:{candle_id}"
             )
             if open_paper(paper_plan, instrument, order_key=auto_key):
                 st.session_state.last_auto_paper_candle[instrument.symbol] = candle_id
@@ -4180,6 +4621,9 @@ if mode == "Paper":
 # ---------------------------- Live ----------------------------
 if mode == "Live":
     st.subheader("Live Execution — Broker Authoritative")
+    if active_candidate in ADAPTIVE_CANDIDATES:
+        st.error("أنماط Adaptive Paper مخصصة للتجربة فقط ولا يمكن استخدامها في Live.")
+        st.stop()
     st.caption(
         "في Live: Twelve Data للتحليل فقط. سعر الدخول وحالة الحساب والمراكز يجب أن تأتي من Broker Bridge."
     )
@@ -4191,7 +4635,7 @@ if mode == "Live":
     paper_net_preview = sum(float(x.get("PnL", 0.0)) for x in paper_closed_preview)
     mini_grid(
         [
-            ("Candidate", forward_candidate, ""),
+            ("Candidate", active_candidate, ""),
             ("Fresh Holdout", "PASS" if fresh_gate_preview.get("passed") else "NOT PASSED", "ok" if fresh_gate_preview.get("passed") else "bad"),
             ("Paper Trades", str(len(paper_closed_preview)), "ok" if len(paper_closed_preview) >= 20 else "wait"),
             ("Paper Net", f"${paper_net_preview:,.2f}", "ok" if paper_net_preview > 0 else "wait"),
@@ -5565,7 +6009,7 @@ if advanced_ui:
             st.info("لا يوجد سجل بعد")
 
     st.info(
-        "FINAL SAFETY v4.9.2: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+        "FINAL SAFETY v4.11: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
         "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
         "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
         "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
@@ -5607,7 +6051,25 @@ if st.session_state.auto_refresh:
             and not st.session_state.paper_position
             and hb_feed.get("execution_ok", False)
         ):
-            hb_analysis = analyze_forward_candidate(hb_raw, forward_candidate)
+            hb_active_candidate = active_candidate
+            hb_profile = adaptive_profile
+            hb_risk_pct = float(paper_risk_pct)
+
+            if (
+                adaptive_paper_mode
+                and instrument.symbol.upper() == "XAU/USD"
+                and selected_profile == "ذكي تلقائي"
+            ):
+                (
+                    hb_profile,
+                    hb_active_candidate,
+                    hb_analysis,
+                    _hb_meta,
+                ) = choose_smart_autopilot(hb_raw)
+                hb_risk_pct = adaptive_paper_risk_pct(hb_profile)
+            else:
+                hb_analysis = analyze_forward_candidate(hb_raw, hb_active_candidate)
+
             hb_m5 = hb_analysis.get("snapshots", {}).get("M5")
             hb_candle = str(hb_raw["datetime"].iloc[-1])
 
@@ -5618,7 +6080,7 @@ if st.session_state.auto_refresh:
                         hb_price,
                         float(hb_m5["atr"]),
                         float(st.session_state.paper_balance),
-                        float(risk_pct),
+                        float(hb_risk_pct),
                         instrument,
                     )
                     hb_day_pnl = (
@@ -5642,7 +6104,7 @@ if st.session_state.auto_refresh:
                         != hb_candle
                     ):
                         hb_key = (
-                            f"AUTO:{instrument.symbol}:{forward_candidate}:{hb_candle}"
+                            f"AUTO:{instrument.symbol}:{hb_active_candidate}:{hb_candle}"
                         )
                         if open_paper(
                             hb_plan,
