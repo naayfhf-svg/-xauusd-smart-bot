@@ -28,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.9.0-x10-persistent-paper"
+VERSION = "4.9.1-x10-compact-arabic"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -3570,6 +3570,12 @@ instrument = InstrumentSpec(
 st.sidebar.divider()
 mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
 
+advanced_ui = st.sidebar.toggle(
+    "إظهار أدوات البحث والتشخيص",
+    value=False,
+    help="مغلق افتراضيًا لواجهة تداول أنظف. فعّله فقط عند الاختبارات أو التشخيص.",
+)
+
 st.session_state.forward_candidate = st.sidebar.selectbox(
     "مرشح Paper Forward",
     list(WF_CANDIDATES.keys()),
@@ -3667,7 +3673,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.9 PERSISTENT PAPER FORWARD • live-market forward test • "
+    "X10 GOLD v4.9.1 COMPACT ARABIC • live-market forward test • "
     "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
 )
 
@@ -3796,34 +3802,34 @@ elif not feed.get("execution_ok", False):
         st.caption("• " + reason)
 
 # ------------------------- command center ---------------------
-st.subheader("Multi-Timeframe Command Center")
-tf_cards = []
-for tf in TIMEFRAMES:
-    snap = analysis.get("snapshots", {}).get(tf)
-    if snap:
-        cls = "buy" if snap["trend"] == "UP" else "sell" if snap["trend"] == "DOWN" else ""
-        tf_cards.append(
-            f"<div class='card'><div class='kicker'>{tf}</div>"
-            f"<h2 class='{cls}'>{snap['trend']}</h2>"
-            f"<div class='muted'>RSI {snap['rsi']:.1f} • ADX {snap['adx']:.1f}</div></div>"
-        )
-    else:
-        tf_cards.append(
-            f"<div class='card'><div class='kicker'>{tf}</div>"
-            f"<h2>WAIT</h2><div class='muted'>Insufficient data</div></div>"
-        )
-st.markdown("<div class='tf-grid'>" + "".join(tf_cards) + "</div>", unsafe_allow_html=True)
+if advanced_ui:
+    st.subheader("Multi-Timeframe Command Center")
+    tf_cards = []
+    for tf in TIMEFRAMES:
+        snap = analysis.get("snapshots", {}).get(tf)
+        if snap:
+            cls = "buy" if snap["trend"] == "UP" else "sell" if snap["trend"] == "DOWN" else ""
+            tf_cards.append(
+                f"<div class='card'><div class='kicker'>{tf}</div>"
+                f"<h2 class='{cls}'>{snap['trend']}</h2>"
+                f"<div class='muted'>RSI {snap['rsi']:.1f} • ADX {snap['adx']:.1f}</div></div>"
+            )
+        else:
+            tf_cards.append(
+                f"<div class='card'><div class='kicker'>{tf}</div>"
+                f"<h2>WAIT</h2><div class='muted'>Insufficient data</div></div>"
+            )
+    st.markdown("<div class='tf-grid'>" + "".join(tf_cards) + "</div>", unsafe_allow_html=True)
 
-signal_class = "buy" if analysis["signal"] == "BUY" else "sell" if analysis["signal"] == "SELL" else ""
-st.markdown(
-    f"<div class='card'><div class='kicker'>FINAL DECISION</div>"
-    f"<div class='big {signal_class}'>{analysis['signal']}</div>"
-    f"<p>{analysis['reason']}</p>"
-    f"<div class='muted'>BUY score {analysis.get('buy_score',0)} • "
-    f"SELL score {analysis.get('sell_score',0)}</div></div>",
-    unsafe_allow_html=True,
-)
-
+    signal_class = "buy" if analysis["signal"] == "BUY" else "sell" if analysis["signal"] == "SELL" else ""
+    st.markdown(
+        f"<div class='card'><div class='kicker'>FINAL DECISION</div>"
+        f"<div class='big {signal_class}'>{analysis['signal']}</div>"
+        f"<p>{analysis['reason']}</p>"
+        f"<div class='muted'>BUY score {analysis.get('buy_score',0)} • "
+        f"SELL score {analysis.get('sell_score',0)}</div></div>",
+        unsafe_allow_html=True,
+    )
 
 near_entry = bool(forward_analysis.get("near_entry", False))
 forward_signal_class = (
@@ -3986,9 +3992,32 @@ if paper_plan:
         "plan-grid",
     )
 
+# ------------------------- compact status ----------------------
+mini_grid(
+    [
+        (
+            "السوق",
+            "مفتوح" if feed.get("market_open") else "مغلق" if feed.get("market_open") is not None else "غير معروف",
+            "ok" if feed.get("market_open") else "wait",
+        ),
+        (
+            "بيانات التنفيذ",
+            "جاهزة" if feed.get("execution_ok") else "محجوبة",
+            "ok" if feed.get("execution_ok") else "bad",
+        ),
+        ("الحفظ", "مفعّل", "ok"),
+        (
+            "التلقائي",
+            "مفعّل" if st.session_state.auto_paper else "متوقف",
+            "ok" if st.session_state.auto_paper else "wait",
+        ),
+    ],
+    "status-grid",
+)
+
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
-    st.subheader("Paper Forward Trading — Live Market / Simulated Money")
+    st.subheader("التداول التجريبي — السوق الحي")
     day_pnl = float(st.session_state.paper_balance) - float(st.session_state.paper_day_start_balance)
     p_open = 1 if st.session_state.paper_position else 0
     p_gate_ok = False
@@ -4012,15 +4041,15 @@ if mode == "Paper":
                 "Execution Feed غير جاهز؛ لا يتم فتح Paper على سعر قديم/غير قابل للتحقق"
             )
 
-    gate_label = "WAIT SIGNAL" if not paper_plan else ("PASS" if p_gate_ok else "BLOCK")
+    gate_label = "انتظار إشارة" if not paper_plan else ("جاهز" if p_gate_ok else "محجوب")
     gate_state = "wait" if not paper_plan else ("ok" if p_gate_ok else "bad")
     mini_grid(
         [
-            ("Paper Balance", f"${st.session_state.paper_balance:,.2f}", ""),
-            ("Day P&L", f"${day_pnl:,.2f}", "ok" if day_pnl >= 0 else "bad"),
-            ("Trades Today", str(st.session_state.paper_trades_today), ""),
-            ("Open Position", "YES" if st.session_state.paper_position else "NO", "wait" if st.session_state.paper_position else ""),
-            ("Risk Gate", gate_label, gate_state),
+            ("الرصيد التجريبي", f"${st.session_state.paper_balance:,.2f}", ""),
+            ("ربح/خسارة اليوم", f"${day_pnl:,.2f}", "ok" if day_pnl >= 0 else "bad"),
+            ("صفقات اليوم", str(st.session_state.paper_trades_today), ""),
+            ("صفقة مفتوحة", "نعم" if st.session_state.paper_position else "لا", "wait" if st.session_state.paper_position else ""),
+            ("بوابة المخاطر", gate_label, gate_state),
         ],
         "paper-grid",
     )
@@ -4031,18 +4060,19 @@ if mode == "Paper":
         "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
     )
 
-    mini_grid(
-        [
-            ("حفظ Paper", "مفعّل", "ok"),
-            ("منع تكرار الأوامر", "مفعّل", "ok"),
-            ("DB", "SQLite", ""),
-            ("سجل الصفقات", str(len(st.session_state.paper_history)), ""),
-        ],
-        "tf-grid",
-    )
+    if advanced_ui:
+        mini_grid(
+            [
+                ("حفظ Paper", "مفعّل", "ok"),
+                ("منع تكرار الأوامر", "مفعّل", "ok"),
+                ("DB", "SQLite", ""),
+                ("سجل الصفقات", str(len(st.session_state.paper_history)), ""),
+            ],
+            "tf-grid",
+        )
 
     st.session_state.auto_paper = st.toggle(
-        "Auto Paper Forward",
+        "التداول التجريبي التلقائي",
         value=st.session_state.auto_paper,
         help="يفتح Paper فقط عند وجود إشارة، خطة، وسعر تنفيذ حديث",
     )
@@ -4096,12 +4126,13 @@ if mode == "Paper":
         else:
             st.warning("المركز Paper مفتوح لكن تحديثه موقوف لأن سعر التنفيذ غير جاهز.")
 
-    with st.expander("حالة الحفظ", expanded=False):
-        st.write(f"مسار قاعدة البيانات: `{state_db()['path']}`")
-        st.write(
-            "الحفظ يستمر مع Refresh وRerun. إذا أعاد مزود الاستضافة بناء الحاوية بالكامل، "
-            "فقد تحتاج لاحقًا قاعدة بيانات خارجية دائمة."
-        )
+    if advanced_ui:
+        with st.expander("حالة الحفظ", expanded=False):
+            st.write(f"مسار قاعدة البيانات: `{state_db()['path']}`")
+            st.write(
+                "الحفظ يستمر مع Refresh وRerun. إذا أعاد مزود الاستضافة بناء الحاوية بالكامل، "
+                "فقد تحتاج لاحقًا قاعدة بيانات خارجية دائمة."
+            )
 
     if st.session_state.paper_history:
         paper_df = pd.DataFrame(st.session_state.paper_history)
@@ -4402,1109 +4433,1113 @@ if mode == "Live":
             )
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
-# -------------------------- backtest --------------------------
-st.subheader("Research Audit — v4.5 Independent Validation")
-st.caption(
-    "نفس قواعد v4.3 بدون تخفيف للاستراتيجية. المؤشرات وMTF وB2 تُحسب مرة واحدة فقط، "
-    "ثم يعاد استخدام نفس السياق لكل Cost Stress وResearch Variant، مع فحص ثبات إضافي."
-)
-
-history_days = st.selectbox(
-    "فترة التاريخ للاختبار",
-    options=[90, 180, 365],
-    index=1,
-    format_func=lambda d: f"{d} يوم" if d != 365 else "365 يوم (سنة)",
-)
-estimated_requests = math.ceil(int(history_days) / 17)
-st.caption(
-    f"متوقع تقريبًا {estimated_requests} طلب تاريخي. على الخطة المجانية قد ينتظر التطبيق "
-    "إعادة ضبط الرصيد للدقيقة تلقائيًا إذا لزم."
-)
-
-if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_container_width=True):
-    total_t0 = time.perf_counter()
-    with st.status("تشغيل Research Audit المحسّن...", expanded=True) as audit_status:
-        st.write("1/4 • جلب التاريخ الطويل")
-        fetch_t0 = time.perf_counter()
-        try:
-            audit_raw, history_meta = fetch_long_history(
-                instrument.symbol, history_days=int(history_days), chunk_days=17,
-            )
-        except Exception as exc:
-            st.error(f"تعذر جلب التاريخ الطويل: {exc}")
-            audit_raw = pd.DataFrame(); history_meta = {}
-        fetch_seconds = time.perf_counter() - fetch_t0
-
-        if not audit_raw.empty:
-            st.write("2/4 • تجهيز المؤشرات + MTF + B2 مرة واحدة")
-            prepared = prepare_research_context(audit_raw)
-            if not prepared.get("ok", False):
-                st.error(prepared.get("warning", "تعذر تجهيز الاختبار"))
-            else:
-                scenario_rows=[]; base_trades=pd.DataFrame(); base_stats={}
-                st.write(f"تم تجهيز {prepared.get('prepared_rows',0):,} صف خلال {prepared.get('prepare_seconds',0):.1f} ثانية")
-                audit_t0=time.perf_counter()
-
-                st.write("3/4 • Cost Stress 2 / 5 / 10 bps")
-                for cost_bps in (2.0,5.0,10.0):
-                    scenario_trades, scenario_stats = simulate_prepared_research(
-                        prepared, instrument, risk_pct=float(risk_pct), cost_bps_roundtrip=cost_bps,
-                        research_variant="STRICT_BOTH",
-                    )
-                    if cost_bps == 2.0:
-                        base_trades=scenario_trades; base_stats=scenario_stats
-                    norm=scenario_stats.get("normalized",{})
-                    if scenario_stats.get("trades",0):
-                        scenario_rows.append({
-                            "Round-trip cost (bps)":cost_bps, "Trades":scenario_stats["trades"],
-                            "Win Rate %":round(scenario_stats["win_rate"],1),
-                            "Profit Factor":math.inf if not math.isfinite(scenario_stats["profit_factor"]) else round(scenario_stats["profit_factor"],2),
-                            "Net P&L":round(scenario_stats["net_pnl"],2), "Max DD %":round(scenario_stats["max_dd_pct"],2),
-                            "Avg Net R":round(scenario_stats["avg_r_net"],3),
-                            "Risk-Weighted Exp R":round(scenario_stats["risk_weighted_expectancy_r"],3),
-                            "Avg Risk $":round(scenario_stats["avg_risk_money"],2), "Max Qty Hit %":round(scenario_stats["max_qty_hit_pct"],1),
-                            "Normalized PF":math.inf if not math.isfinite(norm.get("profit_factor",0.0)) else round(norm.get("profit_factor",0.0),2),
-                            "Normalized Net P&L":round(norm.get("net_pnl",0.0),2), "Normalized Avg R":round(norm.get("avg_r_net",0.0),3),
-                            "Normalized Max DD %":round(norm.get("max_dd_pct",0.0),2),
-                        })
-                    else:
-                        scenario_rows.append({"Round-trip cost (bps)":cost_bps,"Trades":0,"Win Rate %":0.0,"Profit Factor":0.0,"Net P&L":0.0,"Max DD %":0.0,"Avg Net R":0.0,"Risk-Weighted Exp R":0.0,"Avg Risk $":0.0,"Max Qty Hit %":0.0,"Normalized PF":0.0,"Normalized Net P&L":0.0,"Normalized Avg R":0.0,"Normalized Max DD %":0.0})
-
-                cost_df=pd.DataFrame(scenario_rows)
-                st.write("4/4 • Variants + robustness diagnostics")
-                variant_df=run_research_variants(
-                    audit_raw, instrument, risk_pct=float(risk_pct), prepared=prepared, baseline_stats=base_stats,
-                )
-                gate=_research_gate(
-                    base_stats,cost_df,research_context,
-                    history_days=int(history_meta.get("requested_days",history_days)),
-                    history_bars=int(history_meta.get("bars",len(audit_raw))),
-                )
-                robustness=_research_robustness(base_trades)
-                audit_seconds=time.perf_counter()-audit_t0; total_seconds=time.perf_counter()-total_t0
-                performance_meta={
-                    "fetch_seconds":float(fetch_seconds), "prepare_seconds":float(prepared.get("prepare_seconds",0.0)),
-                    "audit_seconds":float(audit_seconds), "total_seconds":float(total_seconds),
-                    "prepared_rows":int(prepared.get("prepared_rows",0)),
-                }
-                st.session_state.backtest={
-                    "trades":base_trades,"stats":base_stats,"cost_scenarios":cost_df,"research_gate":gate,
-                    "history_meta":history_meta,"variant_comparison":variant_df,"performance_meta":performance_meta,
-                    "robustness":robustness,
-                }
-                st.session_state.research_gate=gate
-                audit_status.update(label=f"اكتمل Research Audit خلال {total_seconds:.1f} ثانية",state="complete",expanded=False)
-
-if st.session_state.backtest:
-    bt = st.session_state.backtest
-    stats = bt["stats"]
-
-    if stats.get("trades", 0):
-        hmeta = bt.get("history_meta", {})
-        st.markdown("### Historical Coverage")
-        mini_grid(
-            [
-                ("Requested", f"{hmeta.get('requested_days', 0)} days", ""),
-                ("M5 Bars", f"{int(hmeta.get('bars', 0)):,}", "ok" if int(hmeta.get("bars", 0)) >= 20_000 else "wait"),
-                ("API Requests", str(hmeta.get("requests", 0)), ""),
-                ("Quota Waits", str(hmeta.get("quota_waits", 0)), ""),
-            ],
-            "tf-grid",
-        )
-        if hmeta.get("first_bar") and hmeta.get("last_bar"):
-            st.caption(
-                f"History: {hmeta['first_bar']} → {hmeta['last_bar']}"
-            )
-
-        perf = bt.get("performance_meta", {})
-        if perf:
-            st.markdown("### Audit Performance")
-            mini_grid([
-                ("Fetch", f"{perf.get('fetch_seconds',0.0):.1f}s", ""),
-                ("Prepare Once", f"{perf.get('prepare_seconds',0.0):.1f}s", "ok"),
-                ("All Tests", f"{perf.get('audit_seconds',0.0):.1f}s", ""),
-                ("Total", f"{perf.get('total_seconds',0.0):.1f}s", "ok"),
-            ], "tf-grid")
-
-        mini_grid(
-            [
-                ("Trades", str(stats["trades"]), ""),
-                ("Win Rate", f"{stats['win_rate']:.1f}%", ""),
-                ("Profit Factor", "∞" if not math.isfinite(stats["profit_factor"]) else f"{stats['profit_factor']:.2f}", ""),
-                ("Net P&L", f"${stats['net_pnl']:,.2f}", "ok" if stats["net_pnl"] >= 0 else "bad"),
-                ("Max DD", f"${stats['max_dd']:,.2f} / {stats['max_dd_pct']:.2f}%", "wait"),
-                ("Ending Equity", f"${stats['ending_equity']:,.2f}", ""),
-            ],
-            "bt-grid",
-        )
-
-        mini_grid(
-            [
-                ("Avg Net R", f"{stats['avg_r_net']:.3f}R", "ok" if stats["avg_r_net"] > 0 else "bad"),
-                (
-                    "Risk-Weighted Exp",
-                    f"{stats['risk_weighted_expectancy_r']:.3f}R",
-                    "ok" if stats["risk_weighted_expectancy_r"] > 0 else "bad",
-                ),
-                ("Avg Risk $", f"${stats['avg_risk_money']:,.2f}", ""),
-                ("Risk Utilization", f"{stats['avg_risk_utilization_pct']:.1f}%", ""),
-                ("Max Qty Hits", f"{stats['max_qty_hit_count']} / {stats['max_qty_hit_pct']:.1f}%", "wait" if stats["max_qty_hit_count"] else "ok"),
-                ("Max Losing Streak", str(stats["max_losing_streak"]), "wait"),
-                ("Avg Duration", f"{stats['avg_duration_min']:.0f} min", ""),
-                ("Base Cost", f"{stats['cost_bps_roundtrip']:.0f} bps RT", ""),
-            ],
-            "plan-grid",
-        )
-
-        normalized = stats.get("normalized", {})
-        st.markdown("### Fixed-Risk Normalized — Signal Edge")
-        mini_grid(
-            [
-                ("Normalized PF", "∞" if not math.isfinite(normalized.get("profit_factor", 0.0)) else f"{normalized.get('profit_factor',0.0):.2f}", ""),
-                ("Normalized Net", f"${normalized.get('net_pnl',0.0):,.2f}", "ok" if normalized.get("net_pnl",0.0) > 0 else "bad"),
-                ("Normalized Avg R", f"{normalized.get('avg_r_net',0.0):.3f}R", "ok" if normalized.get("avg_r_net",0.0) > 0 else "bad"),
-                ("Normalized DD", f"{normalized.get('max_dd_pct',0.0):.2f}%", "wait"),
-            ],
-            "tf-grid",
-        )
-
-        if (stats["avg_r_net"] < 0 < stats["risk_weighted_expectancy_r"]) or (
-            stats["avg_r_net"] > 0 > stats["risk_weighted_expectancy_r"]
-        ):
-            st.warning(
-                "Sizing asymmetry detected: متوسط R البسيط واتجاه العائد الموزون بالمخاطرة مختلفان. "
-                "راجع Max Qty Hits وRisk Utilization قبل الاعتماد على النتيجة."
-            )
-
-        robustness = bt.get("robustness", {})
-        if robustness:
-            st.markdown("### Robustness Diagnostics")
-            low = robustness.get("bootstrap_low",0.0); high = robustness.get("bootstrap_high",0.0)
-            be = robustness.get("cost_break_even_bps",0.0)
-            mini_grid([
-                ("Bootstrap Avg-R 95% Low", f"{low:.3f}R", "ok" if low > 0 else "bad"),
-                ("Bootstrap Avg-R 95% High", f"{high:.3f}R", "ok" if high > 0 else "bad"),
-                ("Cost Break-even", f"{be:.2f} bps RT", "ok" if be >= 10 else "wait"),
-            ], "tf-grid")
-            qdf = pd.DataFrame(robustness.get("quarters", []))
-            if not qdf.empty:
-                st.caption("تقسيم زمني إلى 4 أرباع متتالية لاختبار ثبات النتيجة عبر الزمن.")
-                st.dataframe(qdf, hide_index=True, use_container_width=True)
-
-        st.markdown("### Research Variant Comparison")
-        st.caption(
-            "لا نختار الفائز من هذه الشاشة فقط. الهدف كشف هل SELL-only أو الفلاتر تستحق اختبارًا مستقلاً."
-        )
-        variant_df = bt.get("variant_comparison", pd.DataFrame())
-        if isinstance(variant_df, pd.DataFrame) and not variant_df.empty:
-            st.dataframe(variant_df, hide_index=True, use_container_width=True)
-
-        st.markdown("### Cost Stress Test")
-        st.dataframe(
-            bt["cost_scenarios"],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        in_stats = stats.get("in_sample", {})
-        out_stats = stats.get("out_of_sample", {})
-        split_time = stats.get("split_time", "—")
-
-        st.markdown(f"### In-sample / Out-of-sample")
-        st.caption(f"التقسيم الزمني 70/30 • بداية Out-of-sample: {split_time}")
-        norm_in = stats.get("normalized_in_sample", {})
-        norm_out = stats.get("normalized_out_of_sample", {})
-        split_table = pd.DataFrame(
-            [
-                {
-                    "Segment": "IN 70%",
-                    "Trades": in_stats.get("trades", 0),
-                    "Win Rate %": round(in_stats.get("win_rate", 0.0), 1),
-                    "Profit Factor": (
-                        math.inf
-                        if not math.isfinite(in_stats.get("profit_factor", 0.0))
-                        else round(in_stats.get("profit_factor", 0.0), 2)
-                    ),
-                    "Net P&L": round(in_stats.get("net_pnl", 0.0), 2),
-                    "Avg Net R": round(in_stats.get("avg_r_net", 0.0), 3),
-                    "Risk-Weighted Exp R": round(in_stats.get("risk_weighted_expectancy_r", 0.0), 3),
-                    "Avg Risk $": round(in_stats.get("avg_risk_money", 0.0), 2),
-                    "Max Qty Hit %": round(in_stats.get("max_qty_hit_pct", 0.0), 1),
-                    "Max Losing Streak": in_stats.get("max_losing_streak", 0),
-                    "Norm PF": round(norm_in.get("profit_factor", 0.0), 2) if math.isfinite(norm_in.get("profit_factor", 0.0)) else math.inf,
-                    "Norm Avg R": round(norm_in.get("avg_r_net", 0.0), 3),
-                    "Norm Net P&L": round(norm_in.get("net_pnl", 0.0), 2),
-                },
-                {
-                    "Segment": "OUT 30%",
-                    "Trades": out_stats.get("trades", 0),
-                    "Win Rate %": round(out_stats.get("win_rate", 0.0), 1),
-                    "Profit Factor": (
-                        math.inf
-                        if not math.isfinite(out_stats.get("profit_factor", 0.0))
-                        else round(out_stats.get("profit_factor", 0.0), 2)
-                    ),
-                    "Net P&L": round(out_stats.get("net_pnl", 0.0), 2),
-                    "Avg Net R": round(out_stats.get("avg_r_net", 0.0), 3),
-                    "Risk-Weighted Exp R": round(out_stats.get("risk_weighted_expectancy_r", 0.0), 3),
-                    "Avg Risk $": round(out_stats.get("avg_risk_money", 0.0), 2),
-                    "Max Qty Hit %": round(out_stats.get("max_qty_hit_pct", 0.0), 1),
-                    "Max Losing Streak": out_stats.get("max_losing_streak", 0),
-                    "Norm PF": round(norm_out.get("profit_factor", 0.0), 2) if math.isfinite(norm_out.get("profit_factor", 0.0)) else math.inf,
-                    "Norm Avg R": round(norm_out.get("avg_r_net", 0.0), 3),
-                    "Norm Net P&L": round(norm_out.get("net_pnl", 0.0), 2),
-                },
-            ]
-        )
-        st.dataframe(split_table, hide_index=True, use_container_width=True)
-
-        gate = bt.get("research_gate", st.session_state.get("research_gate", {}))
-        st.markdown("### Final Research Gate")
-        gate_state = "PASS" if gate.get("passed") else "BLOCK LIVE"
-        gate_color = "ok" if gate.get("passed") else "bad"
-        mini_grid([("Research Gate", gate_state, gate_color)], "tf-grid")
-        for rule in gate.get("rules", []):
-            icon = "✅" if rule.get("pass") else "❌"
-            st.write(f"{icon} {rule.get('name')} — {rule.get('value')}")
-        if not gate.get("passed"):
-            st.error("Live سيبقى مقفولًا. لا يتم تعديل الشروط لإجبار النتيجة على PASS؛ نغيّر الاستراتيجية فقط بناءً على بيانات جديدة واختبار مستقل.")
-
-        with st.expander("BUY / SELL Audit", expanded=True):
-            side_df = pd.DataFrame(stats.get("side_stats", []))
-            if not side_df.empty:
-                st.dataframe(side_df, hide_index=True, use_container_width=True)
-            else:
-                st.info("لا توجد بيانات كافية لتقسيم BUY/SELL")
-
-        with st.expander("النتائج حسب ساعة الدخول UTC واليوم", expanded=False):
-            hour_df = pd.DataFrame(stats.get("hour_stats", []))
-            day_df = pd.DataFrame(stats.get("day_stats", []))
-            st.markdown("**حسب الساعة UTC**")
-            st.dataframe(hour_df, hide_index=True, use_container_width=True)
-            st.markdown("**حسب اليوم**")
-            st.dataframe(day_df, hide_index=True, use_container_width=True)
-
-        st.markdown("### Trade Log")
-        st.dataframe(
-            bt["trades"].tail(150),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "تنزيل نتائج Backtest CSV",
-            data=bt["trades"].to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"gold_ai_backtest_{now_riyadh().date().isoformat()}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    else:
-        st.info(stats.get("warning", "لا توجد نتائج"))
-
-
-# ------------------- independent validation -------------------
-st.divider()
-st.subheader("Independent Validation — Frozen SELL_SESSION")
-st.caption(
-    "المرشح مجمّد: SELL فقط خلال UTC 06:00–20:00. "
-    "لا نعدّل RSI/ADX/SL/TP/الساعات بعد رؤية هذه النتائج. "
-    "الاختبار يستخدم 180 يومًا أقدم بالكامل من نافذة التطوير الحالية."
-)
-
-bt_dev = st.session_state.get("backtest")
-if not bt_dev or not bt_dev.get("history_meta"):
-    st.info(
-        "شغّل Research Audit لمدة 180 يوم أولًا حتى نثبت بداية نافذة التطوير."
-    )
-else:
-    dev_meta = bt_dev.get("history_meta", {})
-    dev_first = dev_meta.get("first_bar")
-
-    if not dev_first:
-        st.warning("تعذر تحديد بداية نافذة التطوير.")
-    else:
-        validation_end = pd.Timestamp(dev_first)
-        if validation_end.tzinfo is None:
-            validation_end = validation_end.tz_localize("UTC")
-        else:
-            validation_end = validation_end.tz_convert("UTC")
-
-        validation_start = validation_end - pd.Timedelta(days=180)
-
-        frozen_context = hashlib.sha256(
-            (
-                f"{instrument.symbol}|{FROZEN_VALIDATION_VARIANT}|"
-                f"{float(risk_pct):.6f}|"
-                f"{validation_start.isoformat()}|"
-                f"{validation_end.isoformat()}"
-            ).encode()
-        ).hexdigest()[:16]
-
-        mini_grid(
-            [
-                ("Frozen Variant", "SELL_SESSION", "ok"),
-                (
-                    "Window Start",
-                    validation_start.strftime("%Y-%m-%d"),
-                    "",
-                ),
-                (
-                    "Window End",
-                    validation_end.strftime("%Y-%m-%d"),
-                    "",
-                ),
-                ("Risk", f"{float(risk_pct):.2f}%", ""),
-            ],
-            "tf-grid",
-        )
-
-        st.caption(
-            f"Independent window: {validation_start.isoformat()} → "
-            f"{validation_end.isoformat()} • لا تتداخل مع Development 180d."
-        )
-
-        if st.button(
-            "تشغيل Independent Validation على 180 يوم الأقدم",
-            use_container_width=True,
-        ):
-            iv_t0 = time.perf_counter()
-
-            with st.status(
-                "تشغيل الاختبار المستقل المجمد...",
-                expanded=True,
-            ) as iv_status:
-                st.write("1/3 • جلب الفترة الأقدم غير المستخدمة")
-                try:
-                    iv_raw, iv_meta = fetch_history_window(
-                        instrument.symbol,
-                        validation_start.isoformat(),
-                        validation_end.isoformat(),
-                        chunk_days=17,
-                    )
-                except Exception as exc:
-                    st.error(f"تعذر جلب Independent Window: {exc}")
-                    iv_raw = pd.DataFrame()
-                    iv_meta = {}
-
-                if not iv_raw.empty:
-                    st.write("2/3 • تجهيز المؤشرات مرة واحدة")
-                    iv_prepared = prepare_research_context(iv_raw)
-
-                    if not iv_prepared.get("ok", False):
-                        st.error(
-                            iv_prepared.get(
-                                "warning",
-                                "تعذر تجهيز Independent Validation",
-                            )
-                        )
-                    else:
-                        st.write(
-                            "3/3 • Frozen SELL_SESSION + "
-                            "Cost Stress 2/5/10 bps"
-                        )
-
-                        iv_rows = []
-                        iv_trades_2 = pd.DataFrame()
-                        iv_stats_2: dict[str, Any] = {}
-
-                        for iv_cost in (2.0, 5.0, 10.0):
-                            iv_trades, iv_stats = (
-                                simulate_prepared_research(
-                                    iv_prepared,
-                                    instrument,
-                                    risk_pct=float(risk_pct),
-                                    cost_bps_roundtrip=iv_cost,
-                                    research_variant=FROZEN_VALIDATION_VARIANT,
-                                )
-                            )
-
-                            if iv_cost == 2.0:
-                                iv_trades_2 = iv_trades
-                                iv_stats_2 = iv_stats
-
-                            iv_rows.append(
-                                _validation_cost_row(
-                                    iv_cost,
-                                    iv_stats,
-                                )
-                            )
-
-                        iv_cost_df = pd.DataFrame(iv_rows)
-                        iv_robustness = _research_robustness(
-                            iv_trades_2
-                        )
-                        iv_gate = _independent_validation_gate(
-                            iv_stats_2,
-                            iv_cost_df,
-                            iv_robustness,
-                            iv_meta,
-                        )
-
-                        st.session_state.independent_validation = {
-                            "context": frozen_context,
-                            "variant": FROZEN_VALIDATION_VARIANT,
-                            "label": FROZEN_VALIDATION_LABEL,
-                            "window_start": validation_start.isoformat(),
-                            "window_end": validation_end.isoformat(),
-                            "history_meta": iv_meta,
-                            "trades": iv_trades_2,
-                            "stats": iv_stats_2,
-                            "cost_scenarios": iv_cost_df,
-                            "robustness": iv_robustness,
-                            "gate": iv_gate,
-                            "elapsed_seconds": float(
-                                time.perf_counter() - iv_t0
-                            ),
-                        }
-
-                        iv_status.update(
-                            label=(
-                                "Independent Validation اكتمل خلال "
-                                f"{time.perf_counter()-iv_t0:.1f} ثانية"
-                            ),
-                            state="complete",
-                            expanded=False,
-                        )
-
-        iv = st.session_state.get("independent_validation")
-        if iv:
-            if iv.get("context") != frozen_context:
-                st.warning(
-                    "نتيجة Independent Validation المحفوظة تخص إعدادات/فترة "
-                    "مختلفة. أعد الاختبار قبل الاعتماد عليها."
-                )
-            else:
-                iv_stats = iv.get("stats", {})
-                iv_norm = iv_stats.get("normalized", {})
-                iv_meta = iv.get("history_meta", {})
-                iv_gate = iv.get("gate", {})
-                iv_robust = iv.get("robustness", {})
-
-                st.markdown("### Independent Result — 2 bps")
-                mini_grid(
-                    [
-                        (
-                            "Trades",
-                            str(iv_stats.get("trades", 0)),
-                            "",
-                        ),
-                        (
-                            "Normalized PF",
-                            (
-                                "∞"
-                                if not math.isfinite(
-                                    iv_norm.get(
-                                        "profit_factor",
-                                        0.0,
-                                    )
-                                )
-                                else f"{iv_norm.get('profit_factor',0.0):.2f}"
-                            ),
-                            (
-                                "ok"
-                                if iv_norm.get(
-                                    "profit_factor",
-                                    0.0,
-                                ) >= 1.2
-                                else "bad"
-                            ),
-                        ),
-                        (
-                            "Normalized Avg R",
-                            f"{iv_norm.get('avg_r_net',0.0):.3f}R",
-                            (
-                                "ok"
-                                if iv_norm.get(
-                                    "avg_r_net",
-                                    0.0,
-                                ) > 0
-                                else "bad"
-                            ),
-                        ),
-                        (
-                            "Normalized Net",
-                            f"${iv_norm.get('net_pnl',0.0):,.2f}",
-                            (
-                                "ok"
-                                if iv_norm.get("net_pnl", 0.0) > 0
-                                else "bad"
-                            ),
-                        ),
-                        (
-                            "Normalized DD",
-                            f"{iv_norm.get('max_dd_pct',0.0):.2f}%",
-                            "wait",
-                        ),
-                        (
-                            "Elapsed",
-                            f"{iv.get('elapsed_seconds',0.0):.1f}s",
-                            "",
-                        ),
-                    ],
-                    "plan-grid",
-                )
-
-                st.caption(
-                    f"Coverage: {iv_meta.get('first_bar')} → "
-                    f"{iv_meta.get('last_bar')} • "
-                    f"{int(iv_meta.get('bars',0)):,} M5 bars • "
-                    f"{iv_meta.get('requests',0)} API requests"
-                )
-
-                st.markdown("### Independent Cost Stress")
-                st.dataframe(
-                    iv.get("cost_scenarios", pd.DataFrame()),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                st.markdown("### Independent Robustness")
-                mini_grid(
-                    [
-                        (
-                            "Bootstrap 95% Low",
-                            f"{iv_robust.get('bootstrap_low',0.0):.3f}R",
-                            (
-                                "ok"
-                                if iv_robust.get(
-                                    "bootstrap_low",
-                                    0.0,
-                                ) > 0
-                                else "bad"
-                            ),
-                        ),
-                        (
-                            "Bootstrap 95% High",
-                            f"{iv_robust.get('bootstrap_high',0.0):.3f}R",
-                            "",
-                        ),
-                        (
-                            "Cost Break-even",
-                            f"{iv_robust.get('cost_break_even_bps',0.0):.2f} bps RT",
-                            "wait",
-                        ),
-                    ],
-                    "tf-grid",
-                )
-
-                iv_quarters = pd.DataFrame(
-                    iv_robust.get("quarters", [])
-                )
-                if not iv_quarters.empty:
-                    st.dataframe(
-                        iv_quarters,
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-
-                st.markdown("### Independent Validation Gate")
-                iv_pass = bool(iv_gate.get("passed"))
-                mini_grid(
-                    [
-                        (
-                            "Independent Gate",
-                            (
-                                "PASS → PAPER FORWARD"
-                                if iv_pass
-                                else "FAIL / MORE RESEARCH"
-                            ),
-                            "ok" if iv_pass else "bad",
-                        )
-                    ],
-                    "tf-grid",
-                )
-
-                for rule in iv_gate.get("rules", []):
-                    icon = "✅" if rule.get("pass") else "❌"
-                    st.write(
-                        f"{icon} {rule.get('name')} — "
-                        f"{rule.get('value')}"
-                    )
-
-                st.caption(
-                    "10 bps يبقى Stress Test إضافي: "
-                    f"PF={iv_gate.get('cost_10bps_pf')} • "
-                    f"Net={iv_gate.get('cost_10bps_net')}"
-                )
-
-                if iv_pass:
-                    st.success(
-                        "المرشح اجتاز نافذة مستقلة أقدم. "
-                        "الخطوة التالية Paper Forward فقط؛ "
-                        "لا يتم فتح Live من هذا الاختبار."
-                    )
-                else:
-                    st.error(
-                        "المرشح لم يثبت نفسه على نافذة مستقلة. "
-                        "لا نعدّل شروطه باستخدام نفس الفترة؛ "
-                        "نعود للبحث أو نغيّر منطق الاستراتيجية."
-                    )
-
-
-
-# ------------------- v4.6 walk-forward research lab -------------------
-st.divider()
-st.subheader("Walk-Forward Research Lab — v4.8")
-st.caption(
-    "v4.7 يثبت Regime القوي من v4.6 (trend strength + prior-only volatility) لكنه يغيّر "
-    "منطق الدخول نفسه إلى أحداث EMA rejection / pullback break / fresh breakout. "
-    "الهدف زيادة العينة والثبات عبر 6 نوافذ بدون تخفيف Gate أو لمس Fresh Holdout."
-)
-
-dev_bt = st.session_state.get("backtest")
-old_iv = st.session_state.get("independent_validation")
-
-# v4.6.1: Walk-Forward no longer depends on browser/session_state.
-# If the prior Research Audit / Independent Validation objects are still in
-# the current Streamlit session, reuse their exact boundaries. Otherwise,
-# reconstruct the same research design directly from time and fetch history
-# again. This makes the lab usable after refresh/new browser session.
-if dev_bt and old_iv:
-    dev_meta = dev_bt.get("history_meta", {})
-    old_meta = old_iv.get("history_meta", {})
-
-    dev_first = dev_meta.get("first_bar")
-    dev_last = dev_meta.get("last_bar")
-    old_first = old_meta.get("first_bar")
-    old_last = old_meta.get("last_bar")
-else:
-    anchor_end = now_utc().floor("5min")
-    dev_last = anchor_end.isoformat()
-    dev_first = (anchor_end - pd.Timedelta(days=180)).isoformat()
-    old_last = dev_first
-    old_first = (anchor_end - pd.Timedelta(days=360)).isoformat()
-    st.info(
-        "Session Recovery: نتائج الجلسة السابقة غير موجودة، "
-        "لكن Walk-Forward سيعيد بناء نافذة البحث 360 يوم مباشرةً بدون إعادة "
-        "Research Audit وIndependent Validation يدويًا."
-    )
-
-if not all([dev_first, dev_last, old_first, old_last]):
-    st.warning("تعذر تحديد حدود نافذة Walk-Forward.")
-else:
-    research_start = pd.Timestamp(old_first)
-    research_end = pd.Timestamp(dev_last)
-    fresh_end = research_start
-    fresh_start = fresh_end - pd.Timedelta(days=180)
-
-    mini_grid(
-        [
-            ("Research Start", research_start.strftime("%Y-%m-%d"), ""),
-            ("Research End", research_end.strftime("%Y-%m-%d"), ""),
-            ("WF Folds", "6", "ok"),
-            ("Fresh Holdout", fresh_start.strftime("%Y-%m-%d"), "wait"),
-        ],
-        "tf-grid",
-    )
-
+# -------------------------- advanced research ------------------
+if advanced_ui:
+    st.subheader("Research Audit — v4.5 Independent Validation")
     st.caption(
-        "Research history = النافذة المستقلة التي فشلت + نافذة التطوير الحالية. "
-        f"Fresh holdout المحجوز: {fresh_start.isoformat()} → {fresh_end.isoformat()}."
+        "نفس قواعد v4.3 بدون تخفيف للاستراتيجية. المؤشرات وMTF وB2 تُحسب مرة واحدة فقط، "
+        "ثم يعاد استخدام نفس السياق لكل Cost Stress وResearch Variant، مع فحص ثبات إضافي."
     )
 
-    if st.button(
-        "تشغيل Walk-Forward Lab على 360 يوم",
-        use_container_width=True,
-    ):
-        wf_t0 = time.perf_counter()
+    history_days = st.selectbox(
+        "فترة التاريخ للاختبار",
+        options=[90, 180, 365],
+        index=1,
+        format_func=lambda d: f"{d} يوم" if d != 365 else "365 يوم (سنة)",
+    )
+    estimated_requests = math.ceil(int(history_days) / 17)
+    st.caption(
+        f"متوقع تقريبًا {estimated_requests} طلب تاريخي. على الخطة المجانية قد ينتظر التطبيق "
+        "إعادة ضبط الرصيد للدقيقة تلقائيًا إذا لزم."
+    )
 
-        with st.status(
-            "تشغيل Walk-Forward Research Lab...",
-            expanded=True,
-        ) as wf_status:
-            st.write("1/4 • جلب نافذة البحث الأقدم (المستخدمة سابقًا)")
+    if st.button("تحميل التاريخ وتشغيل Final Research Audit", use_container_width=True):
+        total_t0 = time.perf_counter()
+        with st.status("تشغيل Research Audit المحسّن...", expanded=True) as audit_status:
+            st.write("1/4 • جلب التاريخ الطويل")
+            fetch_t0 = time.perf_counter()
             try:
-                older_raw, older_meta = fetch_history_window(
-                    instrument.symbol,
-                    research_start.isoformat(),
-                    pd.Timestamp(dev_first).isoformat(),
-                    chunk_days=17,
+                audit_raw, history_meta = fetch_long_history(
+                    instrument.symbol, history_days=int(history_days), chunk_days=17,
                 )
             except Exception as exc:
-                st.error(f"تعذر جلب الجزء الأقدم: {exc}")
-                older_raw = pd.DataFrame()
-                older_meta = {}
+                st.error(f"تعذر جلب التاريخ الطويل: {exc}")
+                audit_raw = pd.DataFrame(); history_meta = {}
+            fetch_seconds = time.perf_counter() - fetch_t0
 
-            st.write("2/4 • جلب نافذة التطوير الحالية")
-            try:
-                dev_raw, dev_hist_meta = fetch_history_window(
-                    instrument.symbol,
-                    pd.Timestamp(dev_first).isoformat(),
-                    research_end.isoformat(),
-                    chunk_days=17,
-                )
-            except Exception as exc:
-                st.error(f"تعذر جلب جزء التطوير: {exc}")
-                dev_raw = pd.DataFrame()
-                dev_hist_meta = {}
+            if not audit_raw.empty:
+                st.write("2/4 • تجهيز المؤشرات + MTF + B2 مرة واحدة")
+                prepared = prepare_research_context(audit_raw)
+                if not prepared.get("ok", False):
+                    st.error(prepared.get("warning", "تعذر تجهيز الاختبار"))
+                else:
+                    scenario_rows=[]; base_trades=pd.DataFrame(); base_stats={}
+                    st.write(f"تم تجهيز {prepared.get('prepared_rows',0):,} صف خلال {prepared.get('prepare_seconds',0):.1f} ثانية")
+                    audit_t0=time.perf_counter()
 
-            if not older_raw.empty and not dev_raw.empty:
-                research_raw = (
-                    pd.concat([older_raw, dev_raw], ignore_index=True)
-                    .drop_duplicates("datetime")
-                    .sort_values("datetime")
-                    .reset_index(drop=True)
-                )
-
-                st.write(
-                    f"3/4 • تجهيز {len(research_raw):,} شمعة مرة واحدة"
-                )
-                wf_prepared = prepare_research_context(research_raw)
-
-                if not wf_prepared.get("ok", False):
-                    st.error(
-                        wf_prepared.get(
-                            "warning",
-                            "تعذر تجهيز Walk-Forward",
+                    st.write("3/4 • Cost Stress 2 / 5 / 10 bps")
+                    for cost_bps in (2.0,5.0,10.0):
+                        scenario_trades, scenario_stats = simulate_prepared_research(
+                            prepared, instrument, risk_pct=float(risk_pct), cost_bps_roundtrip=cost_bps,
+                            research_variant="STRICT_BOTH",
                         )
+                        if cost_bps == 2.0:
+                            base_trades=scenario_trades; base_stats=scenario_stats
+                        norm=scenario_stats.get("normalized",{})
+                        if scenario_stats.get("trades",0):
+                            scenario_rows.append({
+                                "Round-trip cost (bps)":cost_bps, "Trades":scenario_stats["trades"],
+                                "Win Rate %":round(scenario_stats["win_rate"],1),
+                                "Profit Factor":math.inf if not math.isfinite(scenario_stats["profit_factor"]) else round(scenario_stats["profit_factor"],2),
+                                "Net P&L":round(scenario_stats["net_pnl"],2), "Max DD %":round(scenario_stats["max_dd_pct"],2),
+                                "Avg Net R":round(scenario_stats["avg_r_net"],3),
+                                "Risk-Weighted Exp R":round(scenario_stats["risk_weighted_expectancy_r"],3),
+                                "Avg Risk $":round(scenario_stats["avg_risk_money"],2), "Max Qty Hit %":round(scenario_stats["max_qty_hit_pct"],1),
+                                "Normalized PF":math.inf if not math.isfinite(norm.get("profit_factor",0.0)) else round(norm.get("profit_factor",0.0),2),
+                                "Normalized Net P&L":round(norm.get("net_pnl",0.0),2), "Normalized Avg R":round(norm.get("avg_r_net",0.0),3),
+                                "Normalized Max DD %":round(norm.get("max_dd_pct",0.0),2),
+                            })
+                        else:
+                            scenario_rows.append({"Round-trip cost (bps)":cost_bps,"Trades":0,"Win Rate %":0.0,"Profit Factor":0.0,"Net P&L":0.0,"Max DD %":0.0,"Avg Net R":0.0,"Risk-Weighted Exp R":0.0,"Avg Risk $":0.0,"Max Qty Hit %":0.0,"Normalized PF":0.0,"Normalized Net P&L":0.0,"Normalized Avg R":0.0,"Normalized Max DD %":0.0})
+
+                    cost_df=pd.DataFrame(scenario_rows)
+                    st.write("4/4 • Variants + robustness diagnostics")
+                    variant_df=run_research_variants(
+                        audit_raw, instrument, risk_pct=float(risk_pct), prepared=prepared, baseline_stats=base_stats,
                     )
-                else:
-                    st.write("4/4 • تشغيل 5 Entry Models × 6 نوافذ + 2/5 bps")
-                    wf_result = run_walkforward_lab(
-                        wf_prepared,
-                        instrument,
-                        risk_pct=float(risk_pct),
-                        n_folds=6,
+                    gate=_research_gate(
+                        base_stats,cost_df,research_context,
+                        history_days=int(history_meta.get("requested_days",history_days)),
+                        history_bars=int(history_meta.get("bars",len(audit_raw))),
                     )
+                    robustness=_research_robustness(base_trades)
+                    audit_seconds=time.perf_counter()-audit_t0; total_seconds=time.perf_counter()-total_t0
+                    performance_meta={
+                        "fetch_seconds":float(fetch_seconds), "prepare_seconds":float(prepared.get("prepare_seconds",0.0)),
+                        "audit_seconds":float(audit_seconds), "total_seconds":float(total_seconds),
+                        "prepared_rows":int(prepared.get("prepared_rows",0)),
+                    }
+                    st.session_state.backtest={
+                        "trades":base_trades,"stats":base_stats,"cost_scenarios":cost_df,"research_gate":gate,
+                        "history_meta":history_meta,"variant_comparison":variant_df,"performance_meta":performance_meta,
+                        "robustness":robustness,
+                    }
+                    st.session_state.research_gate=gate
+                    audit_status.update(label=f"اكتمل Research Audit خلال {total_seconds:.1f} ثانية",state="complete",expanded=False)
 
-                    wf_result["elapsed_seconds"] = float(
-                        time.perf_counter() - wf_t0
-                    )
-                    wf_result["research_bars"] = int(len(research_raw))
-                    wf_result["fresh_start"] = fresh_start.isoformat()
-                    wf_result["fresh_end"] = fresh_end.isoformat()
+    if st.session_state.backtest:
+        bt = st.session_state.backtest
+        stats = bt["stats"]
 
-                    st.session_state.walkforward_lab = wf_result
-                    st.session_state.fresh_holdout = None
-
-                    wf_status.update(
-                        label=(
-                            "Walk-Forward Lab اكتمل خلال "
-                            f"{time.perf_counter()-wf_t0:.1f} ثانية"
-                        ),
-                        state="complete",
-                        expanded=False,
-                    )
-
-    wf = st.session_state.get("walkforward_lab")
-    if wf and wf.get("ok"):
-        st.markdown("### Walk-Forward Candidate Summary")
-        summary_df = wf.get("summary", pd.DataFrame())
-        st.dataframe(
-            summary_df,
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        if not summary_df.empty:
-            st.markdown("### Mobile Candidate Audit")
-            for _, sr in summary_df.iterrows():
-                variant_name = str(sr.get("Variant", ""))
-                d = (wf.get("details", {}) or {}).get(variant_name, {})
-                gate = d.get("gate", {})
-                mini_grid(
-                    [
-                        ("Candidate", variant_name, ""),
-                        ("Trades", str(int(sr.get("Trades", 0))), ""),
-                        ("2bps PF", f"{float(sr.get('2bps PF',0.0)):.3f}", "ok" if float(sr.get("2bps PF",0.0)) >= 1.2 else "bad"),
-                        ("2bps Avg R", f"{float(sr.get('2bps Avg R',0.0)):.3f}R", "ok" if float(sr.get("2bps Avg R",0.0)) >= 0.05 else "bad"),
-                        ("5bps PF", f"{float(sr.get('5bps PF',0.0)):.3f}", "ok" if float(sr.get("5bps PF",0.0)) >= 1.05 else "bad"),
-                        ("Positive Folds", str(sr.get("Positive Folds","")), ""),
-                        ("Min Fold Trades", str(int(sr.get("Min Fold Trades",0))), ""),
-                        ("Gate", "PASS" if gate.get("eligible") else "FAIL", "ok" if gate.get("eligible") else "bad"),
-                    ],
-                    "plan-grid",
+        if stats.get("trades", 0):
+            hmeta = bt.get("history_meta", {})
+            st.markdown("### Historical Coverage")
+            mini_grid(
+                [
+                    ("Requested", f"{hmeta.get('requested_days', 0)} days", ""),
+                    ("M5 Bars", f"{int(hmeta.get('bars', 0)):,}", "ok" if int(hmeta.get("bars", 0)) >= 20_000 else "wait"),
+                    ("API Requests", str(hmeta.get("requests", 0)), ""),
+                    ("Quota Waits", str(hmeta.get("quota_waits", 0)), ""),
+                ],
+                "tf-grid",
+            )
+            if hmeta.get("first_bar") and hmeta.get("last_bar"):
+                st.caption(
+                    f"History: {hmeta['first_bar']} → {hmeta['last_bar']}"
                 )
-                failed = gate.get("failed_rules", [])
-                if failed:
-                    st.caption("Gate fails: " + " • ".join(failed))
+
+            perf = bt.get("performance_meta", {})
+            if perf:
+                st.markdown("### Audit Performance")
+                mini_grid([
+                    ("Fetch", f"{perf.get('fetch_seconds',0.0):.1f}s", ""),
+                    ("Prepare Once", f"{perf.get('prepare_seconds',0.0):.1f}s", "ok"),
+                    ("All Tests", f"{perf.get('audit_seconds',0.0):.1f}s", ""),
+                    ("Total", f"{perf.get('total_seconds',0.0):.1f}s", "ok"),
+                ], "tf-grid")
+
+            mini_grid(
+                [
+                    ("Trades", str(stats["trades"]), ""),
+                    ("Win Rate", f"{stats['win_rate']:.1f}%", ""),
+                    ("Profit Factor", "∞" if not math.isfinite(stats["profit_factor"]) else f"{stats['profit_factor']:.2f}", ""),
+                    ("Net P&L", f"${stats['net_pnl']:,.2f}", "ok" if stats["net_pnl"] >= 0 else "bad"),
+                    ("Max DD", f"${stats['max_dd']:,.2f} / {stats['max_dd_pct']:.2f}%", "wait"),
+                    ("Ending Equity", f"${stats['ending_equity']:,.2f}", ""),
+                ],
+                "bt-grid",
+            )
+
+            mini_grid(
+                [
+                    ("Avg Net R", f"{stats['avg_r_net']:.3f}R", "ok" if stats["avg_r_net"] > 0 else "bad"),
+                    (
+                        "Risk-Weighted Exp",
+                        f"{stats['risk_weighted_expectancy_r']:.3f}R",
+                        "ok" if stats["risk_weighted_expectancy_r"] > 0 else "bad",
+                    ),
+                    ("Avg Risk $", f"${stats['avg_risk_money']:,.2f}", ""),
+                    ("Risk Utilization", f"{stats['avg_risk_utilization_pct']:.1f}%", ""),
+                    ("Max Qty Hits", f"{stats['max_qty_hit_count']} / {stats['max_qty_hit_pct']:.1f}%", "wait" if stats["max_qty_hit_count"] else "ok"),
+                    ("Max Losing Streak", str(stats["max_losing_streak"]), "wait"),
+                    ("Avg Duration", f"{stats['avg_duration_min']:.0f} min", ""),
+                    ("Base Cost", f"{stats['cost_bps_roundtrip']:.0f} bps RT", ""),
+                ],
+                "plan-grid",
+            )
+
+            normalized = stats.get("normalized", {})
+            st.markdown("### Fixed-Risk Normalized — Signal Edge")
+            mini_grid(
+                [
+                    ("Normalized PF", "∞" if not math.isfinite(normalized.get("profit_factor", 0.0)) else f"{normalized.get('profit_factor',0.0):.2f}", ""),
+                    ("Normalized Net", f"${normalized.get('net_pnl',0.0):,.2f}", "ok" if normalized.get("net_pnl",0.0) > 0 else "bad"),
+                    ("Normalized Avg R", f"{normalized.get('avg_r_net',0.0):.3f}R", "ok" if normalized.get("avg_r_net",0.0) > 0 else "bad"),
+                    ("Normalized DD", f"{normalized.get('max_dd_pct',0.0):.2f}%", "wait"),
+                ],
+                "tf-grid",
+            )
+
+            if (stats["avg_r_net"] < 0 < stats["risk_weighted_expectancy_r"]) or (
+                stats["avg_r_net"] > 0 > stats["risk_weighted_expectancy_r"]
+            ):
+                st.warning(
+                    "Sizing asymmetry detected: متوسط R البسيط واتجاه العائد الموزون بالمخاطرة مختلفان. "
+                    "راجع Max Qty Hits وRisk Utilization قبل الاعتماد على النتيجة."
+                )
+
+            robustness = bt.get("robustness", {})
+            if robustness:
+                st.markdown("### Robustness Diagnostics")
+                low = robustness.get("bootstrap_low",0.0); high = robustness.get("bootstrap_high",0.0)
+                be = robustness.get("cost_break_even_bps",0.0)
+                mini_grid([
+                    ("Bootstrap Avg-R 95% Low", f"{low:.3f}R", "ok" if low > 0 else "bad"),
+                    ("Bootstrap Avg-R 95% High", f"{high:.3f}R", "ok" if high > 0 else "bad"),
+                    ("Cost Break-even", f"{be:.2f} bps RT", "ok" if be >= 10 else "wait"),
+                ], "tf-grid")
+                qdf = pd.DataFrame(robustness.get("quarters", []))
+                if not qdf.empty:
+                    st.caption("تقسيم زمني إلى 4 أرباع متتالية لاختبار ثبات النتيجة عبر الزمن.")
+                    st.dataframe(qdf, hide_index=True, use_container_width=True)
+
+            st.markdown("### Research Variant Comparison")
+            st.caption(
+                "لا نختار الفائز من هذه الشاشة فقط. الهدف كشف هل SELL-only أو الفلاتر تستحق اختبارًا مستقلاً."
+            )
+            variant_df = bt.get("variant_comparison", pd.DataFrame())
+            if isinstance(variant_df, pd.DataFrame) and not variant_df.empty:
+                st.dataframe(variant_df, hide_index=True, use_container_width=True)
+
+            st.markdown("### Cost Stress Test")
+            st.dataframe(
+                bt["cost_scenarios"],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            in_stats = stats.get("in_sample", {})
+            out_stats = stats.get("out_of_sample", {})
+            split_time = stats.get("split_time", "—")
+
+            st.markdown(f"### In-sample / Out-of-sample")
+            st.caption(f"التقسيم الزمني 70/30 • بداية Out-of-sample: {split_time}")
+            norm_in = stats.get("normalized_in_sample", {})
+            norm_out = stats.get("normalized_out_of_sample", {})
+            split_table = pd.DataFrame(
+                [
+                    {
+                        "Segment": "IN 70%",
+                        "Trades": in_stats.get("trades", 0),
+                        "Win Rate %": round(in_stats.get("win_rate", 0.0), 1),
+                        "Profit Factor": (
+                            math.inf
+                            if not math.isfinite(in_stats.get("profit_factor", 0.0))
+                            else round(in_stats.get("profit_factor", 0.0), 2)
+                        ),
+                        "Net P&L": round(in_stats.get("net_pnl", 0.0), 2),
+                        "Avg Net R": round(in_stats.get("avg_r_net", 0.0), 3),
+                        "Risk-Weighted Exp R": round(in_stats.get("risk_weighted_expectancy_r", 0.0), 3),
+                        "Avg Risk $": round(in_stats.get("avg_risk_money", 0.0), 2),
+                        "Max Qty Hit %": round(in_stats.get("max_qty_hit_pct", 0.0), 1),
+                        "Max Losing Streak": in_stats.get("max_losing_streak", 0),
+                        "Norm PF": round(norm_in.get("profit_factor", 0.0), 2) if math.isfinite(norm_in.get("profit_factor", 0.0)) else math.inf,
+                        "Norm Avg R": round(norm_in.get("avg_r_net", 0.0), 3),
+                        "Norm Net P&L": round(norm_in.get("net_pnl", 0.0), 2),
+                    },
+                    {
+                        "Segment": "OUT 30%",
+                        "Trades": out_stats.get("trades", 0),
+                        "Win Rate %": round(out_stats.get("win_rate", 0.0), 1),
+                        "Profit Factor": (
+                            math.inf
+                            if not math.isfinite(out_stats.get("profit_factor", 0.0))
+                            else round(out_stats.get("profit_factor", 0.0), 2)
+                        ),
+                        "Net P&L": round(out_stats.get("net_pnl", 0.0), 2),
+                        "Avg Net R": round(out_stats.get("avg_r_net", 0.0), 3),
+                        "Risk-Weighted Exp R": round(out_stats.get("risk_weighted_expectancy_r", 0.0), 3),
+                        "Avg Risk $": round(out_stats.get("avg_risk_money", 0.0), 2),
+                        "Max Qty Hit %": round(out_stats.get("max_qty_hit_pct", 0.0), 1),
+                        "Max Losing Streak": out_stats.get("max_losing_streak", 0),
+                        "Norm PF": round(norm_out.get("profit_factor", 0.0), 2) if math.isfinite(norm_out.get("profit_factor", 0.0)) else math.inf,
+                        "Norm Avg R": round(norm_out.get("avg_r_net", 0.0), 3),
+                        "Norm Net P&L": round(norm_out.get("net_pnl", 0.0), 2),
+                    },
+                ]
+            )
+            st.dataframe(split_table, hide_index=True, use_container_width=True)
+
+            gate = bt.get("research_gate", st.session_state.get("research_gate", {}))
+            st.markdown("### Final Research Gate")
+            gate_state = "PASS" if gate.get("passed") else "BLOCK LIVE"
+            gate_color = "ok" if gate.get("passed") else "bad"
+            mini_grid([("Research Gate", gate_state, gate_color)], "tf-grid")
+            for rule in gate.get("rules", []):
+                icon = "✅" if rule.get("pass") else "❌"
+                st.write(f"{icon} {rule.get('name')} — {rule.get('value')}")
+            if not gate.get("passed"):
+                st.error("Live سيبقى مقفولًا. لا يتم تعديل الشروط لإجبار النتيجة على PASS؛ نغيّر الاستراتيجية فقط بناءً على بيانات جديدة واختبار مستقل.")
+
+            with st.expander("BUY / SELL Audit", expanded=True):
+                side_df = pd.DataFrame(stats.get("side_stats", []))
+                if not side_df.empty:
+                    st.dataframe(side_df, hide_index=True, use_container_width=True)
                 else:
-                    st.caption("Gate fails: none")
-                st.divider()
+                    st.info("لا توجد بيانات كافية لتقسيم BUY/SELL")
 
-        st.markdown("### Fold-by-Fold Matrix")
-        folds_df = wf.get("folds", pd.DataFrame())
-        if not folds_df.empty:
-            fold_variant = st.selectbox(
-                "اعرض Folds لمرشح واحد",
-                list(WF_CANDIDATES.keys()),
-                key="wf_fold_variant_view",
-            )
+            with st.expander("النتائج حسب ساعة الدخول UTC واليوم", expanded=False):
+                hour_df = pd.DataFrame(stats.get("hour_stats", []))
+                day_df = pd.DataFrame(stats.get("day_stats", []))
+                st.markdown("**حسب الساعة UTC**")
+                st.dataframe(hour_df, hide_index=True, use_container_width=True)
+                st.markdown("**حسب اليوم**")
+                st.dataframe(day_df, hide_index=True, use_container_width=True)
+
+            st.markdown("### Trade Log")
             st.dataframe(
-                folds_df[folds_df["Variant"] == fold_variant],
+                bt["trades"].tail(150),
                 hide_index=True,
                 use_container_width=True,
             )
 
-        with st.expander("عرض كل Fold-by-Fold Matrix", expanded=False):
-            st.dataframe(
-                folds_df,
-                hide_index=True,
+            st.download_button(
+                "تنزيل نتائج Backtest CSV",
+                data=bt["trades"].to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"gold_ai_backtest_{now_riyadh().date().isoformat()}.csv",
+                mime="text/csv",
                 use_container_width=True,
-            )
-
-        eligible = list(wf.get("eligible", []))
-        mini_grid(
-            [
-                ("Research Bars", f"{int(wf.get('research_bars',0)):,}", ""),
-                ("Elapsed", f"{float(wf.get('elapsed_seconds',0.0)):.1f}s", ""),
-                ("Eligible Candidates", str(len(eligible)), "ok" if eligible else "bad"),
-                ("Fresh Holdout Used?", "NO", "ok"),
-            ],
-            "tf-grid",
-        )
-
-        if not eligible:
-            st.error(
-                "لا يوجد مرشح اجتاز Walk-Forward Gate. Fresh Holdout يبقى غير مستخدم. "
-                "لا نخفف Gate ولا نعدّل Fresh Holdout لإجبار PASS؛ نغيّر منطق الدخول فقط."
             )
         else:
-            st.success(
-                "يوجد مرشح/مرشحون اجتازوا Research Gate. "
-                "يمكن الآن تجميد واحد فقط ثم فتح Fresh Holdout الأقدم لأول مرة."
-            )
+            st.info(stats.get("warning", "لا توجد نتائج"))
 
-            chosen = st.selectbox(
-                "اختر مرشحًا مؤهلًا لتجميده قبل Fresh Holdout",
-                eligible,
-                format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
-                key="wf_candidate_choice",
+
+    # ------------------- independent validation -------------------
+    st.divider()
+    st.subheader("Independent Validation — Frozen SELL_SESSION")
+    st.caption(
+        "المرشح مجمّد: SELL فقط خلال UTC 06:00–20:00. "
+        "لا نعدّل RSI/ADX/SL/TP/الساعات بعد رؤية هذه النتائج. "
+        "الاختبار يستخدم 180 يومًا أقدم بالكامل من نافذة التطوير الحالية."
+    )
+
+    bt_dev = st.session_state.get("backtest")
+    if not bt_dev or not bt_dev.get("history_meta"):
+        st.info(
+            "شغّل Research Audit لمدة 180 يوم أولًا حتى نثبت بداية نافذة التطوير."
+        )
+    else:
+        dev_meta = bt_dev.get("history_meta", {})
+        dev_first = dev_meta.get("first_bar")
+
+        if not dev_first:
+            st.warning("تعذر تحديد بداية نافذة التطوير.")
+        else:
+            validation_end = pd.Timestamp(dev_first)
+            if validation_end.tzinfo is None:
+                validation_end = validation_end.tz_localize("UTC")
+            else:
+                validation_end = validation_end.tz_convert("UTC")
+
+            validation_start = validation_end - pd.Timedelta(days=180)
+
+            frozen_context = hashlib.sha256(
+                (
+                    f"{instrument.symbol}|{FROZEN_VALIDATION_VARIANT}|"
+                    f"{float(risk_pct):.6f}|"
+                    f"{validation_start.isoformat()}|"
+                    f"{validation_end.isoformat()}"
+                ).encode()
+            ).hexdigest()[:16]
+
+            mini_grid(
+                [
+                    ("Frozen Variant", "SELL_SESSION", "ok"),
+                    (
+                        "Window Start",
+                        validation_start.strftime("%Y-%m-%d"),
+                        "",
+                    ),
+                    (
+                        "Window End",
+                        validation_end.strftime("%Y-%m-%d"),
+                        "",
+                    ),
+                    ("Risk", f"{float(risk_pct):.2f}%", ""),
+                ],
+                "tf-grid",
             )
 
             st.caption(
-                f"سيتم اختبار {chosen} على نافذة لم نستخدمها حتى الآن: "
-                f"{fresh_start.isoformat()} → {fresh_end.isoformat()}."
+                f"Independent window: {validation_start.isoformat()} → "
+                f"{validation_end.isoformat()} • لا تتداخل مع Development 180d."
             )
 
             if st.button(
-                "تجميد المرشح وتشغيل Fresh Holdout 180 يوم",
+                "تشغيل Independent Validation على 180 يوم الأقدم",
                 use_container_width=True,
             ):
-                fh_t0 = time.perf_counter()
+                iv_t0 = time.perf_counter()
 
                 with st.status(
-                    "تشغيل Fresh Holdout...",
+                    "تشغيل الاختبار المستقل المجمد...",
                     expanded=True,
-                ) as fh_status:
+                ) as iv_status:
+                    st.write("1/3 • جلب الفترة الأقدم غير المستخدمة")
                     try:
-                        fresh_raw, fresh_meta = fetch_history_window(
+                        iv_raw, iv_meta = fetch_history_window(
                             instrument.symbol,
-                            fresh_start.isoformat(),
-                            fresh_end.isoformat(),
+                            validation_start.isoformat(),
+                            validation_end.isoformat(),
                             chunk_days=17,
                         )
                     except Exception as exc:
-                        st.error(f"تعذر جلب Fresh Holdout: {exc}")
-                        fresh_raw = pd.DataFrame()
-                        fresh_meta = {}
+                        st.error(f"تعذر جلب Independent Window: {exc}")
+                        iv_raw = pd.DataFrame()
+                        iv_meta = {}
 
-                    if not fresh_raw.empty:
-                        fresh_prepared = prepare_research_context(fresh_raw)
+                    if not iv_raw.empty:
+                        st.write("2/3 • تجهيز المؤشرات مرة واحدة")
+                        iv_prepared = prepare_research_context(iv_raw)
 
-                        if not fresh_prepared.get("ok", False):
+                        if not iv_prepared.get("ok", False):
                             st.error(
-                                fresh_prepared.get(
+                                iv_prepared.get(
                                     "warning",
-                                    "تعذر تجهيز Fresh Holdout",
+                                    "تعذر تجهيز Independent Validation",
                                 )
                             )
                         else:
-                            fh_trades2, fh_stats2 = simulate_prepared_research(
-                                fresh_prepared,
-                                instrument,
-                                risk_pct=float(risk_pct),
-                                cost_bps_roundtrip=2.0,
-                                research_variant=chosen,
-                            )
-                            _, fh_stats5 = simulate_prepared_research(
-                                fresh_prepared,
-                                instrument,
-                                risk_pct=float(risk_pct),
-                                cost_bps_roundtrip=5.0,
-                                research_variant=chosen,
-                            )
-                            _, fh_stats10 = simulate_prepared_research(
-                                fresh_prepared,
-                                instrument,
-                                risk_pct=float(risk_pct),
-                                cost_bps_roundtrip=10.0,
-                                research_variant=chosen,
+                            st.write(
+                                "3/3 • Frozen SELL_SESSION + "
+                                "Cost Stress 2/5/10 bps"
                             )
 
-                            fh_robust = _research_robustness(fh_trades2)
-                            fh_gate = _fresh_holdout_gate(
-                                fh_stats2,
-                                fh_stats5,
-                                fh_robust,
-                                fresh_meta,
+                            iv_rows = []
+                            iv_trades_2 = pd.DataFrame()
+                            iv_stats_2: dict[str, Any] = {}
+
+                            for iv_cost in (2.0, 5.0, 10.0):
+                                iv_trades, iv_stats = (
+                                    simulate_prepared_research(
+                                        iv_prepared,
+                                        instrument,
+                                        risk_pct=float(risk_pct),
+                                        cost_bps_roundtrip=iv_cost,
+                                        research_variant=FROZEN_VALIDATION_VARIANT,
+                                    )
+                                )
+
+                                if iv_cost == 2.0:
+                                    iv_trades_2 = iv_trades
+                                    iv_stats_2 = iv_stats
+
+                                iv_rows.append(
+                                    _validation_cost_row(
+                                        iv_cost,
+                                        iv_stats,
+                                    )
+                                )
+
+                            iv_cost_df = pd.DataFrame(iv_rows)
+                            iv_robustness = _research_robustness(
+                                iv_trades_2
+                            )
+                            iv_gate = _independent_validation_gate(
+                                iv_stats_2,
+                                iv_cost_df,
+                                iv_robustness,
+                                iv_meta,
                             )
 
-                            st.session_state.fresh_holdout = {
-                                "candidate": chosen,
-                                "history_meta": fresh_meta,
-                                "stats_2": fh_stats2,
-                                "stats_5": fh_stats5,
-                                "stats_10": fh_stats10,
-                                "trades_2": fh_trades2,
-                                "robustness": fh_robust,
-                                "gate": fh_gate,
+                            st.session_state.independent_validation = {
+                                "context": frozen_context,
+                                "variant": FROZEN_VALIDATION_VARIANT,
+                                "label": FROZEN_VALIDATION_LABEL,
+                                "window_start": validation_start.isoformat(),
+                                "window_end": validation_end.isoformat(),
+                                "history_meta": iv_meta,
+                                "trades": iv_trades_2,
+                                "stats": iv_stats_2,
+                                "cost_scenarios": iv_cost_df,
+                                "robustness": iv_robustness,
+                                "gate": iv_gate,
                                 "elapsed_seconds": float(
-                                    time.perf_counter() - fh_t0
+                                    time.perf_counter() - iv_t0
                                 ),
                             }
 
-                            fh_status.update(
+                            iv_status.update(
                                 label=(
-                                    "Fresh Holdout اكتمل خلال "
-                                    f"{time.perf_counter()-fh_t0:.1f} ثانية"
+                                    "Independent Validation اكتمل خلال "
+                                    f"{time.perf_counter()-iv_t0:.1f} ثانية"
                                 ),
                                 state="complete",
                                 expanded=False,
                             )
 
-    fh = st.session_state.get("fresh_holdout")
-    if fh:
-        st.markdown("### Fresh Holdout Result")
-        fh2 = fh.get("stats_2", {})
-        fh5 = fh.get("stats_5", {})
-        fh10 = fh.get("stats_10", {})
-        n2 = fh2.get("normalized", {})
-        n5 = fh5.get("normalized", {})
-        n10 = fh10.get("normalized", {})
-        fg = fh.get("gate", {})
-        fr = fh.get("robustness", {})
+            iv = st.session_state.get("independent_validation")
+            if iv:
+                if iv.get("context") != frozen_context:
+                    st.warning(
+                        "نتيجة Independent Validation المحفوظة تخص إعدادات/فترة "
+                        "مختلفة. أعد الاختبار قبل الاعتماد عليها."
+                    )
+                else:
+                    iv_stats = iv.get("stats", {})
+                    iv_norm = iv_stats.get("normalized", {})
+                    iv_meta = iv.get("history_meta", {})
+                    iv_gate = iv.get("gate", {})
+                    iv_robust = iv.get("robustness", {})
 
-        mini_grid(
-            [
-                ("Candidate", str(fh.get("candidate")), ""),
-                ("Trades", str(fh2.get("trades", 0)), ""),
-                ("2bps PF", f"{float(n2.get('profit_factor',0.0)):.2f}", "ok" if float(n2.get("profit_factor",0.0)) >= 1.2 else "bad"),
-                ("2bps Avg R", f"{float(n2.get('avg_r_net',0.0)):.3f}R", "ok" if float(n2.get("avg_r_net",0.0)) > 0 else "bad"),
-                ("2bps Net", f"${float(n2.get('net_pnl',0.0)):,.2f}", "ok" if float(n2.get("net_pnl",0.0)) > 0 else "bad"),
-                ("5bps PF", f"{float(n5.get('profit_factor',0.0)):.2f}", "ok" if float(n5.get("profit_factor",0.0)) >= 1.05 else "bad"),
-                ("10bps PF", f"{float(n10.get('profit_factor',0.0)):.2f}", "wait"),
-                ("DD", f"{float(n2.get('max_dd_pct',0.0)):.2f}%", "wait"),
-            ],
-            "plan-grid",
+                    st.markdown("### Independent Result — 2 bps")
+                    mini_grid(
+                        [
+                            (
+                                "Trades",
+                                str(iv_stats.get("trades", 0)),
+                                "",
+                            ),
+                            (
+                                "Normalized PF",
+                                (
+                                    "∞"
+                                    if not math.isfinite(
+                                        iv_norm.get(
+                                            "profit_factor",
+                                            0.0,
+                                        )
+                                    )
+                                    else f"{iv_norm.get('profit_factor',0.0):.2f}"
+                                ),
+                                (
+                                    "ok"
+                                    if iv_norm.get(
+                                        "profit_factor",
+                                        0.0,
+                                    ) >= 1.2
+                                    else "bad"
+                                ),
+                            ),
+                            (
+                                "Normalized Avg R",
+                                f"{iv_norm.get('avg_r_net',0.0):.3f}R",
+                                (
+                                    "ok"
+                                    if iv_norm.get(
+                                        "avg_r_net",
+                                        0.0,
+                                    ) > 0
+                                    else "bad"
+                                ),
+                            ),
+                            (
+                                "Normalized Net",
+                                f"${iv_norm.get('net_pnl',0.0):,.2f}",
+                                (
+                                    "ok"
+                                    if iv_norm.get("net_pnl", 0.0) > 0
+                                    else "bad"
+                                ),
+                            ),
+                            (
+                                "Normalized DD",
+                                f"{iv_norm.get('max_dd_pct',0.0):.2f}%",
+                                "wait",
+                            ),
+                            (
+                                "Elapsed",
+                                f"{iv.get('elapsed_seconds',0.0):.1f}s",
+                                "",
+                            ),
+                        ],
+                        "plan-grid",
+                    )
+
+                    st.caption(
+                        f"Coverage: {iv_meta.get('first_bar')} → "
+                        f"{iv_meta.get('last_bar')} • "
+                        f"{int(iv_meta.get('bars',0)):,} M5 bars • "
+                        f"{iv_meta.get('requests',0)} API requests"
+                    )
+
+                    st.markdown("### Independent Cost Stress")
+                    st.dataframe(
+                        iv.get("cost_scenarios", pd.DataFrame()),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    st.markdown("### Independent Robustness")
+                    mini_grid(
+                        [
+                            (
+                                "Bootstrap 95% Low",
+                                f"{iv_robust.get('bootstrap_low',0.0):.3f}R",
+                                (
+                                    "ok"
+                                    if iv_robust.get(
+                                        "bootstrap_low",
+                                        0.0,
+                                    ) > 0
+                                    else "bad"
+                                ),
+                            ),
+                            (
+                                "Bootstrap 95% High",
+                                f"{iv_robust.get('bootstrap_high',0.0):.3f}R",
+                                "",
+                            ),
+                            (
+                                "Cost Break-even",
+                                f"{iv_robust.get('cost_break_even_bps',0.0):.2f} bps RT",
+                                "wait",
+                            ),
+                        ],
+                        "tf-grid",
+                    )
+
+                    iv_quarters = pd.DataFrame(
+                        iv_robust.get("quarters", [])
+                    )
+                    if not iv_quarters.empty:
+                        st.dataframe(
+                            iv_quarters,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                    st.markdown("### Independent Validation Gate")
+                    iv_pass = bool(iv_gate.get("passed"))
+                    mini_grid(
+                        [
+                            (
+                                "Independent Gate",
+                                (
+                                    "PASS → PAPER FORWARD"
+                                    if iv_pass
+                                    else "FAIL / MORE RESEARCH"
+                                ),
+                                "ok" if iv_pass else "bad",
+                            )
+                        ],
+                        "tf-grid",
+                    )
+
+                    for rule in iv_gate.get("rules", []):
+                        icon = "✅" if rule.get("pass") else "❌"
+                        st.write(
+                            f"{icon} {rule.get('name')} — "
+                            f"{rule.get('value')}"
+                        )
+
+                    st.caption(
+                        "10 bps يبقى Stress Test إضافي: "
+                        f"PF={iv_gate.get('cost_10bps_pf')} • "
+                        f"Net={iv_gate.get('cost_10bps_net')}"
+                    )
+
+                    if iv_pass:
+                        st.success(
+                            "المرشح اجتاز نافذة مستقلة أقدم. "
+                            "الخطوة التالية Paper Forward فقط؛ "
+                            "لا يتم فتح Live من هذا الاختبار."
+                        )
+                    else:
+                        st.error(
+                            "المرشح لم يثبت نفسه على نافذة مستقلة. "
+                            "لا نعدّل شروطه باستخدام نفس الفترة؛ "
+                            "نعود للبحث أو نغيّر منطق الاستراتيجية."
+                        )
+
+
+
+    # ------------------- v4.6 walk-forward research lab -------------------
+    st.divider()
+    st.subheader("Walk-Forward Research Lab — v4.8")
+    st.caption(
+        "v4.7 يثبت Regime القوي من v4.6 (trend strength + prior-only volatility) لكنه يغيّر "
+        "منطق الدخول نفسه إلى أحداث EMA rejection / pullback break / fresh breakout. "
+        "الهدف زيادة العينة والثبات عبر 6 نوافذ بدون تخفيف Gate أو لمس Fresh Holdout."
+    )
+
+    dev_bt = st.session_state.get("backtest")
+    old_iv = st.session_state.get("independent_validation")
+
+    # v4.6.1: Walk-Forward no longer depends on browser/session_state.
+    # If the prior Research Audit / Independent Validation objects are still in
+    # the current Streamlit session, reuse their exact boundaries. Otherwise,
+    # reconstruct the same research design directly from time and fetch history
+    # again. This makes the lab usable after refresh/new browser session.
+    if dev_bt and old_iv:
+        dev_meta = dev_bt.get("history_meta", {})
+        old_meta = old_iv.get("history_meta", {})
+
+        dev_first = dev_meta.get("first_bar")
+        dev_last = dev_meta.get("last_bar")
+        old_first = old_meta.get("first_bar")
+        old_last = old_meta.get("last_bar")
+    else:
+        anchor_end = now_utc().floor("5min")
+        dev_last = anchor_end.isoformat()
+        dev_first = (anchor_end - pd.Timedelta(days=180)).isoformat()
+        old_last = dev_first
+        old_first = (anchor_end - pd.Timedelta(days=360)).isoformat()
+        st.info(
+            "Session Recovery: نتائج الجلسة السابقة غير موجودة، "
+            "لكن Walk-Forward سيعيد بناء نافذة البحث 360 يوم مباشرةً بدون إعادة "
+            "Research Audit وIndependent Validation يدويًا."
         )
 
-        st.markdown("### Fresh Holdout Gate")
+    if not all([dev_first, dev_last, old_first, old_last]):
+        st.warning("تعذر تحديد حدود نافذة Walk-Forward.")
+    else:
+        research_start = pd.Timestamp(old_first)
+        research_end = pd.Timestamp(dev_last)
+        fresh_end = research_start
+        fresh_start = fresh_end - pd.Timedelta(days=180)
+
         mini_grid(
             [
-                (
-                    "Fresh Gate",
-                    "PASS → PAPER FORWARD" if fg.get("passed") else "FAIL / RESEARCH AGAIN",
-                    "ok" if fg.get("passed") else "bad",
-                )
+                ("Research Start", research_start.strftime("%Y-%m-%d"), ""),
+                ("Research End", research_end.strftime("%Y-%m-%d"), ""),
+                ("WF Folds", "6", "ok"),
+                ("Fresh Holdout", fresh_start.strftime("%Y-%m-%d"), "wait"),
             ],
             "tf-grid",
         )
 
-        for rule in fg.get("rules", []):
-            st.write(
-                f"{'✅' if rule.get('pass') else '❌'} {rule.get('name')}"
+        st.caption(
+            "Research history = النافذة المستقلة التي فشلت + نافذة التطوير الحالية. "
+            f"Fresh holdout المحجوز: {fresh_start.isoformat()} → {fresh_end.isoformat()}."
+        )
+
+        if st.button(
+            "تشغيل Walk-Forward Lab على 360 يوم",
+            use_container_width=True,
+        ):
+            wf_t0 = time.perf_counter()
+
+            with st.status(
+                "تشغيل Walk-Forward Research Lab...",
+                expanded=True,
+            ) as wf_status:
+                st.write("1/4 • جلب نافذة البحث الأقدم (المستخدمة سابقًا)")
+                try:
+                    older_raw, older_meta = fetch_history_window(
+                        instrument.symbol,
+                        research_start.isoformat(),
+                        pd.Timestamp(dev_first).isoformat(),
+                        chunk_days=17,
+                    )
+                except Exception as exc:
+                    st.error(f"تعذر جلب الجزء الأقدم: {exc}")
+                    older_raw = pd.DataFrame()
+                    older_meta = {}
+
+                st.write("2/4 • جلب نافذة التطوير الحالية")
+                try:
+                    dev_raw, dev_hist_meta = fetch_history_window(
+                        instrument.symbol,
+                        pd.Timestamp(dev_first).isoformat(),
+                        research_end.isoformat(),
+                        chunk_days=17,
+                    )
+                except Exception as exc:
+                    st.error(f"تعذر جلب جزء التطوير: {exc}")
+                    dev_raw = pd.DataFrame()
+                    dev_hist_meta = {}
+
+                if not older_raw.empty and not dev_raw.empty:
+                    research_raw = (
+                        pd.concat([older_raw, dev_raw], ignore_index=True)
+                        .drop_duplicates("datetime")
+                        .sort_values("datetime")
+                        .reset_index(drop=True)
+                    )
+
+                    st.write(
+                        f"3/4 • تجهيز {len(research_raw):,} شمعة مرة واحدة"
+                    )
+                    wf_prepared = prepare_research_context(research_raw)
+
+                    if not wf_prepared.get("ok", False):
+                        st.error(
+                            wf_prepared.get(
+                                "warning",
+                                "تعذر تجهيز Walk-Forward",
+                            )
+                        )
+                    else:
+                        st.write("4/4 • تشغيل 5 Entry Models × 6 نوافذ + 2/5 bps")
+                        wf_result = run_walkforward_lab(
+                            wf_prepared,
+                            instrument,
+                            risk_pct=float(risk_pct),
+                            n_folds=6,
+                        )
+
+                        wf_result["elapsed_seconds"] = float(
+                            time.perf_counter() - wf_t0
+                        )
+                        wf_result["research_bars"] = int(len(research_raw))
+                        wf_result["fresh_start"] = fresh_start.isoformat()
+                        wf_result["fresh_end"] = fresh_end.isoformat()
+
+                        st.session_state.walkforward_lab = wf_result
+                        st.session_state.fresh_holdout = None
+
+                        wf_status.update(
+                            label=(
+                                "Walk-Forward Lab اكتمل خلال "
+                                f"{time.perf_counter()-wf_t0:.1f} ثانية"
+                            ),
+                            state="complete",
+                            expanded=False,
+                        )
+
+        wf = st.session_state.get("walkforward_lab")
+        if wf and wf.get("ok"):
+            st.markdown("### Walk-Forward Candidate Summary")
+            summary_df = wf.get("summary", pd.DataFrame())
+            st.dataframe(
+                summary_df,
+                hide_index=True,
+                use_container_width=True,
             )
 
-        st.markdown("### Fresh Robustness")
-        mini_grid(
-            [
-                ("Bootstrap Low", f"{float(fr.get('bootstrap_low',0.0)):.3f}R", "ok" if float(fr.get("bootstrap_low",0.0)) > 0 else "bad"),
-                ("Bootstrap High", f"{float(fr.get('bootstrap_high',0.0)):.3f}R", ""),
-                ("Break-even", f"{float(fr.get('cost_break_even_bps',0.0)):.2f} bps RT", "wait"),
-            ],
-            "tf-grid",
-        )
+            if not summary_df.empty:
+                st.markdown("### Mobile Candidate Audit")
+                for _, sr in summary_df.iterrows():
+                    variant_name = str(sr.get("Variant", ""))
+                    d = (wf.get("details", {}) or {}).get(variant_name, {})
+                    gate = d.get("gate", {})
+                    mini_grid(
+                        [
+                            ("Candidate", variant_name, ""),
+                            ("Trades", str(int(sr.get("Trades", 0))), ""),
+                            ("2bps PF", f"{float(sr.get('2bps PF',0.0)):.3f}", "ok" if float(sr.get("2bps PF",0.0)) >= 1.2 else "bad"),
+                            ("2bps Avg R", f"{float(sr.get('2bps Avg R',0.0)):.3f}R", "ok" if float(sr.get("2bps Avg R",0.0)) >= 0.05 else "bad"),
+                            ("5bps PF", f"{float(sr.get('5bps PF',0.0)):.3f}", "ok" if float(sr.get("5bps PF",0.0)) >= 1.05 else "bad"),
+                            ("Positive Folds", str(sr.get("Positive Folds","")), ""),
+                            ("Min Fold Trades", str(int(sr.get("Min Fold Trades",0))), ""),
+                            ("Gate", "PASS" if gate.get("eligible") else "FAIL", "ok" if gate.get("eligible") else "bad"),
+                        ],
+                        "plan-grid",
+                    )
+                    failed = gate.get("failed_rules", [])
+                    if failed:
+                        st.caption("Gate fails: " + " • ".join(failed))
+                    else:
+                        st.caption("Gate fails: none")
+                    st.divider()
 
-        qdf = pd.DataFrame(fr.get("quarters", []))
-        if not qdf.empty:
-            st.dataframe(qdf, hide_index=True, use_container_width=True)
+            st.markdown("### Fold-by-Fold Matrix")
+            folds_df = wf.get("folds", pd.DataFrame())
+            if not folds_df.empty:
+                fold_variant = st.selectbox(
+                    "اعرض Folds لمرشح واحد",
+                    list(WF_CANDIDATES.keys()),
+                    key="wf_fold_variant_view",
+                )
+                st.dataframe(
+                    folds_df[folds_df["Variant"] == fold_variant],
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
-        if fg.get("passed"):
-            st.success(
-                "Fresh holdout نجح. الخطوة التالية Paper Forward فقط لمدة كافية؛ "
-                "لا يتم فتح Live تلقائيًا."
+            with st.expander("عرض كل Fold-by-Fold Matrix", expanded=False):
+                st.dataframe(
+                    folds_df,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            eligible = list(wf.get("eligible", []))
+            mini_grid(
+                [
+                    ("Research Bars", f"{int(wf.get('research_bars',0)):,}", ""),
+                    ("Elapsed", f"{float(wf.get('elapsed_seconds',0.0)):.1f}s", ""),
+                    ("Eligible Candidates", str(len(eligible)), "ok" if eligible else "bad"),
+                    ("Fresh Holdout Used?", "NO", "ok"),
+                ],
+                "tf-grid",
+            )
+
+            if not eligible:
+                st.error(
+                    "لا يوجد مرشح اجتاز Walk-Forward Gate. Fresh Holdout يبقى غير مستخدم. "
+                    "لا نخفف Gate ولا نعدّل Fresh Holdout لإجبار PASS؛ نغيّر منطق الدخول فقط."
+                )
+            else:
+                st.success(
+                    "يوجد مرشح/مرشحون اجتازوا Research Gate. "
+                    "يمكن الآن تجميد واحد فقط ثم فتح Fresh Holdout الأقدم لأول مرة."
+                )
+
+                chosen = st.selectbox(
+                    "اختر مرشحًا مؤهلًا لتجميده قبل Fresh Holdout",
+                    eligible,
+                    format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
+                    key="wf_candidate_choice",
+                )
+
+                st.caption(
+                    f"سيتم اختبار {chosen} على نافذة لم نستخدمها حتى الآن: "
+                    f"{fresh_start.isoformat()} → {fresh_end.isoformat()}."
+                )
+
+                if st.button(
+                    "تجميد المرشح وتشغيل Fresh Holdout 180 يوم",
+                    use_container_width=True,
+                ):
+                    fh_t0 = time.perf_counter()
+
+                    with st.status(
+                        "تشغيل Fresh Holdout...",
+                        expanded=True,
+                    ) as fh_status:
+                        try:
+                            fresh_raw, fresh_meta = fetch_history_window(
+                                instrument.symbol,
+                                fresh_start.isoformat(),
+                                fresh_end.isoformat(),
+                                chunk_days=17,
+                            )
+                        except Exception as exc:
+                            st.error(f"تعذر جلب Fresh Holdout: {exc}")
+                            fresh_raw = pd.DataFrame()
+                            fresh_meta = {}
+
+                        if not fresh_raw.empty:
+                            fresh_prepared = prepare_research_context(fresh_raw)
+
+                            if not fresh_prepared.get("ok", False):
+                                st.error(
+                                    fresh_prepared.get(
+                                        "warning",
+                                        "تعذر تجهيز Fresh Holdout",
+                                    )
+                                )
+                            else:
+                                fh_trades2, fh_stats2 = simulate_prepared_research(
+                                    fresh_prepared,
+                                    instrument,
+                                    risk_pct=float(risk_pct),
+                                    cost_bps_roundtrip=2.0,
+                                    research_variant=chosen,
+                                )
+                                _, fh_stats5 = simulate_prepared_research(
+                                    fresh_prepared,
+                                    instrument,
+                                    risk_pct=float(risk_pct),
+                                    cost_bps_roundtrip=5.0,
+                                    research_variant=chosen,
+                                )
+                                _, fh_stats10 = simulate_prepared_research(
+                                    fresh_prepared,
+                                    instrument,
+                                    risk_pct=float(risk_pct),
+                                    cost_bps_roundtrip=10.0,
+                                    research_variant=chosen,
+                                )
+
+                                fh_robust = _research_robustness(fh_trades2)
+                                fh_gate = _fresh_holdout_gate(
+                                    fh_stats2,
+                                    fh_stats5,
+                                    fh_robust,
+                                    fresh_meta,
+                                )
+
+                                st.session_state.fresh_holdout = {
+                                    "candidate": chosen,
+                                    "history_meta": fresh_meta,
+                                    "stats_2": fh_stats2,
+                                    "stats_5": fh_stats5,
+                                    "stats_10": fh_stats10,
+                                    "trades_2": fh_trades2,
+                                    "robustness": fh_robust,
+                                    "gate": fh_gate,
+                                    "elapsed_seconds": float(
+                                        time.perf_counter() - fh_t0
+                                    ),
+                                }
+
+                                fh_status.update(
+                                    label=(
+                                        "Fresh Holdout اكتمل خلال "
+                                        f"{time.perf_counter()-fh_t0:.1f} ثانية"
+                                    ),
+                                    state="complete",
+                                    expanded=False,
+                                )
+
+        fh = st.session_state.get("fresh_holdout")
+        if fh:
+            st.markdown("### Fresh Holdout Result")
+            fh2 = fh.get("stats_2", {})
+            fh5 = fh.get("stats_5", {})
+            fh10 = fh.get("stats_10", {})
+            n2 = fh2.get("normalized", {})
+            n5 = fh5.get("normalized", {})
+            n10 = fh10.get("normalized", {})
+            fg = fh.get("gate", {})
+            fr = fh.get("robustness", {})
+
+            mini_grid(
+                [
+                    ("Candidate", str(fh.get("candidate")), ""),
+                    ("Trades", str(fh2.get("trades", 0)), ""),
+                    ("2bps PF", f"{float(n2.get('profit_factor',0.0)):.2f}", "ok" if float(n2.get("profit_factor",0.0)) >= 1.2 else "bad"),
+                    ("2bps Avg R", f"{float(n2.get('avg_r_net',0.0)):.3f}R", "ok" if float(n2.get("avg_r_net",0.0)) > 0 else "bad"),
+                    ("2bps Net", f"${float(n2.get('net_pnl',0.0)):,.2f}", "ok" if float(n2.get("net_pnl",0.0)) > 0 else "bad"),
+                    ("5bps PF", f"{float(n5.get('profit_factor',0.0)):.2f}", "ok" if float(n5.get("profit_factor",0.0)) >= 1.05 else "bad"),
+                    ("10bps PF", f"{float(n10.get('profit_factor',0.0)):.2f}", "wait"),
+                    ("DD", f"{float(n2.get('max_dd_pct',0.0)):.2f}%", "wait"),
+                ],
+                "plan-grid",
+            )
+
+            st.markdown("### Fresh Holdout Gate")
+            mini_grid(
+                [
+                    (
+                        "Fresh Gate",
+                        "PASS → PAPER FORWARD" if fg.get("passed") else "FAIL / RESEARCH AGAIN",
+                        "ok" if fg.get("passed") else "bad",
+                    )
+                ],
+                "tf-grid",
+            )
+
+            for rule in fg.get("rules", []):
+                st.write(
+                    f"{'✅' if rule.get('pass') else '❌'} {rule.get('name')}"
+                )
+
+            st.markdown("### Fresh Robustness")
+            mini_grid(
+                [
+                    ("Bootstrap Low", f"{float(fr.get('bootstrap_low',0.0)):.3f}R", "ok" if float(fr.get("bootstrap_low",0.0)) > 0 else "bad"),
+                    ("Bootstrap High", f"{float(fr.get('bootstrap_high',0.0)):.3f}R", ""),
+                    ("Break-even", f"{float(fr.get('cost_break_even_bps',0.0)):.2f} bps RT", "wait"),
+                ],
+                "tf-grid",
+            )
+
+            qdf = pd.DataFrame(fr.get("quarters", []))
+            if not qdf.empty:
+                st.dataframe(qdf, hide_index=True, use_container_width=True)
+
+            if fg.get("passed"):
+                st.success(
+                    "Fresh holdout نجح. الخطوة التالية Paper Forward فقط لمدة كافية؛ "
+                    "لا يتم فتح Live تلقائيًا."
+                )
+            else:
+                st.error(
+                    "Fresh holdout فشل. لا نعدّل المرشح باستخدام هذه النافذة؛ "
+                    "نرجع للبحث ونحجز نافذة أقدم جديدة لأي نسخة لاحقة."
+                )
+
+
+
+# -------------------------- advanced health --------------------
+if advanced_ui:
+    st.subheader("System Health")
+
+    quote_age_label = (
+        "N/A"
+        if feed.get("quote_age_min") is None
+        else f"{feed['quote_age_min']:.1f}m"
+    )
+    vol_ratio_label = (
+        "N/A"
+        if feed.get("volatility_ratio") is None
+        else f"{feed['volatility_ratio']:.2f}x"
+    )
+    market_label = (
+        "UNKNOWN"
+        if feed.get("market_open") is None
+        else ("OPEN" if feed.get("market_open") else "CLOSED")
+    )
+
+    health_rows = [
+        {"Component": "Engine self-test", "Status": "ONLINE"},
+        {"Component": "Analysis market data", "Status": "ONLINE" if not raw.empty else "BLOCKED"},
+        {"Component": "Paper quote API", "Status": "ONLINE" if quote.get("connected") else ("RATE GUARD" if quote.get("rate_guard") else "CHECK")},
+        {"Component": "Twelve Data budget", "Status": "PROTECTED (≤7/min)"},
+        {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
+        {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
+        {"Component": "Paper engine", "Status": "ONLINE"},
+        {"Component": "Paper persistence", "Status": "ACTIVE"},
+        {"Component": "Order idempotency", "Status": "ACTIVE"},
+        {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
+        {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
+        {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
+        {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
+        {"Component": "Independent validation", "Status": "PASS" if ((st.session_state.get("independent_validation") or {}).get("gate") or {}).get("passed", False) else "NOT PASSED"},
+        {"Component": "Walk-forward lab", "Status": "CANDIDATE READY" if ((st.session_state.get("walkforward_lab") or {}).get("eligible")) else "RESEARCH"},
+        {"Component": "Paper Forward", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
+        {"Component": "Fresh holdout", "Status": "PASS" if ((st.session_state.get("fresh_holdout") or {}).get("gate") or {}).get("passed", False) else "UNUSED/FAIL"},
+        {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
+        {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
+        {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
+    ]
+    st.dataframe(pd.DataFrame(health_rows), hide_index=True, use_container_width=True)
+
+    st.caption(
+        f"{quality['label']} • Structure {'OK' if feed.get('trusted') else 'CHECK'} • "
+        f"Paper Execution {'READY' if feed.get('execution_ok') else 'BLOCKED'} • "
+        f"Market {market_label} • Quote age {quote_age_label} ({feed.get('quote_ts_source') or 'N/A'}) • "
+        f"unique {feed.get('unique_ratio',0)*100:.0f}% • "
+        f"alternation {feed.get('alternation_ratio',0)*100:.0f}% • "
+        f"vol {vol_ratio_label} • {len(raw):,} bars"
+    )
+
+    with st.expander("Decision Log", expanded=False):
+        if st.session_state.decisions:
+            decisions_df = pd.DataFrame(st.session_state.decisions)
+            st.dataframe(decisions_df, hide_index=True, use_container_width=True)
+            st.download_button(
+                "تنزيل سجل القرارات CSV",
+                data=decisions_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"gold_ai_decisions_{now_riyadh().date().isoformat()}.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
         else:
-            st.error(
-                "Fresh holdout فشل. لا نعدّل المرشح باستخدام هذه النافذة؛ "
-                "نرجع للبحث ونحجز نافذة أقدم جديدة لأي نسخة لاحقة."
-            )
+            st.info("لا يوجد سجل بعد")
 
+    st.info(
+        "FINAL SAFETY v4.9.1: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+        "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
+        "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
+        "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
+        "هذه البوابات لا تعني ضمان الربح؛ هي شروط تحقق وتشغيل فقط."
+    )
 
-# --------------------------- health ---------------------------
-st.subheader("System Health")
-
-quote_age_label = (
-    "N/A"
-    if feed.get("quote_age_min") is None
-    else f"{feed['quote_age_min']:.1f}m"
-)
-vol_ratio_label = (
-    "N/A"
-    if feed.get("volatility_ratio") is None
-    else f"{feed['volatility_ratio']:.2f}x"
-)
-market_label = (
-    "UNKNOWN"
-    if feed.get("market_open") is None
-    else ("OPEN" if feed.get("market_open") else "CLOSED")
-)
-
-health_rows = [
-    {"Component": "Engine self-test", "Status": "ONLINE"},
-    {"Component": "Analysis market data", "Status": "ONLINE" if not raw.empty else "BLOCKED"},
-    {"Component": "Paper quote API", "Status": "ONLINE" if quote.get("connected") else ("RATE GUARD" if quote.get("rate_guard") else "CHECK")},
-    {"Component": "Twelve Data budget", "Status": "PROTECTED (≤7/min)"},
-    {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
-    {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
-    {"Component": "Paper engine", "Status": "ONLINE"},
-    {"Component": "Paper persistence", "Status": "ACTIVE"},
-    {"Component": "Order idempotency", "Status": "ACTIVE"},
-    {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
-    {"Component": "Broker quote", "Status": "READY" if broker_quote.get("ok") else ("BLOCKED" if bridge else "NOT CONFIGURED")},
-    {"Component": "Contract metadata", "Status": "VERIFIED" if contract_metadata_verified else "UNVERIFIED"},
-    {"Component": "Baseline research gate", "Status": "PASS" if (st.session_state.get("research_gate", {}).get("passed") and st.session_state.get("research_gate", {}).get("context") == research_context) else "BLOCKED"},
-    {"Component": "Independent validation", "Status": "PASS" if ((st.session_state.get("independent_validation") or {}).get("gate") or {}).get("passed", False) else "NOT PASSED"},
-    {"Component": "Walk-forward lab", "Status": "CANDIDATE READY" if ((st.session_state.get("walkforward_lab") or {}).get("eligible")) else "RESEARCH"},
-    {"Component": "Paper Forward", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
-    {"Component": "Fresh holdout", "Status": "PASS" if ((st.session_state.get("fresh_holdout") or {}).get("gate") or {}).get("passed", False) else "UNUSED/FAIL"},
-    {"Component": "Automation backend", "Status": "READY" if automation_backend_ready else "NOT CONFIGURED"},
-    {"Component": "Live trading", "Status": "UNLOCKED" if live_unlocked else "LOCKED"},
-    {"Component": "Auto live", "Status": "UNLOCKED" if auto_live_unlocked else "LOCKED"},
-]
-st.dataframe(pd.DataFrame(health_rows), hide_index=True, use_container_width=True)
-
-st.caption(
-    f"{quality['label']} • Structure {'OK' if feed.get('trusted') else 'CHECK'} • "
-    f"Paper Execution {'READY' if feed.get('execution_ok') else 'BLOCKED'} • "
-    f"Market {market_label} • Quote age {quote_age_label} ({feed.get('quote_ts_source') or 'N/A'}) • "
-    f"unique {feed.get('unique_ratio',0)*100:.0f}% • "
-    f"alternation {feed.get('alternation_ratio',0)*100:.0f}% • "
-    f"vol {vol_ratio_label} • {len(raw):,} bars"
-)
-
-with st.expander("Decision Log", expanded=False):
-    if st.session_state.decisions:
-        decisions_df = pd.DataFrame(st.session_state.decisions)
-        st.dataframe(decisions_df, hide_index=True, use_container_width=True)
-        st.download_button(
-            "تنزيل سجل القرارات CSV",
-            data=decisions_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"gold_ai_decisions_{now_riyadh().date().isoformat()}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    else:
-        st.info("لا يوجد سجل بعد")
-
-st.info(
-    "FINAL SAFETY v4.9: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
-    "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
-    "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
-    "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
-    "هذه البوابات لا تعني ضمان الربح؛ هي شروط تحقق وتشغيل فقط."
-)
 
 if st.session_state.auto_refresh:
     @st.fragment(run_every=refresh_seconds)
