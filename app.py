@@ -214,6 +214,39 @@ def mini_grid(items: list[tuple[str, str, str]], css_class: str = "status-grid")
     st.markdown(f"<div class='{css_class}'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
+def render_readiness_panel() -> None:
+    """Show a plain-language setup checklist before market analysis starts."""
+    market_ready = bool(secret("TWELVE_DATA_API_KEY"))
+    sharia_ready = bool(
+        secret("SHARIA_APPROVED_SYMBOLS")
+        and secret("SHARIA_SCREEN_SOURCE")
+        and secret("SHARIA_SCREEN_DATE")
+    )
+    bridge_ready = bool(bridge) if "bridge" in globals() else False
+    live_ready = bool(
+        live_unlocked
+        and automation_backend_ready
+        and auto_live_unlocked
+        and contract_metadata_verified
+        and bridge_ready
+    )
+    with st.expander("مركز الجاهزية", expanded=not market_ready):
+        mini_grid(
+            [
+                ("بيانات السوق", "متصلة" if market_ready else "تحتاج مفتاح", "ok" if market_ready else "wait"),
+                ("Paper", "جاهز", "ok"),
+                ("الفحص الشرعي", "مربوط" if sharia_ready else "اختياري", "ok" if sharia_ready else "wait"),
+                ("Live", "مفعّل" if live_ready else "مقفول للحماية", "ok" if live_ready else "wait"),
+            ]
+        )
+        if not market_ready:
+            st.info("لإظهار أسعار الذهب والأسهم أضف TWELVE_DATA_API_KEY في Streamlit Secrets ثم أعد تشغيل التطبيق.")
+        elif not sharia_ready and instrument.asset_class == "STOCK":
+            st.caption("الفحص الشرعي غير مربوط بمصدر محدث؛ التطبيق لا يفترض الحكم من اسم الشركة.")
+        if not live_ready:
+            st.caption("التداول الحقيقي يبقى مقفولًا حتى يكتمل Broker Bridge وتوثيق بيانات العقد.")
+
+
 
 # ---------------------- persistent Paper state ----------------------
 # This SQLite layer survives browser refreshes / normal Streamlit reruns.
@@ -4643,6 +4676,8 @@ st.caption(
     "X10 v6.1.1 STOCK STABILITY • Gold + U.S. Stocks • Paper Smart AutoPilot • "
     "market-specific engines • automatic risk control"
 )
+
+render_readiness_panel()
 
 if instrument.asset_class == "STOCK":
     st.info(
