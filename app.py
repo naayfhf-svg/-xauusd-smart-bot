@@ -28,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "4.11.0-x10-smart-autopilot"
+VERSION = "6.0.0-x10-stock-desk"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -141,12 +141,39 @@ class InstrumentSpec:
 
 PRESETS: dict[str, InstrumentSpec] = {
     "Gold — XAU/USD": InstrumentSpec("Gold — XAU/USD", "GOLD", "XAU/USD", 1.0, 0.01, 0.01, 100.0),
+
+    # U.S. stock watchlist. These are trading symbols only; the app does NOT
+    # claim current Sharia compliance without a separate up-to-date screener.
     "Apple — AAPL": InstrumentSpec("Apple — AAPL", "STOCK", "AAPL", 1.0, 1.0, 1.0, 100000.0),
     "Microsoft — MSFT": InstrumentSpec("Microsoft — MSFT", "STOCK", "MSFT", 1.0, 1.0, 1.0, 100000.0),
+    "NVIDIA — NVDA": InstrumentSpec("NVIDIA — NVDA", "STOCK", "NVDA", 1.0, 1.0, 1.0, 100000.0),
+    "AMD — AMD": InstrumentSpec("AMD — AMD", "STOCK", "AMD", 1.0, 1.0, 1.0, 100000.0),
+    "Meta — META": InstrumentSpec("Meta — META", "STOCK", "META", 1.0, 1.0, 1.0, 100000.0),
+    "Alphabet — GOOGL": InstrumentSpec("Alphabet — GOOGL", "STOCK", "GOOGL", 1.0, 1.0, 1.0, 100000.0),
+    "Amazon — AMZN": InstrumentSpec("Amazon — AMZN", "STOCK", "AMZN", 1.0, 1.0, 1.0, 100000.0),
     "SPY ETF": InstrumentSpec("SPY ETF", "STOCK", "SPY", 1.0, 1.0, 1.0, 100000.0),
+
     "Nasdaq Futures — NQ": InstrumentSpec("Nasdaq Futures — NQ", "FUTURES", "NQ", 20.0, 1.0, 1.0, 1000.0),
     "S&P Futures — ES": InstrumentSpec("S&P Futures — ES", "FUTURES", "ES", 50.0, 1.0, 1.0, 1000.0),
 }
+
+# Curated liquid U.S. watchlist. Symbols here are market-data symbols only.
+# Sharia status is NOT inferred from the company name; if the user supplies a
+# current verified allow-list in Secrets, the UI can filter against it.
+STOCK_UNIVERSE: dict[str, dict[str, str]] = {
+    "AAPL": {"name": "Apple", "group": "Technology"},
+    "MSFT": {"name": "Microsoft", "group": "Technology"},
+    "NVDA": {"name": "NVIDIA", "group": "Semiconductors"},
+    "AMD": {"name": "AMD", "group": "Semiconductors"},
+    "META": {"name": "Meta", "group": "Communication"},
+    "GOOGL": {"name": "Alphabet", "group": "Communication"},
+    "AMZN": {"name": "Amazon", "group": "Consumer"},
+}
+STOCK_SCAN_BATCH_SIZE = 3
+STOCK_SCAN_INTERVAL_SECONDS = 60
+STOCK_MAX_TRADES_PER_DAY = 6
+STOCK_MAX_TRADES_PER_SYMBOL_DAY = 3
+STOCK_LOSS_COOLDOWN_MINUTES = 30
 
 # -------------------------- utilities -------------------------
 def now_utc() -> pd.Timestamp:
@@ -203,6 +230,11 @@ PERSIST_KEYS = (
     "auto_paper",
     "forward_candidate",
     "adaptive_profile_choice",
+    "stock_favorites",
+    "stock_scan_cache",
+    "stock_scan_cursor",
+    "stock_auto_scan",
+    "stock_sharia_only",
     "last_auto_paper_candle",
     "paper_order_keys",
 )
@@ -333,6 +365,15 @@ def init_state() -> None:
         "fresh_holdout": None,
         "forward_candidate": "V47_B2_VOL",
         "adaptive_profile_choice": "ذكي تلقائي",
+        "stock_favorites": [],
+        "stock_scan_cache": {},
+        "stock_scan_cursor": 0,
+        "stock_auto_scan": True,
+        "stock_sharia_only": False,
+        "stock_scan_alerts": {},
+        "market_preset": "Gold — XAU/USD",
+        "market_section": "الذهب",
+        "pending_market_preset": None,
         "research_gate": {
             "passed": False,
             "context": None,
@@ -343,8 +384,11 @@ def init_state() -> None:
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
-    # Restore Paper state after defaults are present.
-    restore_persistent_state()
+    # Restore persisted state once per browser session. Restoring on every
+    # Streamlit rerun can overwrite a widget value the user just changed.
+    if not st.session_state.get("_persistent_state_loaded", False):
+        restore_persistent_state()
+        st.session_state._persistent_state_loaded = True
 
     today = now_riyadh().date().isoformat()
     if st.session_state.paper_day != today:
@@ -1257,6 +1301,411 @@ def analyze_mtf(raw: pd.DataFrame) -> dict[str, Any]:
         "sell_score": sell_score,
     }
 
+
+# ----------------------- stock desk helpers -------------------
+def stock_session_state(as_of: pd.Timestamp | None = None) -> dict[str, Any]:
+    """U.S. regular session context. Quote market_open remains authoritative."""
+    ts = now_utc() if as_of is None else pd.Timestamp(as_of)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    ny = ts.tz_convert("America/New_York")
+    minute = ny.hour * 60 + ny.minute
+    weekday = ny.weekday() < 5
+    regular = bool(weekday and (9 * 60 + 30) <= minute < 16 * 60)
+    # Avoid the first 15 minutes and final 10 minutes for new entries.
+    preferred = bool(weekday and (9 * 60 + 45) <= minute < (15 * 60 + 50))
+    return {
+        "ny_time": ny,
+        "regular": regular,
+        "preferred": preferred,
+        "label": "جلسة مناسبة" if preferred else ("جلسة مفتوحة" if regular else "خارج الجلسة"),
+    }
+
+
+def sharia_config() -> dict[str, Any]:
+    raw = str(secret("SHARIA_APPROVED_SYMBOLS", "") or "").strip()
+    approved = {
+        x.strip().upper()
+        for x in raw.replace(";", ",").split(",")
+        if x.strip()
+    }
+    return {
+        "approved": approved,
+        "source": str(secret("SHARIA_SCREEN_SOURCE", "") or "").strip(),
+        "date": str(secret("SHARIA_SCREEN_DATE", "") or "").strip(),
+        "configured": bool(approved),
+    }
+
+
+def stock_sharia_status(symbol: str) -> str:
+    cfg = sharia_config()
+    if not cfg["configured"]:
+        return "غير متحقق"
+    return "مُدرج بالقائمة" if symbol.upper() in cfg["approved"] else "غير مدرج"
+
+
+def stock_quote_guard(quote: dict[str, Any], reference_price: float) -> tuple[bool, list[str], float | None]:
+    reasons: list[str] = []
+    spread_pct: float | None = None
+    if quote.get("connected") and finite(quote.get("bid")) and finite(quote.get("ask")):
+        bid = float(quote["bid"])
+        ask = float(quote["ask"])
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spread_pct = (ask - bid) / mid * 100.0
+            if spread_pct > 0.20:
+                reasons.append(f"سبريد السهم مرتفع ({spread_pct:.3f}%)")
+    if reference_price <= 0:
+        reasons.append("سعر السهم غير صالح")
+    return not reasons, reasons, spread_pct
+
+
+def quote_execution_ready(quote: dict[str, Any], max_age_minutes: float = 5.0) -> bool:
+    if not quote.get("connected") or not finite(quote.get("last")):
+        return False
+    q_ts, _ = quote_timestamp(quote)
+    if q_ts is None:
+        return False
+    age = max(0.0, (now_utc() - q_ts).total_seconds() / 60.0)
+    if age > max_age_minutes:
+        return False
+    if quote.get("market_open") is False:
+        return False
+    return True
+
+
+def stock_symbol_to_preset(symbol: str) -> str | None:
+    symbol = symbol.upper()
+    for label, spec in PRESETS.items():
+        if spec.asset_class == "STOCK" and spec.symbol.upper() == symbol:
+            return label
+    return None
+
+
+def stock_recent_loss(symbol: str, cooldown_minutes: int = STOCK_LOSS_COOLDOWN_MINUTES) -> bool:
+    cutoff = now_utc() - pd.Timedelta(minutes=int(cooldown_minutes))
+    for item in list(st.session_state.get("paper_history", [])):
+        if str(item.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if float(item.get("PnL", 0.0)) >= 0:
+            continue
+        ts = parse_timestamp(item.get("closed_at"))
+        if ts is not None and ts >= cutoff:
+            return True
+    return False
+
+
+def stock_trades_today(symbol: str | None = None) -> int:
+    today = now_riyadh().date()
+    count = 0
+    for item in list(st.session_state.get("paper_history", [])):
+        if item.get("asset_class") != "STOCK":
+            continue
+        if symbol and str(item.get("symbol", "")).upper() != symbol.upper():
+            continue
+        try:
+            ts = pd.Timestamp(item.get("opened_at"))
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(TZ)
+            else:
+                ts = ts.tz_convert(TZ)
+            if ts.date() == today:
+                count += 1
+        except Exception:
+            continue
+    p = st.session_state.get("paper_position")
+    if p and p.get("asset_class") == "STOCK":
+        if not symbol or str(p.get("symbol", "")).upper() == symbol.upper():
+            try:
+                ts = pd.Timestamp(p.get("opened_at"))
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(TZ)
+                else:
+                    ts = ts.tz_convert(TZ)
+                if ts.date() == today:
+                    count += 1
+            except Exception:
+                pass
+    return count
+
+
+def stock_performance_summary() -> dict[str, Any]:
+    rows = [x for x in st.session_state.get("paper_history", []) if x.get("asset_class") == "STOCK"]
+    if not rows:
+        return {"trades": 0, "wins": 0, "win_rate": 0.0, "net": 0.0, "avg_r": 0.0, "loss_streak": 0}
+    pnl = [float(x.get("PnL", 0.0)) for x in rows]
+    rvals = [float(x.get("R", 0.0)) for x in rows]
+    wins = sum(v > 0 for v in pnl)
+    streak = 0
+    for v in pnl:  # history is newest first
+        if v < 0:
+            streak += 1
+        else:
+            break
+    return {
+        "trades": len(rows),
+        "wins": wins,
+        "win_rate": wins / len(rows) * 100.0,
+        "net": sum(pnl),
+        "avg_r": sum(rvals) / len(rvals),
+        "loss_streak": streak,
+    }
+
+
+# ----------------------- smart stock engine -------------------
+STOCK_PROFILE_CANDIDATES = {
+    "صارم": "V500_STOCK_STRICT",
+    "متوازن": "V500_STOCK_BALANCED",
+    "مرن": "V500_STOCK_FLEX",
+}
+STOCK_CANDIDATES = set(STOCK_PROFILE_CANDIDATES.values())
+
+
+def analyze_stock_candidate(raw: pd.DataFrame, profile: str) -> dict[str, Any]:
+    """
+    Long-only U.S. stock Paper engine, separate from the gold logic.
+
+    Inputs are closed bars only. The engine adapts trend/volatility thresholds
+    from prior data, avoids extended entries, uses relative volume when present,
+    and only emits BUY/WAIT. No shorting, averaging down, or martingale.
+    """
+    frames = {
+        "M5": raw,
+        "M15": resample_closed(raw, "15min"),
+        "H1": resample_closed(raw, "1h"),
+        "H4": resample_closed(raw, "4h"),
+    }
+    snaps = {name: snapshot(frame) for name, frame in frames.items()}
+    if any(v is None for v in snaps.values()):
+        return {
+            "signal": "WAIT", "strength": 0, "reason": "بيانات الأسهم غير كافية لكل الأطر",
+            "snapshots": snaps, "b2": {}, "buy_score": 0, "sell_score": 0,
+            "trend25": False, "regime_ok": False, "session_ok": False,
+            "event_ok": False, "event": "NONE", "readiness_pct": 0,
+            "near_entry": False, "stock_profile": profile, "volume_ratio": None,
+            "volume_ok": False, "not_extended": False,
+        }
+
+    m5, m15, h1, h4 = snaps["M5"], snaps["M15"], snaps["H1"], snaps["H4"]
+    m5f, h1f, h4f = m5["frame"].copy(), h1["frame"].copy(), h4["frame"].copy()
+
+    def prior_quantile(series: pd.Series, q: float, lookback: int, fallback: float) -> float:
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        if len(values) < 20:
+            return float(fallback)
+        prior = values.iloc[:-1].tail(int(lookback))
+        if len(prior) < 10:
+            return float(fallback)
+        value = float(prior.quantile(q))
+        return value if finite(value) else float(fallback)
+
+    cfgs = {
+        "صارم": {"h1_q": .60, "h4_q": .55, "h1_clip": (20.,30.), "h4_clip": (17.,26.),
+                  "vol_low": .20, "vol_high": .90, "rsi": (52.,68.), "volume_min": 1.00, "max_ext": .85},
+        "متوازن": {"h1_q": .45, "h4_q": .40, "h1_clip": (18.,28.), "h4_clip": (15.,24.),
+                    "vol_low": .12, "vol_high": .93, "rsi": (50.,72.), "volume_min": .75, "max_ext": 1.20},
+        "مرن": {"h1_q": .35, "h4_q": .30, "h1_clip": (16.,25.), "h4_clip": (14.,22.),
+                 "vol_low": .08, "vol_high": .97, "rsi": (48.,75.), "volume_min": .50, "max_ext": 1.50},
+    }
+    cfg = cfgs.get(profile, cfgs["متوازن"])
+
+    h1_adx = float(np.clip(prior_quantile(h1f["adx"], cfg["h1_q"], 240, 20.), *cfg["h1_clip"]))
+    h4_adx = float(np.clip(prior_quantile(h4f["adx"], cfg["h4_q"], 180, 18.), *cfg["h4_clip"]))
+
+    atr_pct = pd.to_numeric(m5f["atr"], errors="coerce") / pd.to_numeric(m5f["close"], errors="coerce").abs().replace(0, np.nan)
+    atr_now = float(atr_pct.iloc[-1]) if len(atr_pct) and finite(atr_pct.iloc[-1]) else math.nan
+    vol_low = prior_quantile(atr_pct, cfg["vol_low"], 2880, atr_now if finite(atr_now) else 0.)
+    vol_high = prior_quantile(atr_pct, cfg["vol_high"], 2880, atr_now if finite(atr_now) else 0.)
+    regime_ok = bool(finite(atr_now) and finite(vol_low) and finite(vol_high) and vol_low <= atr_now <= vol_high)
+
+    if profile == "صارم":
+        trend_ok = bool(h4["trend"] == "UP" and h1["trend"] == "UP" and m15["trend"] == "UP"
+                        and float(h1["adx"]) >= h1_adx and float(h4["adx"]) >= h4_adx)
+    elif profile == "مرن":
+        trend_ok = bool(h1["trend"] == "UP" and m15["trend"] != "DOWN" and h4["trend"] != "DOWN"
+                        and float(h1["adx"]) >= h1_adx)
+    else:
+        trend_ok = bool(h1["trend"] == "UP" and m15["trend"] == "UP" and h4["trend"] != "DOWN"
+                        and float(h1["adx"]) >= h1_adx and float(h4["adx"]) >= h4_adx)
+
+    current = m5f.iloc[-1]
+    atr_abs = float(current["atr"]) if finite(current.get("atr")) else 0.0
+    rsi_ok = cfg["rsi"][0] <= float(m5["rsi"]) <= cfg["rsi"][1]
+    momentum_ok = bool(float(m5["momentum"]) > 0 and float(m5["macd_hist"]) > 0)
+    price_structure_ok = bool(float(m5["close"]) > float(m5["ema20"]) >= float(m5["ema50"]))
+
+    extension_atr = ((float(m5["close"]) - float(m5["ema20"])) / atr_abs) if atr_abs > 0 else math.inf
+    not_extended = bool(finite(extension_atr) and extension_atr <= float(cfg["max_ext"]))
+
+    volume_ratio = None
+    volume_ok = True
+    if "volume" in m5f.columns:
+        vols = pd.to_numeric(m5f["volume"], errors="coerce")
+        if len(vols) >= 22 and finite(vols.iloc[-1]):
+            prior_med = float(vols.iloc[-21:-1].median())
+            if prior_med > 0:
+                volume_ratio = float(vols.iloc[-1]) / prior_med
+                volume_ok = bool(volume_ratio >= float(cfg["volume_min"]))
+
+    prior20 = m5f.iloc[-21:-1] if len(m5f) >= 22 else pd.DataFrame()
+    prior_high = float(prior20["high"].max()) if not prior20.empty else math.nan
+    breakout20 = bool(finite(prior_high) and float(current["close"]) > prior_high and momentum_ok)
+    pullback = bool(atr_abs > 0 and float(current["low"]) <= float(m5["ema20"]) + .20 * atr_abs
+                    and float(current["close"]) > float(m5["ema20"]) and momentum_ok)
+    b2 = b2_signal(m5f)
+    b2_buy = bool(b2.get("valid") and b2.get("side") == "BUY")
+
+    if profile == "صارم":
+        event_ok = bool((b2_buy or breakout20) and rsi_ok and momentum_ok and price_structure_ok and not_extended)
+        event = "B2/Break20"
+    else:
+        event_ok = bool((b2_buy or breakout20 or pullback) and rsi_ok and momentum_ok and not_extended
+                        and (price_structure_ok or profile == "مرن"))
+        event = "B2/Break20/Pullback"
+
+    session = stock_session_state()
+    session_ok = bool(session["preferred"])
+
+    gates = [trend_ok, regime_ok, session_ok, event_ok, volume_ok]
+    readiness_pct = int(round(sum(bool(x) for x in gates) / len(gates) * 100))
+    near_entry = bool(trend_ok and regime_ok and session_ok and volume_ok and not event_ok)
+    signal = "BUY" if all(gates) else "WAIT"
+
+    if signal == "BUY":
+        reason = f"أسهم {profile}: اتجاه + تذبذب + حجم + حدث دخول مكتملة"
+    elif near_entry:
+        reason = f"أسهم {profile}: السوق والاتجاه جاهزان، ننتظر حدث الدخول"
+    else:
+        missing = []
+        if not trend_ok: missing.append("الاتجاه")
+        if not regime_ok: missing.append("التذبذب")
+        if not session_ok: missing.append("وقت التداول")
+        if not event_ok: missing.append("حدث الدخول")
+        if not volume_ok: missing.append("الحجم")
+        reason = "أسهم " + profile + ": ننتظر " + " + ".join(missing or ["التأكيد"])
+
+    return {
+        "signal": signal, "strength": readiness_pct, "reason": reason,
+        "snapshots": snaps, "b2": b2, "buy_score": readiness_pct, "sell_score": 0,
+        "trend25": trend_ok, "regime_ok": regime_ok, "session_ok": session_ok,
+        "event_ok": event_ok, "event": event, "readiness_pct": readiness_pct,
+        "near_entry": near_entry, "stock_profile": profile,
+        "adaptive_h1_adx": h1_adx, "adaptive_h4_adx": h4_adx,
+        "adaptive_vol_low": vol_low, "adaptive_vol_high": vol_high,
+        "volume_ratio": volume_ratio, "volume_ok": volume_ok,
+        "extension_atr": extension_atr, "not_extended": not_extended,
+        "stock_session_label": session["label"],
+    }
+
+def choose_stock_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    """Compare the three stock profiles on identical closed bars."""
+    order = ["صارم", "متوازن", "مرن"]
+    evaluations = {p: analyze_stock_candidate(raw_df, p) for p in order}
+    loss_streak = recent_paper_loss_streak("STOCK")
+    allowed = ["صارم"] if loss_streak >= 1 else order
+
+    for p in allowed:  # prefer the strongest valid profile
+        result = evaluations[p]
+        if result.get("signal") == "BUY":
+            return p, STOCK_PROFILE_CANDIDATES[p], result, {
+                "mode": "STOCK_AUTO_SIGNAL", "loss_streak": loss_streak,
+                "reason": f"اختير {p} لأنه أقوى نمط أسهم لديه دخول مكتمل",
+                "evaluations": {k: {"signal": evaluations[k].get("signal"),
+                                     "readiness": int(evaluations[k].get("readiness_pct", 0)),
+                                     "event": evaluations[k].get("event")} for k in order},
+            }
+
+    priority = {"صارم": 3, "متوازن": 2, "مرن": 1}
+    best = max(allowed, key=lambda p: (int(evaluations[p].get("readiness_pct", 0)), priority[p]))
+    return best, STOCK_PROFILE_CANDIDATES[best], evaluations[best], {
+        "mode": "STOCK_AUTO_WAIT", "loss_streak": loss_streak,
+        "reason": ("بعد خسارة حديثة: الأسهم مقفلة على صارم" if loss_streak >= 1
+                   else f"لا يوجد دخول مكتمل؛ الأقرب الآن {best}"),
+        "evaluations": {k: {"signal": evaluations[k].get("signal"),
+                             "readiness": int(evaluations[k].get("readiness_pct", 0)),
+                             "event": evaluations[k].get("event")} for k in order},
+    }
+
+
+def scan_stock_batch(profile_choice: str = "ذكي تلقائي", batch_size: int = STOCK_SCAN_BATCH_SIZE) -> list[dict[str, Any]]:
+    """Rotate through the watchlist without breaking the Twelve Data credit budget."""
+    symbols = list(STOCK_UNIVERSE.keys())
+    if not symbols:
+        return []
+    cache = dict(st.session_state.get("stock_scan_cache", {}) or {})
+    cursor = int(st.session_state.get("stock_scan_cursor", 0)) % len(symbols)
+    chosen = [symbols[(cursor + i) % len(symbols)] for i in range(min(int(batch_size), len(symbols)))]
+
+    for symbol in chosen:
+        raw_i, status_i = fetch_market(symbol)
+        if raw_i.empty:
+            old = dict(cache.get(symbol, {}) or {})
+            old.update({"symbol": symbol, "status": status_i, "stale": True})
+            cache[symbol] = old
+            continue
+        if profile_choice == "ذكي تلقائي":
+            profile_i, candidate_i, result_i, _ = choose_stock_autopilot(raw_i)
+        else:
+            profile_i = profile_choice if profile_choice in STOCK_PROFILE_CANDIDATES else "متوازن"
+            candidate_i = STOCK_PROFILE_CANDIDATES[profile_i]
+            result_i = analyze_stock_candidate(raw_i, profile_i)
+        m5 = result_i.get("snapshots", {}).get("M5") or {}
+        cache[symbol] = {
+            "symbol": symbol,
+            "name": STOCK_UNIVERSE[symbol]["name"],
+            "group": STOCK_UNIVERSE[symbol]["group"],
+            "signal": result_i.get("signal", "WAIT"),
+            "readiness": int(result_i.get("readiness_pct", 0)),
+            "profile": profile_i,
+            "candidate": candidate_i,
+            "event": result_i.get("event", "NONE"),
+            "trend": m5.get("trend", "—"),
+            "rsi": round(float(m5.get("rsi", 0.0)), 1) if m5 else None,
+            "volume_ratio": (round(float(result_i["volume_ratio"]), 2)
+                             if finite(result_i.get("volume_ratio")) else None),
+            "price": round(float(raw_i["close"].iloc[-1]), 4),
+            "sharia": stock_sharia_status(symbol),
+            "updated_at": now_riyadh().isoformat(),
+            "status": status_i,
+            "stale": False,
+        }
+        if result_i.get("signal") == "BUY":
+            latest_candle = str(raw_i["datetime"].iloc[-1])
+            alert_key = f"{symbol}:{latest_candle}:{profile_i}:BUY"
+            alerts = dict(st.session_state.get("stock_scan_alerts", {}) or {})
+            if alerts.get(symbol) != alert_key:
+                alerts[symbol] = alert_key
+                st.session_state.stock_scan_alerts = alerts
+                st.toast(f"📈 Stock Scanner: {symbol} لديه BUY مكتملة — {profile_i}")
+
+    st.session_state.stock_scan_cache = cache
+    st.session_state.stock_scan_cursor = (cursor + len(chosen)) % len(symbols)
+    persist_paper_state()
+    return list(cache.values())
+
+
+def stock_scanner_rows(sharia_only: bool = False) -> list[dict[str, Any]]:
+    rows = [dict(r) for r in (st.session_state.get("stock_scan_cache", {}) or {}).values()]
+    favorites = set(st.session_state.get("stock_favorites", []))
+    for row in rows:
+        ts = parse_timestamp(row.get("updated_at"))
+        age_min = ((now_utc() - ts).total_seconds() / 60.0) if ts is not None else math.inf
+        row["stale"] = bool(row.get("stale", False) or age_min > 5.0)
+        row["freshness"] = "حديث" if not row["stale"] else "قديم"
+        row["favorite"] = "★" if row.get("symbol") in favorites else ""
+    if sharia_only:
+        rows = [r for r in rows if r.get("sharia") == "مُدرج بالقائمة"]
+    rows.sort(
+        key=lambda r: (
+            not bool(r.get("stale")),
+            r.get("signal") == "BUY",
+            int(r.get("readiness", 0)),
+            r.get("favorite") == "★",
+        ),
+        reverse=True,
+    )
+    return rows
+
+
 # ----------------------- risk / trade plan --------------------
 def build_trade_plan(
     signal: str,
@@ -1271,7 +1720,9 @@ def build_trade_plan(
 ) -> dict[str, Any]:
     if signal not in {"BUY", "SELL"}:
         raise ValueError("Signal must be BUY or SELL")
-    if equity <= 0 or risk_pct <= 0 or atr_value <= 0 or spec.point_value <= 0:
+    if spec.asset_class == "STOCK" and signal == "SELL":
+        raise ValueError("محرك الأسهم Cash/Long-only ولا يسمح بصفقات Short")
+    if equity <= 0 or risk_pct <= 0 or atr_value <= 0 or spec.point_value <= 0 or entry <= 0:
         raise ValueError("مدخلات المخاطرة غير صالحة")
 
     stop_distance = max(atr_value * stop_atr, 1e-9)
@@ -1286,6 +1737,14 @@ def build_trade_plan(
 
     max_qty_hit = stepped_qty > spec.max_qty
     qty = min(stepped_qty, spec.max_qty)
+    cash_cap_hit = False
+    if spec.asset_class == "STOCK" and signal == "BUY":
+        cash_qty = floor_step(equity / entry, spec.qty_step)
+        if cash_qty < spec.min_qty:
+            raise ValueError("الرصيد النقدي لا يكفي للحد الأدنى من كمية السهم")
+        if qty > cash_qty:
+            qty = cash_qty
+            cash_cap_hit = True
 
     if signal == "BUY":
         stop = entry - stop_distance
@@ -1306,6 +1765,8 @@ def build_trade_plan(
         "raw_qty": float(raw_qty),
         "stepped_qty": float(stepped_qty),
         "max_qty_hit": bool(max_qty_hit),
+        "cash_cap_hit": bool(cash_cap_hit),
+        "notional": float(entry * qty),
         "entry_reference": float(entry),
         "stop_loss": float(stop),
         "take_profit_1": float(tp1),
@@ -1362,7 +1823,11 @@ def paper_mark_price(position: dict[str, Any], quote: dict[str, Any], fallback: 
         if position["side"] == "SELL" and finite(quote.get("ask")):
             return float(quote["ask"])
         if finite(quote.get("last")):
-            return float(quote["last"])
+            last = float(quote["last"])
+            if position.get("asset_class") == "STOCK":
+                # Conservative fallback when the data plan omits bid/ask.
+                return last * (1.0 - 0.0002) if position["side"] == "BUY" else last * (1.0 + 0.0002)
+            return last
     return fallback
 
 
@@ -1378,6 +1843,8 @@ def open_paper(
     plan: dict[str, Any],
     instrument: InstrumentSpec,
     order_key: str | None = None,
+    candidate: str | None = None,
+    profile: str | None = None,
 ) -> bool:
     if st.session_state.paper_position:
         return False
@@ -1402,7 +1869,8 @@ def open_paper(
         "tp1_hit": False,
         "remaining": 1.0,
         "realized_r": 0.0,
-        "candidate": st.session_state.get("forward_candidate", "UNKNOWN"),
+        "candidate": candidate or st.session_state.get("forward_candidate", "UNKNOWN"),
+        "profile": profile,
         "order_key": order_key,
     }
     st.session_state.paper_trades_today += 1
@@ -1418,6 +1886,7 @@ def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_valu
         {
             "id": position["id"],
             "symbol": position["symbol"],
+            "asset_class": position.get("asset_class"),
             "side": position["side"],
             "opened_at": position["opened_at"],
             "closed_at": now_riyadh().isoformat(),
@@ -1427,6 +1896,7 @@ def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_valu
             "PnL": round(pnl, 2),
             "reason": reason,
             "candidate": position.get("candidate"),
+            "profile": position.get("profile"),
             "order_key": position.get("order_key"),
         },
     )
@@ -3596,6 +4066,7 @@ def self_test() -> tuple[bool, str]:
                 "high": close + 0.5,
                 "low": close - 0.5,
                 "close": close,
+                "volume": np.linspace(100000, 180000, len(idx)),
             }
         )
 
@@ -3682,6 +4153,40 @@ def self_test() -> tuple[bool, str]:
             assert bool(b2_fast.loc[i, "b2_valid"]) == bool(reference.get("valid"))
             assert b2_fast.loc[i, "b2_side"] == reference.get("side")
 
+        stock_idx = pd.date_range(
+            end=now_utc().floor("5min") - pd.Timedelta(minutes=5),
+            periods=3600,
+            freq="5min",
+            tz="UTC",
+        )
+        stock_close = np.linspace(100.0, 145.0, len(stock_idx)) + np.sin(np.arange(len(stock_idx)) / 13.0) * 0.12
+        stock_df = pd.DataFrame(
+            {
+                "datetime": stock_idx,
+                "open": stock_close - 0.05,
+                "high": stock_close + 0.30,
+                "low": stock_close - 0.28,
+                "close": stock_close,
+                "volume": np.linspace(100000, 180000, len(stock_idx)),
+            }
+        )
+        stock_result = analyze_stock_candidate(stock_df, "متوازن")
+        assert stock_result["signal"] in {"BUY", "WAIT"}
+        assert stock_result.get("sell_score", 0) == 0
+        assert stock_result.get("stock_profile") == "متوازن"
+        assert "volume_ok" in stock_result and "not_extended" in stock_result
+        assert "stock_session_label" in stock_result
+        stock_plan = build_trade_plan("BUY", 100.0, 2.0, 100000.0, 0.075, PRESETS["Apple — AAPL"], stop_atr=1.5, tp2_r=2.0)
+        assert stock_plan["side"] == "BUY" and stock_plan["actual_risk_pct"] <= 0.075 + 1e-6
+        assert stock_plan["notional"] <= 100000.0 + 1e-6
+        try:
+            build_trade_plan("SELL", 100.0, 2.0, 100000.0, 0.075, PRESETS["Apple — AAPL"])
+            raise AssertionError("stock short guard failed")
+        except ValueError:
+            pass
+        session_probe = stock_session_state()
+        assert "regular" in session_probe and "preferred" in session_probe
+
         return True, "OK"
     except Exception as exc:
         return False, str(exc)
@@ -3692,64 +4197,90 @@ if not engine_ok:
     st.error(f"فشل اختبار المحرك الداخلي: {engine_error}")
     st.stop()
 
-st.sidebar.markdown("## ⚡ GOLD AI X10")
-st.sidebar.caption(f"v{VERSION} • Gold • Stocks • Futures/Contracts")
+st.sidebar.markdown("## ⚡ X10 SMART TERMINAL")
+st.sidebar.caption(f"v{VERSION} • Gold • Smart Stocks • Futures")
 
-preset_name = st.sidebar.selectbox("السوق", list(PRESETS.keys()), index=0)
+# Scanner buttons set a pending preset and rerun; consume it before widgets exist.
+pending_market = st.session_state.get("pending_market_preset")
+if pending_market in PRESETS:
+    st.session_state.market_preset = pending_market
+    st.session_state.pending_market_preset = None
+    pending_spec = PRESETS[pending_market]
+    st.session_state.market_section = (
+        "الأسهم" if pending_spec.asset_class == "STOCK"
+        else "العقود" if pending_spec.asset_class == "FUTURES"
+        else "الذهب"
+    )
+
+section_map = {
+    "الذهب": [k for k,v in PRESETS.items() if v.asset_class == "GOLD"],
+    "الأسهم": [k for k,v in PRESETS.items() if v.asset_class == "STOCK"],
+    "العقود": [k for k,v in PRESETS.items() if v.asset_class == "FUTURES"],
+}
+section_options = ["الذهب", "الأسهم", "العقود"]
+current_section = st.session_state.get("market_section", "الذهب")
+if current_section not in section_options:
+    current_section = "الذهب"
+market_section = st.sidebar.radio("القسم", section_options, key="market_section")
+market_options = section_map[market_section]
+current_preset = st.session_state.get("market_preset")
+if current_preset not in market_options:
+    st.session_state.market_preset = market_options[0]
+preset_name = st.sidebar.selectbox("السوق", market_options, key="market_preset")
 base_spec = PRESETS[preset_name]
 
 st.sidebar.divider()
 mode = st.sidebar.radio("وضع التشغيل", ["تحليل", "Paper", "Live"], index=1)
 
-risk_pct = st.sidebar.number_input(
-    "مخاطرة الصفقة %",
-    min_value=0.05,
-    max_value=0.50,
-    value=0.25,
-    step=0.05,
-)
-
 st.session_state.auto_paper = st.sidebar.toggle(
     "التداول التجريبي التلقائي",
     value=st.session_state.auto_paper,
-    help="يفتح صفقة Paper تلقائيًا فقط عند اكتمال الإشارة وبوابة المخاطر.",
+    help="يفتح Paper فقط عند اكتمال الإشارة وكل بوابات المخاطر.",
 )
 
 adaptive_paper_mode = st.sidebar.toggle(
-    "الوضع الذكي التكيفي — Paper",
+    "المحرك الذكي — Paper",
     value=(mode == "Paper"),
-    disabled=(mode != "Paper"),
-    help=(
-        "يضبط شروط الاتجاه والتذبذب تلقائيًا من البيانات السابقة، "
-        "ويخفّض المخاطرة بعد الخسائر. لا يعمل في Live."
-    ),
+    disabled=(mode != "Paper" or base_spec.asset_class == "FUTURES"),
+    help="للذهب والأسهم: يضبط الشروط والمخاطرة تلقائيًا. العقود لها تطوير منفصل لاحقًا.",
 )
 
 profile_options = ["ذكي تلقائي", "صارم", "متوازن", "مرن"]
 current_profile = st.session_state.get("adaptive_profile_choice", "ذكي تلقائي")
 if current_profile not in profile_options:
     current_profile = "ذكي تلقائي"
-
 st.session_state.adaptive_profile_choice = st.sidebar.selectbox(
-    "نمط الدخول",
-    profile_options,
+    "نمط الدخول", profile_options,
     index=profile_options.index(current_profile),
     disabled=(mode != "Paper" or not adaptive_paper_mode),
-    help=(
-        "ذكي تلقائي يفحص صارم ومتوازن ومرن معًا ويختار الأنسب كل دورة. "
-        "لا تحتاج ضبط ADX أو التذبذب أو المخاطرة يدويًا."
-    ),
+    help="ذكي تلقائي يقارن الأنماط بنفسه. لا تحتاج ضبط ADX أو التذبذب أو المخاطرة يدويًا.",
 )
+
+if base_spec.asset_class == "STOCK":
+    st.sidebar.markdown("### 📈 الأسهم")
+    st.session_state.stock_auto_scan = st.sidebar.toggle(
+        "ماسح الأسهم التلقائي",
+        value=bool(st.session_state.get("stock_auto_scan", True)),
+        help="يفحص 3 رموز في كل دورة 60 ثانية لحماية حد API.",
+    )
+    sh_cfg_sidebar = sharia_config()
+    st.session_state.stock_sharia_only = st.sidebar.toggle(
+        "عرض القائمة الشرعية فقط",
+        value=bool(st.session_state.get("stock_sharia_only", False)),
+        disabled=not sh_cfg_sidebar["configured"],
+        help="يتطلب SHARIA_APPROVED_SYMBOLS في Secrets. التطبيق لا يخمن الحكم الشرعي.",
+    )
 
 persist_paper_state()
 
 advanced_settings = st.sidebar.toggle(
-    "إعدادات متقدمة",
-    value=False,
-    help="يعرض إعدادات الأصل، المرشح، KILL SWITCH، البحث والتشخيص وإعدادات التحديث.",
+    "إعدادات متقدمة", value=False,
+    help="يعرض إعدادات الأصل والمخاطر والبحث والتشخيص.",
 )
 
-# Safe defaults while advanced settings are hidden.
+# Safe automatic defaults. Numeric controls are intentionally hidden from the
+# normal experience; Smart Paper chooses its own smaller risk.
+risk_pct = 0.25
 custom_symbol = base_spec.symbol
 point_value = float(base_spec.point_value)
 qty_step = float(base_spec.qty_step)
@@ -3764,97 +4295,33 @@ refresh_seconds = 60
 
 if advanced_settings:
     st.sidebar.markdown("### الإعدادات المتقدمة")
-
-    advanced_ui = st.sidebar.toggle(
-        "إظهار أدوات البحث والتشخيص",
-        value=False,
-        help="فعّله فقط عند الاختبارات أو تشخيص مشكلة.",
-    )
+    advanced_ui = st.sidebar.toggle("إظهار أدوات البحث والتشخيص", value=False)
+    risk_pct = st.sidebar.number_input("مخاطرة Legacy %", min_value=0.05, max_value=0.50, value=0.25, step=0.05)
 
     with st.sidebar.expander("إعدادات الأصل", expanded=False):
         custom_symbol = st.text_input("رمز البيانات/الوسيط", value=base_spec.symbol)
-        point_value = st.number_input(
-            "قيمة حركة سعر 1 لكل وحدة",
-            min_value=0.000001,
-            value=float(base_spec.point_value),
-            format="%.6f",
-        )
-        qty_step = st.number_input(
-            "خطوة الكمية",
-            min_value=0.000001,
-            value=float(base_spec.qty_step),
-            format="%.6f",
-        )
-        min_qty = st.number_input(
-            "أقل كمية",
-            min_value=0.0,
-            value=float(base_spec.min_qty),
-            format="%.6f",
-        )
-        max_qty = st.number_input(
-            "أعلى كمية",
-            min_value=min_qty,
-            value=float(base_spec.max_qty),
-            format="%.6f",
-        )
+        point_value = st.number_input("قيمة حركة سعر 1 لكل وحدة", min_value=0.000001, value=float(base_spec.point_value), format="%.6f")
+        qty_step = st.number_input("خطوة الكمية", min_value=0.000001, value=float(base_spec.qty_step), format="%.6f")
+        min_qty = st.number_input("أقل كمية", min_value=0.0, value=float(base_spec.min_qty), format="%.6f")
+        max_qty = st.number_input("أعلى كمية", min_value=min_qty, value=float(base_spec.max_qty), format="%.6f")
 
-    st.session_state.forward_candidate = st.sidebar.selectbox(
-        "مرشح Paper Forward",
-        list(WF_CANDIDATES.keys()),
-        index=(
-            list(WF_CANDIDATES.keys()).index(st.session_state.forward_candidate)
-            if st.session_state.forward_candidate in WF_CANDIDATES
-            else 0
-        ),
-        format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
-        help="يُستخدم في Paper Forward. لا يفتح Live وحده.",
-    )
-    forward_candidate = st.session_state.forward_candidate
-    persist_paper_state()
+    if base_spec.asset_class == "GOLD":
+        st.session_state.forward_candidate = st.sidebar.selectbox(
+            "مرشح Gold Forward", list(WF_CANDIDATES.keys()),
+            index=(list(WF_CANDIDATES.keys()).index(st.session_state.forward_candidate)
+                   if st.session_state.forward_candidate in WF_CANDIDATES else 0),
+            format_func=lambda x: f"{x} — {WF_CANDIDATES.get(x, x)}",
+        )
+        forward_candidate = st.session_state.forward_candidate
 
-    st.session_state.kill_switch = st.sidebar.toggle(
-        "KILL SWITCH",
-        value=st.session_state.kill_switch,
-        help="ON يمنع أي أمر Live جديد",
-    )
-
+    st.session_state.kill_switch = st.sidebar.toggle("KILL SWITCH", value=st.session_state.kill_switch, help="ON يمنع أي أمر Live جديد")
     with st.sidebar.expander("المخاطر والتحديث", expanded=False):
-        max_daily_loss_pct = st.number_input(
-            "حد الخسارة اليومية %",
-            min_value=0.5,
-            max_value=3.0,
-            value=1.5,
-            step=0.5,
-        )
-        max_open_positions = st.number_input(
-            "أقصى مراكز مفتوحة",
-            min_value=1,
-            max_value=3,
-            value=1,
-            step=1,
-        )
-        max_order_risk_pct = st.number_input(
-            "الحد الصلب لمخاطرة الأمر %",
-            min_value=0.05,
-            max_value=0.50,
-            value=0.50,
-            step=0.05,
-        )
-        st.session_state.auto_refresh = st.toggle(
-            "تحديث Paper تلقائي",
-            value=st.session_state.auto_refresh,
-            help="يحدّث محرك Paper بدون إعادة تحميل الصفحة كاملة.",
-        )
-        refresh_seconds = st.slider(
-            "ثواني التحديث",
-            60,
-            180,
-            60,
-            step=15,
-            help="60 ثانية أو أكثر موصى بها مع حد Twelve Data المجاني.",
-        )
+        max_daily_loss_pct = st.number_input("حد الخسارة اليومية %", .5, 3.0, 1.5, .5)
+        max_open_positions = st.number_input("أقصى مراكز مفتوحة", 1, 3, 1, 1)
+        max_order_risk_pct = st.number_input("الحد الصلب لمخاطرة الأمر %", .05, .50, .50, .05)
+        st.session_state.auto_refresh = st.toggle("تحديث Paper تلقائي", value=st.session_state.auto_refresh)
+        refresh_seconds = st.slider("ثواني التحديث", 60, 180, 60, step=15)
 else:
-    # Simple mode: Auto Paper automatically keeps the safe 60s heartbeat alive.
     st.session_state.auto_refresh = bool(st.session_state.auto_paper)
 
 if not st.session_state.auto_refresh:
@@ -3876,10 +4343,14 @@ ADAPTIVE_PROFILE_CANDIDATES = {
     "مرن": "V410_ADAPTIVE_FLEX",
 }
 ADAPTIVE_CANDIDATES = set(ADAPTIVE_PROFILE_CANDIDATES.values())
+SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES
 
-def recent_paper_loss_streak() -> int:
+def recent_paper_loss_streak(asset_class: str | None = None) -> int:
     streak = 0
-    for item in list(st.session_state.get("paper_history", []))[:5]:
+    rows = list(st.session_state.get("paper_history", []))
+    if asset_class:
+        rows = [x for x in rows if x.get("asset_class") == asset_class]
+    for item in rows[:5]:
         if float(item.get("PnL", 0.0)) < 0:
             streak += 1
         else:
@@ -3891,20 +4362,27 @@ adaptive_profile = (
     "متوازن" if selected_profile == "ذكي تلقائي" else selected_profile
 )
 
-active_candidate = (
-    ADAPTIVE_PROFILE_CANDIDATES[adaptive_profile]
-    if (mode == "Paper" and adaptive_paper_mode and instrument.symbol.upper() == "XAU/USD")
-    else forward_candidate
-)
+if mode == "Paper" and adaptive_paper_mode:
+    if instrument.asset_class == "GOLD":
+        active_candidate = ADAPTIVE_PROFILE_CANDIDATES[adaptive_profile]
+    elif instrument.asset_class == "STOCK":
+        active_candidate = STOCK_PROFILE_CANDIDATES[adaptive_profile]
+    else:
+        active_candidate = forward_candidate
+else:
+    active_candidate = forward_candidate
 
-def adaptive_paper_risk_pct(profile: str) -> float:
+def adaptive_paper_risk_pct(profile: str, asset_class: str | None = None) -> float:
     """
     Risk is automatic and moves opposite to permissiveness:
     strict <= 0.10%, balanced <= 0.075%, flexible <= 0.05%.
-    Recent losses reduce it further. No martingale.
+    Recent losses in the same asset class reduce it further. No martingale.
     """
     base = {"صارم": 0.10, "متوازن": 0.075, "مرن": 0.05}.get(profile, 0.075)
-    recent = list(st.session_state.get("paper_history", []))[:5]
+    recent = list(st.session_state.get("paper_history", []))
+    if asset_class:
+        recent = [x for x in recent if x.get("asset_class") == asset_class]
+    recent = recent[:5]
     recent_losses = sum(1 for x in recent if float(x.get("PnL", 0.0)) < 0)
     if recent_losses >= 2:
         return min(base, 0.05)
@@ -3913,8 +4391,8 @@ def adaptive_paper_risk_pct(profile: str) -> float:
     return base
 
 paper_risk_pct = (
-    adaptive_paper_risk_pct(adaptive_profile)
-    if active_candidate in ADAPTIVE_CANDIDATES
+    adaptive_paper_risk_pct(adaptive_profile, instrument.asset_class)
+    if active_candidate in SMART_PAPER_CANDIDATES
     else float(risk_pct)
 )
 
@@ -3938,7 +4416,7 @@ def choose_smart_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, An
         candidate = ADAPTIVE_PROFILE_CANDIDATES[profile]
         evaluations[profile] = analyze_forward_candidate(raw_df, candidate)
 
-    loss_streak = recent_paper_loss_streak()
+    loss_streak = recent_paper_loss_streak("GOLD")
     allowed = ["صارم"] if loss_streak >= 1 else profile_order
 
     # Strongest valid signal wins.
@@ -4027,9 +4505,16 @@ st.markdown(
 )
 
 st.caption(
-    "X10 GOLD v4.11 SMART AUTOPILOT • live-market forward test • "
-    "Retest 0.30 ATR • SL 1.6 ATR • TP1 1R / TP2 2.2R • Default Risk 0.25%"
+    "X10 v6.0 STOCK DESK • Gold + U.S. Stocks • Paper Smart AutoPilot • "
+    "market-specific engines • automatic risk control"
 )
+
+if instrument.asset_class == "STOCK":
+    st.info(
+        "📈 محرك الأسهم مستقل عن الذهب: Long-only في Paper، ويقرأ الاتجاه والزخم "
+        "والتذبذب تلقائيًا. رموز القائمة لا تُعتبر فحصًا شرعيًا بحد ذاتها؛ "
+        "الفحص الشرعي يحتاج مصدرًا محدثًا منفصلًا."
+    )
 
 raw, data_status = fetch_market(instrument.symbol)
 if raw.empty:
@@ -4061,26 +4546,36 @@ smart_autopilot_meta: dict[str, Any] = {
     "mode": "MANUAL_PROFILE",
     "reason": "نمط يدوي",
     "evaluations": {},
-    "loss_streak": recent_paper_loss_streak(),
+    "loss_streak": recent_paper_loss_streak(instrument.asset_class),
 }
 
-if (
-    mode == "Paper"
-    and adaptive_paper_mode
-    and instrument.symbol.upper() == "XAU/USD"
-    and selected_profile == "ذكي تلقائي"
-):
+if instrument.asset_class == "STOCK":
+    # Stocks always use their own engine in Analysis/Paper; never the gold model.
+    if selected_profile == "ذكي تلقائي":
+        (
+            adaptive_profile,
+            active_candidate,
+            forward_analysis,
+            smart_autopilot_meta,
+        ) = choose_stock_autopilot(raw)
+    else:
+        adaptive_profile = selected_profile if selected_profile in STOCK_PROFILE_CANDIDATES else "متوازن"
+        active_candidate = STOCK_PROFILE_CANDIDATES[adaptive_profile]
+        forward_analysis = analyze_stock_candidate(raw, adaptive_profile)
+    if mode == "Paper":
+        paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "STOCK")
+elif mode == "Paper" and adaptive_paper_mode and selected_profile == "ذكي تلقائي" and instrument.asset_class == "GOLD":
     (
         adaptive_profile,
         active_candidate,
         forward_analysis,
         smart_autopilot_meta,
     ) = choose_smart_autopilot(raw)
-    paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile)
+    paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "GOLD")
 else:
     forward_analysis = analyze_forward_candidate(raw, active_candidate)
-    if active_candidate in ADAPTIVE_CANDIDATES:
-        paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile)
+    if active_candidate in SMART_PAPER_CANDIDATES:
+        paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, instrument.asset_class)
 
 if not feed.get("trusted", False):
     if analysis.get("signal") in {"BUY", "SELL"}:
@@ -4096,7 +4591,11 @@ if not feed.get("trusted", False):
             "reason": "Forward candidate blocked: feed structure check failed",
         }
 
-execution_analysis = forward_analysis if mode in {"Paper", "Live"} else analysis
+execution_analysis = (
+    forward_analysis
+    if instrument.asset_class == "STOCK" or mode in {"Paper", "Live"}
+    else analysis
+)
 
 candle_id = str(raw["datetime"].iloc[-1])
 research_context = hashlib.sha256(
@@ -4107,10 +4606,18 @@ research_context = hashlib.sha256(
     ).encode()
 ).hexdigest()[:16]
 
-# Never manage a Paper position from a stale/unverifiable execution price.
-if st.session_state.paper_position and feed.get("execution_ok", False):
-    mark = paper_mark_price(st.session_state.paper_position, quote, reference_price)
-    manage_paper(mark)
+# Manage an open Paper position from its OWN symbol, even if the user changes
+# the selected market. This prevents cross-symbol marking errors.
+if st.session_state.paper_position:
+    _p = st.session_state.paper_position
+    if str(_p.get("symbol")) == instrument.symbol and feed.get("execution_ok", False):
+        mark = paper_mark_price(_p, quote, reference_price)
+        manage_paper(mark)
+    elif str(_p.get("symbol")) != instrument.symbol:
+        _pq = fetch_quote(str(_p.get("symbol")))
+        if quote_execution_ready(_pq):
+            _fallback = float(_pq.get("last")) if finite(_pq.get("last")) else float(_p.get("entry", 0.0))
+            manage_paper(paper_mark_price(_p, _pq, _fallback))
 
 if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
     st.session_state.last_signal_candle[instrument.symbol] = candle_id
@@ -4126,7 +4633,7 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
             "sell_score": execution_analysis.get("sell_score", 0),
             "feed_execution_ready": feed.get("execution_ok", False),
             "reason": execution_analysis["reason"],
-            "candidate": forward_candidate if mode in {"Paper", "Live"} else "LEGACY_ANALYSIS",
+            "candidate": active_candidate if mode in {"Paper", "Live"} else "LEGACY_ANALYSIS",
         },
     )
     st.session_state.decisions = st.session_state.decisions[:500]
@@ -4179,6 +4686,109 @@ elif not feed.get("execution_ok", False):
     for reason in feed.get("execution_reasons", []):
         st.caption("• " + reason)
 
+# ------------------------- smart stock desk --------------------
+if instrument.asset_class == "STOCK":
+    stock_session = stock_session_state()
+    sh_cfg = sharia_config()
+    selected_sharia = stock_sharia_status(instrument.symbol)
+    stock_guard_ok, stock_guard_reasons, stock_spread_pct = stock_quote_guard(quote, reference_price)
+
+    st.subheader("📈 مركز الأسهم الذكي")
+    mini_grid(
+        [
+            ("السهم", instrument.symbol, "ok"),
+            ("جلسة نيويورك", stock_session["label"], "ok" if stock_session["preferred"] else "wait"),
+            ("الاتجاه", (forward_analysis.get("snapshots", {}).get("H1") or {}).get("trend", "—"), ""),
+            ("الجاهزية", f"{int(forward_analysis.get('readiness_pct',0))}%", "ok" if forward_analysis.get("signal") == "BUY" else "wait"),
+            ("الحجم النسبي", (f"{float(forward_analysis.get('volume_ratio')):.2f}x" if finite(forward_analysis.get("volume_ratio")) else "غير متاح"), ""),
+            ("الفحص الشرعي", selected_sharia, "ok" if selected_sharia == "مُدرج بالقائمة" else "wait"),
+        ],
+        "status-grid",
+    )
+
+    if not sh_cfg["configured"]:
+        st.caption(
+            "الفحص الشرعي غير مربوط بمصدر حالي. يمكن لاحقًا ضبط SHARIA_APPROVED_SYMBOLS + "
+            "SHARIA_SCREEN_SOURCE + SHARIA_SCREEN_DATE في Secrets؛ التطبيق لا يخمن الحكم."
+        )
+    else:
+        st.caption(
+            f"قائمة الفحص الشرعي من إعداداتك"
+            + (f" • المصدر: {sh_cfg['source']}" if sh_cfg['source'] else "")
+            + (f" • التاريخ: {sh_cfg['date']}" if sh_cfg['date'] else "")
+        )
+
+    if stock_spread_pct is not None:
+        st.caption(f"السبريد الحالي: {stock_spread_pct:.3f}%")
+    for _reason in stock_guard_reasons:
+        st.warning(_reason)
+
+    def _render_stock_scanner() -> None:
+        if st.session_state.get("stock_auto_scan", True):
+            scan_stock_batch(st.session_state.get("adaptive_profile_choice", "ذكي تلقائي"), STOCK_SCAN_BATCH_SIZE)
+        rows = stock_scanner_rows(bool(st.session_state.get("stock_sharia_only", False)))
+        st.markdown("### ماسح الفرص")
+        st.caption("يفحص 3 أسهم كل 60 ثانية بالتناوب حتى لا يتجاوز حد Twelve Data؛ اكتمال القائمة يحتاج عدة دورات.")
+        if rows:
+            view = pd.DataFrame(rows)
+            rename = {
+                "favorite": "★", "symbol": "الرمز", "name": "الشركة", "signal": "الإشارة", "readiness": "الجاهزية %",
+                "profile": "النمط", "price": "السعر", "rsi": "RSI", "volume_ratio": "الحجم النسبي",
+                "sharia": "الفحص الشرعي", "freshness": "البيانات", "updated_at": "آخر تحديث",
+            }
+            cols = [c for c in ["favorite","symbol","name","signal","readiness","profile","price","rsi","volume_ratio","sharia","freshness","updated_at"] if c in view.columns]
+            st.dataframe(view[cols].rename(columns=rename), hide_index=True, use_container_width=True)
+            best = rows[0]
+            st.success(
+                f"أعلى جاهزية حالياً: {best.get('symbol')} • {best.get('readiness',0)}% • "
+                f"{best.get('signal','WAIT')} • {best.get('profile','—')}"
+            )
+            best_label = stock_symbol_to_preset(str(best.get("symbol", "")))
+            if best_label and best_label != preset_name:
+                if st.button(f"فتح {best.get('symbol')} في المنصة", use_container_width=True, key="open_best_stock"):
+                    st.session_state.pending_market_preset = best_label
+                    st.rerun()
+        else:
+            st.info("الماسح يجمع أول دفعة الآن؛ إذا ظهر حد API سيحتفظ بآخر نتائج متاحة.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("تحديث دفعة الماسح الآن", use_container_width=True, key="stock_scan_now"):
+                scan_stock_batch(st.session_state.get("adaptive_profile_choice", "ذكي تلقائي"), STOCK_SCAN_BATCH_SIZE)
+                st.rerun()
+        with c2:
+            favorites = list(st.session_state.get("stock_favorites", []))
+            is_fav = instrument.symbol in favorites
+            if st.button("إزالة من المفضلة" if is_fav else "إضافة للمفضلة", use_container_width=True, key="stock_favorite_toggle"):
+                if is_fav:
+                    favorites = [x for x in favorites if x != instrument.symbol]
+                else:
+                    favorites.append(instrument.symbol)
+                st.session_state.stock_favorites = sorted(set(favorites))
+                persist_paper_state()
+                st.rerun()
+
+    if st.session_state.get("stock_auto_scan", True):
+        @st.fragment(run_every=STOCK_SCAN_INTERVAL_SECONDS)
+        def _stock_scan_fragment() -> None:
+            _render_stock_scanner()
+        _stock_scan_fragment()
+    else:
+        _render_stock_scanner()
+
+    perf = stock_performance_summary()
+    st.markdown("### أداء Stock Paper")
+    mini_grid(
+        [
+            ("صفقات مغلقة", str(perf["trades"]), ""),
+            ("نسبة الربح", f"{perf['win_rate']:.1f}%", "ok" if perf["win_rate"] >= 50 and perf["trades"] else "wait"),
+            ("صافي P&L", f"${perf['net']:,.2f}", "ok" if perf["net"] > 0 else "bad" if perf["net"] < 0 else "wait"),
+            ("متوسط R", f"{perf['avg_r']:.3f}R", "ok" if perf["avg_r"] > 0 else "wait"),
+        ],
+        "status-grid",
+    )
+    st.caption("حالة الاستراتيجية: Paper validation. نجاح الكود لا يعني أن الاستراتيجية رابحة حتى تتكوّن عينة كافية من الصفقات.")
+
 # ------------------------- command center ---------------------
 if advanced_ui:
     st.subheader("Multi-Timeframe Command Center")
@@ -4211,12 +4821,13 @@ if advanced_ui:
 
 near_entry = bool(forward_analysis.get("near_entry", False))
 forward_signal_class = (
-    "sell" if forward_analysis.get("signal") == "SELL"
+    "buy" if forward_analysis.get("signal") == "BUY"
+    else "sell" if forward_analysis.get("signal") == "SELL"
     else "state-wait"
 )
 forward_display = (
-    "SELL"
-    if forward_analysis.get("signal") == "SELL"
+    forward_analysis.get("signal")
+    if forward_analysis.get("signal") in {"BUY", "SELL"}
     else ("قريب من الدخول" if near_entry else "WAIT")
 )
 
@@ -4230,51 +4841,64 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-mini_grid(
-    [
+forward_gate_cards = [
+    (
+        "قوة الاتجاه",
+        "مكتمل" if forward_analysis.get("trend25") else "غير مكتمل",
+        "ok" if forward_analysis.get("trend25") else "wait",
+    ),
+    (
+        "نظام التذبذب",
+        "مكتمل" if forward_analysis.get("regime_ok") else "غير مكتمل",
+        "ok" if forward_analysis.get("regime_ok") else "wait",
+    ),
+    (
+        "وقت التداول",
+        "مكتمل" if forward_analysis.get("session_ok") else "خارج الجلسة",
+        "ok" if forward_analysis.get("session_ok") else "wait",
+    ),
+    (
+        "حدث الدخول",
+        "مكتمل" if forward_analysis.get("event_ok") else "ننتظر",
+        "ok" if forward_analysis.get("event_ok") else "wait",
+    ),
+]
+if instrument.asset_class == "STOCK":
+    forward_gate_cards.append(
         (
-            "قوة الاتجاه",
-            "مكتمل" if forward_analysis.get("trend25") else "غير مكتمل",
-            "ok" if forward_analysis.get("trend25") else "wait",
-        ),
-        (
-            "نظام التذبذب",
-            "مكتمل" if forward_analysis.get("regime_ok") else "غير مكتمل",
-            "ok" if forward_analysis.get("regime_ok") else "wait",
-        ),
-        (
-            "وقت التداول",
-            "مكتمل" if forward_analysis.get("session_ok") else "خارج الجلسة",
-            "ok" if forward_analysis.get("session_ok") else "wait",
-        ),
-        (
-            "حدث الدخول",
-            "مكتمل" if forward_analysis.get("event_ok") else "ننتظر",
-            "ok" if forward_analysis.get("event_ok") else "wait",
-        ),
-    ],
-    "tf-grid",
-)
+            "حجم التداول",
+            "مكتمل" if forward_analysis.get("volume_ok") else "ضعيف",
+            "ok" if forward_analysis.get("volume_ok") else "wait",
+        )
+    )
+mini_grid(forward_gate_cards, "tf-grid")
 
 if near_entry:
     st.warning(
         "🟡 قريب من الدخول: الاتجاه + التذبذب + وقت التداول مكتملة. "
         "ننتظر حدث الدخول فقط. لن يفتح Paper قبل اكتماله."
     )
-elif forward_analysis.get("signal") == "SELL":
+elif forward_analysis.get("signal") in {"BUY", "SELL"}:
+    _side = forward_analysis.get("signal")
     st.success(
-        "🟢 اكتملت شروط SELL. إذا Auto Paper Forward مفعّل وRisk Gate يسمح، "
+        f"🟢 اكتملت شروط {_side}. إذا التداول التجريبي التلقائي مفعّل وبوابة المخاطر تسمح، "
         "سيتم فتح صفقة Paper تلقائيًا."
     )
 
 if mode == "Paper":
-    st.info(
-        "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
-        "المخاطرة الافتراضية 0.25%، ومركز واحد فقط."
-    )
+    if instrument.asset_class == "STOCK":
+        st.info(
+            "Stock Paper جاهز على السهم المختار بأموال افتراضية. "
+            "الدخول الذكي للأسهم BUY فقط، والمخاطرة تُضبط تلقائيًا."
+        )
+    else:
+        st.info(
+            "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
+            "مركز واحد فقط مع إدارة مخاطر تلقائية."
+        )
 
 if near_entry:
-    near_key = f"{instrument.symbol}:{candle_id}:{forward_candidate}:NEAR"
+    near_key = f"{instrument.symbol}:{candle_id}:{active_candidate}:NEAR"
     if st.session_state.get("last_near_entry_alert") != near_key:
         st.session_state.last_near_entry_alert = near_key
         st.toast("قريب من الدخول: باقي حدث الدخول فقط", icon="🟡")
@@ -4309,14 +4933,15 @@ st.altair_chart(price_chart, use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------- decision diagnostics -----------------
-m5_diag = analysis.get("snapshots", {}).get("M5") or {}
+diag_analysis = forward_analysis if instrument.asset_class == "STOCK" else analysis
+m5_diag = diag_analysis.get("snapshots", {}).get("M5") or {}
 trends_diag = [
-    (analysis.get("snapshots", {}).get(tf) or {}).get("trend")
+    (diag_analysis.get("snapshots", {}).get(tf) or {}).get("trend")
     for tf in TIMEFRAMES
 ]
 up_count = sum(t == "UP" for t in trends_diag)
 down_count = sum(t == "DOWN" for t in trends_diag)
-b2_diag = analysis.get("b2") or {}
+b2_diag = diag_analysis.get("b2") or {}
 
 diag_rows = [
     ("اتجاه الأطر", f"UP {up_count}/4 • DOWN {down_count}/4", up_count >= 3 or down_count >= 3),
@@ -4327,6 +4952,21 @@ diag_rows = [
     ("بنية البيانات", "سليمة" if feed.get("trusted") else "تحقق مطلوب", bool(feed.get("trusted"))),
     ("جاهزية Paper", "جاهز" if feed.get("execution_ok") else "محجوب", bool(feed.get("execution_ok"))),
 ]
+if instrument.asset_class == "STOCK":
+    diag_rows.extend(
+        [
+            (
+                "حجم التداول",
+                f"{float(forward_analysis.get('volume_ratio')):.2f}x" if finite(forward_analysis.get("volume_ratio")) else "غير متاح",
+                bool(forward_analysis.get("volume_ok", True)),
+            ),
+            (
+                "عدم مطاردة السعر",
+                f"{float(forward_analysis.get('extension_atr',0.0)):.2f} ATR" if finite(forward_analysis.get("extension_atr")) else "—",
+                bool(forward_analysis.get("not_extended", False)),
+            ),
+        ]
+    )
 
 with st.expander("لماذا هذا القرار؟", expanded=False):
     for label, value, passed in diag_rows:
@@ -4343,13 +4983,23 @@ paper_plan: dict[str, Any] | None = None
 m5_snap = forward_analysis.get("snapshots", {}).get("M5")
 if forward_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
     try:
+        paper_entry_reference = reference_price
+        if instrument.asset_class == "STOCK" and forward_analysis["signal"] == "BUY":
+            paper_entry_reference = (
+                float(quote["ask"])
+                if finite(quote.get("ask"))
+                else float(reference_price) * (1.0 + 0.0002)
+            )
         paper_plan = build_trade_plan(
             forward_analysis["signal"],
-            reference_price,
+            paper_entry_reference,
             float(m5_snap["atr"]),
             float(st.session_state.paper_balance),
             float(paper_risk_pct),
             instrument,
+            stop_atr=1.5 if instrument.asset_class == "STOCK" else 1.6,
+            tp1_r=1.0,
+            tp2_r=2.0 if instrument.asset_class == "STOCK" else 2.2,
         )
     except ValueError as exc:
         st.warning(f"لا يمكن بناء خطة بالحجم الحالي: {exc}")
@@ -4393,10 +5043,10 @@ mini_grid(
             "نمط الدخول",
             (
                 adaptive_profile
-                if active_candidate in ADAPTIVE_CANDIDATES
+                if active_candidate in SMART_PAPER_CANDIDATES
                 else "محافظ"
             ),
-            "wait" if active_candidate in ADAPTIVE_CANDIDATES else "ok",
+            "wait" if active_candidate in SMART_PAPER_CANDIDATES else "ok",
         ),
     ],
     "status-grid",
@@ -4405,10 +5055,11 @@ mini_grid(
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
     st.subheader("التداول التجريبي — السوق الحي")
-    if active_candidate in ADAPTIVE_CANDIDATES:
+    if active_candidate in SMART_PAPER_CANDIDATES:
         if selected_profile == "ذكي تلقائي":
+            engine_name = "الأسهم" if instrument.asset_class == "STOCK" else "الذهب"
             st.info(
-                f"🧠 الطيار الذكي اختار الآن: {adaptive_profile} • "
+                f"🧠 طيار {engine_name} الذكي اختار الآن: {adaptive_profile} • "
                 f"المخاطرة {float(paper_risk_pct):.3f}% • "
                 f"{smart_autopilot_meta.get('reason','')}. "
                 "يفحص صارم/متوازن/مرن في كل دورة ولا يضاعف المخاطرة بعد الخسارة."
@@ -4435,7 +5086,7 @@ if mode == "Paper":
 
     profile_loss_limit = 2 if adaptive_profile == "مرن" else 3
     adaptive_circuit_block = bool(
-        active_candidate in ADAPTIVE_CANDIDATES
+        active_candidate in SMART_PAPER_CANDIDATES
         and recent_loss_streak >= profile_loss_limit
     )
 
@@ -4457,13 +5108,35 @@ if mode == "Paper":
                 "Execution Feed غير جاهز؛ لا يتم فتح Paper على سعر قديم/غير قابل للتحقق"
             )
 
+        # Stock execution-quality brakes before the generic adaptive brakes.
+        if instrument.asset_class == "STOCK":
+            _sq_ok, _sq_reasons, _ = stock_quote_guard(quote, reference_price)
+            if not _sq_ok:
+                p_gate_ok = False
+                p_gate_reasons.extend(_sq_reasons)
+            if not stock_session_state()["preferred"]:
+                p_gate_ok = False
+                p_gate_reasons.append("الأسهم: فتح مراكز جديدة خارج نافذة 09:45–15:50 نيويورك محجوب")
+            if stock_recent_loss(instrument.symbol):
+                p_gate_ok = False
+                p_gate_reasons.append(f"الأسهم: تبريد {STOCK_LOSS_COOLDOWN_MINUTES} دقيقة بعد خسارة حديثة على نفس السهم")
+            if stock_trades_today() >= STOCK_MAX_TRADES_PER_DAY:
+                p_gate_ok = False
+                p_gate_reasons.append(f"الأسهم: تم بلوغ حد {STOCK_MAX_TRADES_PER_DAY} صفقات يومية")
+            if stock_trades_today(instrument.symbol) >= STOCK_MAX_TRADES_PER_SYMBOL_DAY:
+                p_gate_ok = False
+                p_gate_reasons.append(f"الأسهم: تم بلوغ حد {STOCK_MAX_TRADES_PER_SYMBOL_DAY} صفقات يومية لهذا السهم")
+            if st.session_state.get("stock_sharia_only", False) and stock_sharia_status(instrument.symbol) != "مُدرج بالقائمة":
+                p_gate_ok = False
+                p_gate_reasons.append("فلتر القائمة الشرعية مفعّل وهذا الرمز غير موجود في القائمة الموثقة بإعداداتك")
+
         # Adaptive safety brakes.
-        if active_candidate in ADAPTIVE_CANDIDATES:
+        if active_candidate in SMART_PAPER_CANDIDATES:
             daily_stop_pct = {
-                "صارم": 0.40,
-                "متوازن": 0.35,
-                "مرن": 0.25,
-            }.get(adaptive_profile, 0.35)
+                "صارم": 0.35 if instrument.asset_class == "STOCK" else 0.40,
+                "متوازن": 0.30 if instrument.asset_class == "STOCK" else 0.35,
+                "مرن": 0.20 if instrument.asset_class == "STOCK" else 0.25,
+            }.get(adaptive_profile, 0.30 if instrument.asset_class == "STOCK" else 0.35)
             if day_pnl <= -(
                 float(st.session_state.paper_day_start_balance)
                 * daily_stop_pct
@@ -4499,7 +5172,7 @@ if mode == "Paper":
     )
 
 
-    if active_candidate in ADAPTIVE_CANDIDATES and advanced_ui:
+    if active_candidate in SMART_PAPER_CANDIDATES and advanced_ui:
         mini_grid(
             [
                 ("النمط", adaptive_profile, ""),
@@ -4518,17 +5191,17 @@ if mode == "Paper":
                     (
                         "صارم",
                         f"{int((auto_eval.get('صارم') or {}).get('readiness',0))}% • {(auto_eval.get('صارم') or {}).get('signal','WAIT')}",
-                        "ok" if (auto_eval.get("صارم") or {}).get("signal") == "SELL" else "wait",
+                        "ok" if (auto_eval.get("صارم") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                     (
                         "متوازن",
                         f"{int((auto_eval.get('متوازن') or {}).get('readiness',0))}% • {(auto_eval.get('متوازن') or {}).get('signal','WAIT')}",
-                        "ok" if (auto_eval.get("متوازن") or {}).get("signal") == "SELL" else "wait",
+                        "ok" if (auto_eval.get("متوازن") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                     (
                         "مرن",
                         f"{int((auto_eval.get('مرن') or {}).get('readiness',0))}% • {(auto_eval.get('مرن') or {}).get('signal','WAIT')}",
-                        "ok" if (auto_eval.get("مرن") or {}).get("signal") == "SELL" else "wait",
+                        "ok" if (auto_eval.get("مرن") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                 ],
                 "tf-grid",
@@ -4562,7 +5235,7 @@ if mode == "Paper":
                 f"MANUAL:{instrument.symbol}:{active_candidate}:"
                 f"{now_riyadh().isoformat()}:{uuid.uuid4().hex[:8]}"
             )
-            open_paper(paper_plan, instrument, order_key=manual_key)
+            open_paper(paper_plan, instrument, order_key=manual_key, candidate=active_candidate, profile=adaptive_profile)
             st.rerun()
 
     if (
@@ -4575,7 +5248,7 @@ if mode == "Paper":
             auto_key = (
                 f"AUTO:{instrument.symbol}:{active_candidate}:{candle_id}"
             )
-            if open_paper(paper_plan, instrument, order_key=auto_key):
+            if open_paper(paper_plan, instrument, order_key=auto_key, candidate=active_candidate, profile=adaptive_profile):
                 st.session_state.last_auto_paper_candle[instrument.symbol] = candle_id
                 persist_paper_state()
                 st.rerun()
@@ -4585,8 +5258,11 @@ if mode == "Paper":
 
     p = st.session_state.paper_position
     if p:
-        if feed.get("execution_ok", False):
-            mark = paper_mark_price(p, quote, reference_price)
+        _display_quote = quote if str(p.get("symbol")) == instrument.symbol else fetch_quote(str(p.get("symbol")))
+        _display_ready = feed.get("execution_ok", False) if str(p.get("symbol")) == instrument.symbol else quote_execution_ready(_display_quote)
+        if _display_ready:
+            _fallback = reference_price if str(p.get("symbol")) == instrument.symbol else float(_display_quote.get("last", p.get("entry", 0.0)))
+            mark = paper_mark_price(p, _display_quote, _fallback)
             ur = paper_unrealized_r(p, mark)
             upnl = ur * p["risk_money"]
             st.info(
@@ -4597,7 +5273,7 @@ if mode == "Paper":
                 close_paper(p, mark, "MANUAL", ur)
                 st.rerun()
         else:
-            st.warning("المركز Paper مفتوح لكن تحديثه موقوف لأن سعر التنفيذ غير جاهز.")
+            st.warning(f"المركز Paper على {p.get('symbol')} مفتوح لكن Quote صالح للتنفيذ غير متاح الآن.")
 
     if advanced_ui:
         with st.expander("حالة الحفظ", expanded=False):
@@ -4609,7 +5285,12 @@ if mode == "Paper":
 
     if st.session_state.paper_history:
         paper_df = pd.DataFrame(st.session_state.paper_history)
-        st.dataframe(paper_df, hide_index=True, use_container_width=True)
+        if instrument.asset_class == "STOCK" and "asset_class" in paper_df.columns:
+            stock_hist = paper_df[paper_df["asset_class"] == "STOCK"].copy()
+            st.markdown("### سجل Stock Paper")
+            st.dataframe(stock_hist, hide_index=True, use_container_width=True)
+        else:
+            st.dataframe(paper_df, hide_index=True, use_container_width=True)
         st.download_button(
             "تنزيل سجل Paper CSV",
             data=paper_df.to_csv(index=False).encode("utf-8-sig"),
@@ -4621,8 +5302,11 @@ if mode == "Paper":
 # ---------------------------- Live ----------------------------
 if mode == "Live":
     st.subheader("Live Execution — Broker Authoritative")
-    if active_candidate in ADAPTIVE_CANDIDATES:
-        st.error("أنماط Adaptive Paper مخصصة للتجربة فقط ولا يمكن استخدامها في Live.")
+    if instrument.asset_class == "STOCK":
+        st.error("Live للأسهم مقفول حاليًا: محرك الأسهم في مرحلة Paper validation ولم يتم ربط تنفيذ وسيط موثق له بعد.")
+        st.stop()
+    if active_candidate in SMART_PAPER_CANDIDATES:
+        st.error("أنماط Smart Paper للذهب والأسهم مخصصة للتجربة ولا يمكن استخدامها في Live.")
         st.stop()
     st.caption(
         "في Live: Twelve Data للتحليل فقط. سعر الدخول وحالة الحساب والمراكز يجب أن تأتي من Broker Bridge."
@@ -4910,7 +5594,7 @@ if mode == "Live":
         st.dataframe(pd.DataFrame(safe_rows), hide_index=True, use_container_width=True)
 
 # -------------------------- advanced research ------------------
-if advanced_ui:
+if advanced_ui and instrument.asset_class == "GOLD":
     st.subheader("Research Audit — v4.5 Independent Validation")
     st.caption(
         "نفس قواعد v4.3 بدون تخفيف للاستراتيجية. المؤشرات وMTF وB2 تُحسب مرة واحدة فقط، "
@@ -5969,6 +6653,8 @@ if advanced_ui:
         {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
         {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
         {"Component": "Paper engine", "Status": "ONLINE"},
+        {"Component": "Stock Smart Engine", "Status": "ONLINE" if instrument.asset_class == "STOCK" else "STANDBY"},
+        {"Component": "Stock scanner", "Status": "AUTO" if st.session_state.get("stock_auto_scan", False) else "MANUAL"},
         {"Component": "Paper persistence", "Status": "ACTIVE"},
         {"Component": "Order idempotency", "Status": "ACTIVE"},
         {"Component": "Broker bridge", "Status": "ONLINE" if account else ("CHECK" if bridge else "NOT CONFIGURED")},
@@ -6009,7 +6695,7 @@ if advanced_ui:
             st.info("لا يوجد سجل بعد")
 
     st.info(
-        "FINAL SAFETY v4.11: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+        "FINAL SAFETY v6.0: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
         "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
         "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
         "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
@@ -6038,13 +6724,16 @@ if st.session_state.auto_refresh:
             else float(hb_raw["close"].iloc[-1])
         )
 
-        if st.session_state.paper_position and hb_feed.get("execution_ok", False):
-            hb_mark = paper_mark_price(
-                st.session_state.paper_position,
-                hb_quote,
-                hb_price,
-            )
-            manage_paper(hb_mark)
+        if st.session_state.paper_position:
+            _hp = st.session_state.paper_position
+            if str(_hp.get("symbol")) == instrument.symbol and hb_feed.get("execution_ok", False):
+                hb_mark = paper_mark_price(_hp, hb_quote, hb_price)
+                manage_paper(hb_mark)
+            elif str(_hp.get("symbol")) != instrument.symbol:
+                _hpq = fetch_quote(str(_hp.get("symbol")))
+                if quote_execution_ready(_hpq):
+                    _hpfallback = float(_hpq.get("last")) if finite(_hpq.get("last")) else float(_hp.get("entry", 0.0))
+                    manage_paper(paper_mark_price(_hp, _hpq, _hpfallback))
 
         if (
             st.session_state.auto_paper
@@ -6055,18 +6744,29 @@ if st.session_state.auto_refresh:
             hb_profile = adaptive_profile
             hb_risk_pct = float(paper_risk_pct)
 
-            if (
-                adaptive_paper_mode
-                and instrument.symbol.upper() == "XAU/USD"
-                and selected_profile == "ذكي تلقائي"
-            ):
-                (
-                    hb_profile,
-                    hb_active_candidate,
-                    hb_analysis,
-                    _hb_meta,
-                ) = choose_smart_autopilot(hb_raw)
-                hb_risk_pct = adaptive_paper_risk_pct(hb_profile)
+            if adaptive_paper_mode and selected_profile == "ذكي تلقائي":
+                if instrument.asset_class == "GOLD":
+                    (
+                        hb_profile,
+                        hb_active_candidate,
+                        hb_analysis,
+                        _hb_meta,
+                    ) = choose_smart_autopilot(hb_raw)
+                    hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
+                elif instrument.asset_class == "STOCK":
+                    (
+                        hb_profile,
+                        hb_active_candidate,
+                        hb_analysis,
+                        _hb_meta,
+                    ) = choose_stock_autopilot(hb_raw)
+                    hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
+                else:
+                    hb_analysis = analyze_forward_candidate(hb_raw, hb_active_candidate)
+            elif adaptive_paper_mode and instrument.asset_class == "STOCK":
+                hb_active_candidate = STOCK_PROFILE_CANDIDATES[hb_profile]
+                hb_analysis = analyze_stock_candidate(hb_raw, hb_profile)
+                hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
             else:
                 hb_analysis = analyze_forward_candidate(hb_raw, hb_active_candidate)
 
@@ -6075,19 +6775,29 @@ if st.session_state.auto_refresh:
 
             if hb_analysis.get("signal") in {"BUY", "SELL"} and hb_m5:
                 try:
+                    hb_entry_price = hb_price
+                    if instrument.asset_class == "STOCK" and hb_analysis["signal"] == "BUY":
+                        hb_entry_price = (
+                            float(hb_quote["ask"])
+                            if finite(hb_quote.get("ask"))
+                            else float(hb_price) * (1.0 + 0.0002)
+                        )
                     hb_plan = build_trade_plan(
                         hb_analysis["signal"],
-                        hb_price,
+                        hb_entry_price,
                         float(hb_m5["atr"]),
                         float(st.session_state.paper_balance),
                         float(hb_risk_pct),
                         instrument,
+                        stop_atr=1.5 if instrument.asset_class == "STOCK" else 1.6,
+                        tp1_r=1.0,
+                        tp2_r=2.0 if instrument.asset_class == "STOCK" else 2.2,
                     )
                     hb_day_pnl = (
                         float(st.session_state.paper_balance)
                         - float(st.session_state.paper_day_start_balance)
                     )
-                    hb_ok, _ = risk_gate(
+                    hb_ok, hb_reasons = risk_gate(
                         float(st.session_state.paper_balance),
                         hb_day_pnl,
                         0,
@@ -6098,6 +6808,14 @@ if st.session_state.auto_refresh:
                         True,
                         float(st.session_state.paper_day_start_balance),
                     )
+                    if instrument.asset_class == "STOCK":
+                        _hg_ok, _, _ = stock_quote_guard(hb_quote, hb_price)
+                        hb_ok = bool(hb_ok and _hg_ok and stock_session_state()["preferred"])
+                        hb_ok = bool(hb_ok and not stock_recent_loss(instrument.symbol))
+                        hb_ok = bool(hb_ok and stock_trades_today() < STOCK_MAX_TRADES_PER_DAY)
+                        hb_ok = bool(hb_ok and stock_trades_today(instrument.symbol) < STOCK_MAX_TRADES_PER_SYMBOL_DAY)
+                        if st.session_state.get("stock_sharia_only", False):
+                            hb_ok = bool(hb_ok and stock_sharia_status(instrument.symbol) == "مُدرج بالقائمة")
                     if (
                         hb_ok
                         and st.session_state.last_auto_paper_candle.get(instrument.symbol)
@@ -6110,6 +6828,8 @@ if st.session_state.auto_refresh:
                             hb_plan,
                             instrument,
                             order_key=hb_key,
+                            candidate=hb_active_candidate,
+                            profile=hb_profile,
                         ):
                             st.session_state.last_auto_paper_candle[instrument.symbol] = hb_candle
                             persist_paper_state()
