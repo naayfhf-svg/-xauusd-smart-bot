@@ -28,7 +28,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.0.0-x10-stock-desk"
+VERSION = "6.1.0-x10-stock-polish"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -1536,15 +1536,43 @@ def analyze_stock_candidate(raw: pd.DataFrame, profile: str) -> dict[str, Any]:
     extension_atr = ((float(m5["close"]) - float(m5["ema20"])) / atr_abs) if atr_abs > 0 else math.inf
     not_extended = bool(finite(extension_atr) and extension_atr <= float(cfg["max_ext"]))
 
+    # Relative volume is only evaluated while the regular U.S. session is active.
+    # Outside the session it is neutral, so stale after-hours volume cannot create
+    # misleading 5x/7x readings.
+    session = stock_session_state()
     volume_ratio = None
     volume_ok = True
-    if "volume" in m5f.columns:
+    volume_context = "خارج الجلسة"
+
+    if session["regular"] and "volume" in m5f.columns:
         vols = pd.to_numeric(m5f["volume"], errors="coerce")
-        if len(vols) >= 22 and finite(vols.iloc[-1]):
-            prior_med = float(vols.iloc[-21:-1].median())
-            if prior_med > 0:
-                volume_ratio = float(vols.iloc[-1]) / prior_med
-                volume_ok = bool(volume_ratio >= float(cfg["volume_min"]))
+        dts = pd.to_datetime(m5f["datetime"], utc=True, errors="coerce")
+        if len(vols) >= 50 and finite(vols.iloc[-1]) and pd.notna(dts.iloc[-1]):
+            current_ny = dts.iloc[-1].tz_convert("America/New_York")
+            current_minute = current_ny.hour * 60 + current_ny.minute
+
+            hist = pd.DataFrame({"dt": dts.iloc[:-1], "volume": vols.iloc[:-1]}).dropna()
+            if not hist.empty:
+                hist["ny"] = hist["dt"].dt.tz_convert("America/New_York")
+                hist["minute"] = hist["ny"].dt.hour * 60 + hist["ny"].dt.minute
+                hist["weekday"] = hist["ny"].dt.weekday
+                hist = hist[
+                    (hist["weekday"] < 5)
+                    & (hist["minute"] >= 9 * 60 + 30)
+                    & (hist["minute"] < 16 * 60)
+                    & ((hist["minute"] - current_minute).abs() <= 10)
+                ].tail(60)
+
+                if len(hist) >= 5:
+                    baseline = float(pd.to_numeric(hist["volume"], errors="coerce").median())
+                    if baseline > 0:
+                        volume_ratio = float(vols.iloc[-1]) / baseline
+                        volume_ok = bool(volume_ratio >= float(cfg["volume_min"]))
+                        volume_context = "جلسة حية"
+                    else:
+                        volume_context = "مرجع حجم غير كافٍ"
+                else:
+                    volume_context = "مرجع حجم غير كافٍ"
 
     prior20 = m5f.iloc[-21:-1] if len(m5f) >= 22 else pd.DataFrame()
     prior_high = float(prior20["high"].max()) if not prior20.empty else math.nan
@@ -1562,7 +1590,6 @@ def analyze_stock_candidate(raw: pd.DataFrame, profile: str) -> dict[str, Any]:
                         and (price_structure_ok or profile == "مرن"))
         event = "B2/Break20/Pullback"
 
-    session = stock_session_state()
     session_ok = bool(session["preferred"])
 
     gates = [trend_ok, regime_ok, session_ok, event_ok, volume_ok]
@@ -1592,6 +1619,7 @@ def analyze_stock_candidate(raw: pd.DataFrame, profile: str) -> dict[str, Any]:
         "adaptive_h1_adx": h1_adx, "adaptive_h4_adx": h4_adx,
         "adaptive_vol_low": vol_low, "adaptive_vol_high": vol_high,
         "volume_ratio": volume_ratio, "volume_ok": volume_ok,
+        "volume_context": volume_context,
         "extension_atr": extension_atr, "not_extended": not_extended,
         "stock_session_label": session["label"],
     }
@@ -1628,6 +1656,12 @@ def choose_stock_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, An
 
 def scan_stock_batch(profile_choice: str = "ذكي تلقائي", batch_size: int = STOCK_SCAN_BATCH_SIZE) -> list[dict[str, Any]]:
     """Rotate through the watchlist without breaking the Twelve Data credit budget."""
+    session = stock_session_state()
+    if not session["regular"]:
+        st.session_state.stock_scan_paused_reason = "السوق الأمريكي مغلق — الماسح متوقف تلقائيًا"
+        return list((st.session_state.get("stock_scan_cache", {}) or {}).values())
+
+    st.session_state.stock_scan_paused_reason = ""
     symbols = list(STOCK_UNIVERSE.keys())
     if not symbols:
         return []
@@ -1689,8 +1723,13 @@ def stock_scanner_rows(sharia_only: bool = False) -> list[dict[str, Any]]:
     for row in rows:
         ts = parse_timestamp(row.get("updated_at"))
         age_min = ((now_utc() - ts).total_seconds() / 60.0) if ts is not None else math.inf
+        market_regular = stock_session_state()["regular"]
         row["stale"] = bool(row.get("stale", False) or age_min > 5.0)
-        row["freshness"] = "حديث" if not row["stale"] else "قديم"
+        row["freshness"] = (
+            ("حديث" if not row["stale"] else "قديم")
+            if market_regular
+            else "آخر جلسة"
+        )
         row["favorite"] = "★" if row.get("symbol") in favorites else ""
     if sharia_only:
         rows = [r for r in rows if r.get("sharia") == "مُدرج بالقائمة"]
@@ -4505,7 +4544,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 v6.0 STOCK DESK • Gold + U.S. Stocks • Paper Smart AutoPilot • "
+    "X10 v6.1 STOCK POLISH • Gold + U.S. Stocks • Paper Smart AutoPilot • "
     "market-specific engines • automatic risk control"
 )
 
@@ -4647,12 +4686,30 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
                 icon="⚡",
             )
 
+stock_market_closed = bool(
+    instrument.asset_class == "STOCK"
+    and (
+        quote.get("market_open") is False
+        or not stock_session_state()["regular"]
+    )
+)
+execution_label = (
+    "READY"
+    if feed.get("execution_ok")
+    else ("السوق مغلق" if stock_market_closed else "تحقق مطلوب")
+)
+execution_state = (
+    "ok"
+    if feed.get("execution_ok")
+    else ("wait" if stock_market_closed else "bad")
+)
+
 mini_grid(
     [
         ("السعر", fmt(reference_price, 4), ""),
         ("القرار", execution_analysis["signal"], "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"),
         ("القوة", f"{execution_analysis['strength']}%", ""),
-        ("Execution Feed", "READY" if feed.get("execution_ok") else "BLOCKED", "ok" if feed.get("execution_ok") else "bad"),
+        ("بيانات التنفيذ", execution_label, execution_state),
         ("Live", "UNLOCKED" if live_unlocked else "LOCKED", "ok" if live_unlocked else "wait"),
         ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF", "wait" if st.session_state.kill_switch else "ok"),
     ],
@@ -4681,8 +4738,13 @@ if not feed.get("trusted", False):
     st.error("فحص بنية بيانات السوق لم ينجح. تم حجب أي إشارة تنفيذية.")
     for reason in feed.get("structural_reasons", []):
         st.caption("• " + reason)
+elif instrument.asset_class == "STOCK" and stock_market_closed:
+    st.info("السوق الأمريكي مغلق الآن. التحليل يبقى ظاهرًا، والتنفيذ والماسح الثقيل متوقفان تلقائيًا حتى الجلسة.")
+    if advanced_ui:
+        for reason in feed.get("execution_reasons", []):
+            st.caption("• " + reason)
 elif not feed.get("execution_ok", False):
-    st.warning("البيانات تصل للتحليل، لكن التنفيذ محجوب حتى يصبح سعر التنفيذ حديثًا وقابلًا للتحقق.")
+    st.warning("السوق يفترض أنه مفتوح، لكن سعر التنفيذ غير جاهز أو قديم. تم حجب أي دخول حتى تتحدث البيانات.")
     for reason in feed.get("execution_reasons", []):
         st.caption("• " + reason)
 
@@ -4700,17 +4762,27 @@ if instrument.asset_class == "STOCK":
             ("جلسة نيويورك", stock_session["label"], "ok" if stock_session["preferred"] else "wait"),
             ("الاتجاه", (forward_analysis.get("snapshots", {}).get("H1") or {}).get("trend", "—"), ""),
             ("الجاهزية", f"{int(forward_analysis.get('readiness_pct',0))}%", "ok" if forward_analysis.get("signal") == "BUY" else "wait"),
-            ("الحجم النسبي", (f"{float(forward_analysis.get('volume_ratio')):.2f}x" if finite(forward_analysis.get("volume_ratio")) else "غير متاح"), ""),
+            (
+                "الحجم النسبي",
+                (
+                    f"{float(forward_analysis.get('volume_ratio')):.2f}x"
+                    if finite(forward_analysis.get("volume_ratio"))
+                    else ("خارج الجلسة" if not stock_session["regular"] else "غير مكتمل")
+                ),
+                "",
+            ),
             ("الفحص الشرعي", selected_sharia, "ok" if selected_sharia == "مُدرج بالقائمة" else "wait"),
         ],
         "status-grid",
     )
 
     if not sh_cfg["configured"]:
-        st.caption(
-            "الفحص الشرعي غير مربوط بمصدر حالي. يمكن لاحقًا ضبط SHARIA_APPROVED_SYMBOLS + "
-            "SHARIA_SCREEN_SOURCE + SHARIA_SCREEN_DATE في Secrets؛ التطبيق لا يخمن الحكم."
-        )
+        st.caption("الفحص الشرعي غير مربوط بمصدر محدث حتى الآن؛ التطبيق لا يخمن الحكم.")
+        if advanced_ui:
+            st.caption(
+                "لربط القائمة يدويًا: SHARIA_APPROVED_SYMBOLS + "
+                "SHARIA_SCREEN_SOURCE + SHARIA_SCREEN_DATE في Secrets."
+            )
     else:
         st.caption(
             f"قائمة الفحص الشرعي من إعداداتك"
@@ -4728,16 +4800,52 @@ if instrument.asset_class == "STOCK":
             scan_stock_batch(st.session_state.get("adaptive_profile_choice", "ذكي تلقائي"), STOCK_SCAN_BATCH_SIZE)
         rows = stock_scanner_rows(bool(st.session_state.get("stock_sharia_only", False)))
         st.markdown("### ماسح الفرص")
-        st.caption("يفحص 3 أسهم كل 60 ثانية بالتناوب حتى لا يتجاوز حد Twelve Data؛ اكتمال القائمة يحتاج عدة دورات.")
+        if stock_session_state()["regular"]:
+            st.caption("يتحدث تلقائيًا أثناء جلسة السوق ويجمع أفضل الفرص بالتناوب.")
+        else:
+            st.caption("السوق مغلق الآن؛ الماسح محتفظ بنتائج آخر جلسة ولن يستهلك طلبات إضافية.")
+        if advanced_ui:
+            st.caption("الوضع التقني: 3 أسهم كل 60 ثانية بالتناوب لحماية حد Twelve Data.")
         if rows:
-            view = pd.DataFrame(rows)
-            rename = {
-                "favorite": "★", "symbol": "الرمز", "name": "الشركة", "signal": "الإشارة", "readiness": "الجاهزية %",
-                "profile": "النمط", "price": "السعر", "rsi": "RSI", "volume_ratio": "الحجم النسبي",
-                "sharia": "الفحص الشرعي", "freshness": "البيانات", "updated_at": "آخر تحديث",
-            }
-            cols = [c for c in ["favorite","symbol","name","signal","readiness","profile","price","rsi","volume_ratio","sharia","freshness","updated_at"] if c in view.columns]
-            st.dataframe(view[cols].rename(columns=rename), hide_index=True, use_container_width=True)
+            # Mobile-first opportunity cards. The full diagnostic table is Advanced-only.
+            for row in rows[:6]:
+                _sig = str(row.get("signal", "WAIT"))
+                _sig_cls = "buy" if _sig == "BUY" else "state-wait"
+                _fav = "★ " if row.get("favorite") == "★" else ""
+                _vol = (
+                    f"{float(row.get('volume_ratio')):.2f}x"
+                    if finite(row.get("volume_ratio"))
+                    else ("خارج الجلسة" if not stock_session_state()["regular"] else "—")
+                )
+                _price = fmt(row.get("price"), 2)
+                _sh = str(row.get("sharia", "غير متحقق"))
+                _fresh = str(row.get("freshness", "—"))
+                st.markdown(
+                    f"<div class='card'>"
+                    f"<div class='kicker'>{_fav}{row.get('name','')}</div>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:end;gap:12px;'>"
+                    f"<div><h2 style='margin:.2rem 0'>{row.get('symbol','')}</h2>"
+                    f"<div class='muted'>السعر {_price} • الحجم {_vol}</div></div>"
+                    f"<div style='text-align:left'><div class='big {_sig_cls}' style='font-size:1.7rem'>{_sig}</div>"
+                    f"<div class='muted'>جاهزية {int(row.get('readiness',0))}% • {row.get('profile','—')}</div></div>"
+                    f"</div>"
+                    f"<div class='muted' style='margin-top:.65rem'>الفحص الشرعي: {_sh} • البيانات: {_fresh}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if advanced_ui:
+                view = pd.DataFrame(rows)
+                rename = {
+                    "favorite": "★", "symbol": "الرمز", "name": "الشركة", "signal": "الإشارة",
+                    "readiness": "الجاهزية %", "profile": "النمط", "price": "السعر", "rsi": "RSI",
+                    "volume_ratio": "الحجم النسبي", "sharia": "الفحص الشرعي",
+                    "freshness": "البيانات", "updated_at": "آخر تحديث",
+                }
+                cols = [c for c in ["favorite","symbol","name","signal","readiness","profile","price","rsi","volume_ratio","sharia","freshness","updated_at"] if c in view.columns]
+                with st.expander("جدول الماسح المتقدم", expanded=False):
+                    st.dataframe(view[cols].rename(columns=rename), hide_index=True, use_container_width=True)
+
             best = rows[0]
             st.success(
                 f"أعلى جاهزية حالياً: {best.get('symbol')} • {best.get('readiness',0)}% • "
@@ -4753,7 +4861,12 @@ if instrument.asset_class == "STOCK":
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("تحديث دفعة الماسح الآن", use_container_width=True, key="stock_scan_now"):
+            if st.button(
+                "تحديث دفعة الماسح الآن",
+                use_container_width=True,
+                key="stock_scan_now",
+                disabled=not stock_session_state()["regular"],
+            ):
                 scan_stock_batch(st.session_state.get("adaptive_profile_choice", "ذكي تلقائي"), STOCK_SCAN_BATCH_SIZE)
                 st.rerun()
         with c2:
@@ -4831,13 +4944,28 @@ forward_display = (
     else ("قريب من الدخول" if near_entry else "WAIT")
 )
 
+candidate_display = (
+    active_candidate
+    if advanced_ui
+    else (
+        f"النمط {adaptive_profile}"
+        if instrument.asset_class in {"STOCK", "GOLD"} and active_candidate in SMART_PAPER_CANDIDATES
+        else "Paper"
+    )
+)
+event_display = (
+    str(forward_analysis.get("event", "NONE"))
+    if advanced_ui
+    else ("جاهز" if forward_analysis.get("event_ok") else "بانتظار حدث الدخول")
+)
+
 st.markdown(
-    f"<div class='card'><div class='kicker'>PAPER FORWARD CANDIDATE</div>"
+    f"<div class='card'><div class='kicker'>قرار Paper</div>"
     f"<div class='big {forward_signal_class}'>{forward_display}</div>"
     f"<p>{forward_analysis.get('reason','')}</p>"
-    f"<div class='muted'>{active_candidate} • "
+    f"<div class='muted'>{candidate_display} • "
     f"الجاهزية {int(forward_analysis.get('readiness_pct',0))}% • "
-    f"Event {forward_analysis.get('event','NONE')}</div></div>",
+    f"{event_display}</div></div>",
     unsafe_allow_html=True,
 )
 
@@ -5165,11 +5293,17 @@ if mode == "Paper":
         "paper-grid",
     )
 
-    st.caption(
-        f"Candidate: {active_candidate} • Risk {float(paper_risk_pct):.2f}% • "
-        "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
-        "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
-    )
+    if advanced_ui:
+        st.caption(
+            f"Candidate: {active_candidate} • Risk {float(paper_risk_pct):.3f}% • "
+            "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
+            "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
+        )
+    else:
+        st.caption(
+            f"المخاطرة الحالية {float(paper_risk_pct):.3f}% • Paper فقط • "
+            "الحفظ ومنع تكرار الأوامر مفعّلان تلقائيًا."
+        )
 
 
     if active_candidate in SMART_PAPER_CANDIDATES and advanced_ui:
@@ -6695,7 +6829,7 @@ if advanced_ui:
             st.info("لا يوجد سجل بعد")
 
     st.info(
-        "FINAL SAFETY v6.0: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
+        "FINAL SAFETY v6.1: تقدر تبدأ Paper Forward الآن بأموال افتراضية. "
         "Live الحقيقي يبقى مقفولًا حتى يجتاز نفس المرشح Fresh Holdout + "
         "20 صفقة Paper Forward مغلقة بنتيجة كلية موجبة + Broker Bridge فعلي + "
         "Broker Quote حديث + positions موثقة + بيانات عقد موثقة + LIVE_UI_PIN + KILL SWITCH OFF. "
@@ -6711,6 +6845,13 @@ if st.session_state.auto_refresh:
         It does not full-rerun the app, so mobile stays connected more reliably.
         It is NOT a 24/7 server worker and may pause if the browser session sleeps.
         """
+        if instrument.asset_class == "STOCK" and not stock_session_state()["regular"]:
+            st.caption(
+                f"Paper heartbeat • {now_riyadh().strftime('%H:%M:%S')} • "
+                "السوق مغلق — متوقف تلقائيًا"
+            )
+            return
+
         hb_raw, _ = fetch_market(instrument.symbol)
         if hb_raw.empty:
             st.caption("Paper heartbeat: market data unavailable")
