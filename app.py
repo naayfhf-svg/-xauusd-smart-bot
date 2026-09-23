@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import json
@@ -28,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.0-x10-stock-polish"
+VERSION = "6.1.1-stock-stability"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -248,7 +249,10 @@ def _state_db_path() -> str:
 @st.cache_resource
 def state_db() -> dict[str, Any]:
     path = _state_db_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS kv_state (
@@ -309,20 +313,78 @@ def state_read(key: str, default: Any = None) -> Any:
 
 
 def restore_persistent_state() -> None:
+    db = state_db()
+    with db["lock"]:
+        rows = dict(db["conn"].execute("SELECT key, value FROM kv_state").fetchall())
     for key in PERSIST_KEYS:
-        saved = state_read(key, None)
-        if saved is not None:
-            st.session_state[key] = saved
+        if key in rows:
+            st.session_state[key] = json.loads(rows[key])
+    st.session_state._state_revision = int(json.loads(rows.get("_revision", "0")))
+    st.session_state._last_good_state = copy.deepcopy({k: st.session_state[k] for k in PERSIST_KEYS if k in st.session_state})
 
 
-def persist_paper_state() -> None:
-    for key in PERSIST_KEYS:
-        if key in st.session_state:
+def persist_paper_state() -> bool:
+    """Atomic snapshot; reject stale browser sessions instead of losing trades."""
+    try:
+        db = state_db()
+        with db["lock"]:
+            conn = db["conn"]
             try:
-                state_write(key, st.session_state.get(key))
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT value FROM kv_state WHERE key='_revision'").fetchone()
+                revision = int(json.loads(row[0])) if row else 0
+                if revision != st.session_state.get("_state_revision", 0):
+                    raise RuntimeError("تغيرت المحفظة في جلسة أخرى؛ تم تحميل أحدث حالة")
+                stamp = now_riyadh().isoformat()
+                values = [(key, json.dumps(st.session_state[key], ensure_ascii=False,
+                           default=_jsonable, allow_nan=False), stamp)
+                          for key in PERSIST_KEYS if key in st.session_state]
+                values.append(("_revision", json.dumps(revision + 1), stamp))
+                conn.executemany("INSERT INTO kv_state(key,value,updated_at) VALUES(?,?,?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                                 "updated_at=excluded.updated_at", values)
+                conn.commit()
+                st.session_state._state_revision = revision + 1
+                st.session_state._persistence_error = None
+                st.session_state._last_good_state = copy.deepcopy({k: st.session_state[k] for k in PERSIST_KEYS if k in st.session_state})
+                return True
             except Exception:
-                # Never break trading/Paper UI because persistence failed.
-                pass
+                conn.rollback()
+                raise
+    except Exception as exc:
+        st.session_state._persistence_error = str(exc)
+        st.session_state.auto_paper = False
+        try:
+            restore_persistent_state()
+        except Exception:
+            for key, value in st.session_state.get("_last_good_state", {}).items():
+                st.session_state[key] = copy.deepcopy(value)
+        st.session_state.auto_paper = False
+        return False
+
+
+def roll_paper_day() -> None:
+    today = now_riyadh().date().isoformat()
+    if st.session_state.paper_day != today:
+        st.session_state.paper_day = today
+        st.session_state.paper_day_start_balance = float(st.session_state.paper_balance)
+        st.session_state.paper_trades_today = 0
+        persist_paper_state()
+
+
+def adaptive_entry_brake(profile: str, asset_class: str) -> bool:
+    day_pnl = float(st.session_state.paper_balance) - float(st.session_state.paper_day_start_balance)
+    stock = asset_class == "STOCK"
+    limit = {"صارم": 0.35 if stock else 0.40,
+             "متوازن": 0.30 if stock else 0.35,
+             "مرن": 0.20 if stock else 0.25}.get(profile, 0.30 if stock else 0.35)
+    streak = 0
+    for item in list(st.session_state.get("paper_history", []))[:5]:
+        if float(item.get("PnL", 0)) >= 0:
+            break
+        streak += 1
+    return (day_pnl > -float(st.session_state.paper_day_start_balance) * limit / 100
+            and streak < (2 if profile == "مرن" else 3))
 
 
 def remember_paper_order(order_key: str) -> bool:
@@ -335,8 +397,7 @@ def remember_paper_order(order_key: str) -> bool:
         return False
     keys.append(order_key)
     st.session_state.paper_order_keys = keys[-500:]
-    persist_paper_state()
-    return True
+    return persist_paper_state()
 
 
 def init_state() -> None:
@@ -371,8 +432,8 @@ def init_state() -> None:
         "stock_auto_scan": True,
         "stock_sharia_only": False,
         "stock_scan_alerts": {},
-        "market_preset": "Gold — XAU/USD",
-        "market_section": "الذهب",
+        "market_preset": "Apple — AAPL",
+        "market_section": "الأسهم",
         "pending_market_preset": None,
         "research_gate": {
             "passed": False,
@@ -387,15 +448,14 @@ def init_state() -> None:
     # Restore persisted state once per browser session. Restoring on every
     # Streamlit rerun can overwrite a widget value the user just changed.
     if not st.session_state.get("_persistent_state_loaded", False):
-        restore_persistent_state()
+        try:
+            restore_persistent_state()
+        except Exception as exc:
+            st.error(f"تعذر قراءة المحفظة المحفوظة: {exc}")
+            st.stop()
         st.session_state._persistent_state_loaded = True
 
-    today = now_riyadh().date().isoformat()
-    if st.session_state.paper_day != today:
-        st.session_state.paper_day = today
-        st.session_state.paper_day_start_balance = float(st.session_state.paper_balance)
-        st.session_state.paper_trades_today = 0
-        persist_paper_state()
+    roll_paper_day()
 
 
 init_state()
@@ -475,7 +535,7 @@ def normalize_ohlcv(values: Any) -> pd.DataFrame:
     if not isinstance(values, list) or not values:
         return pd.DataFrame()
     df = pd.DataFrame(values)
-    if "datetime" not in df.columns:
+    if not {"datetime", "open", "high", "low", "close"}.issubset(df.columns):
         return pd.DataFrame()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
     for col in ("open", "high", "low", "close", "volume"):
@@ -483,6 +543,10 @@ def normalize_ohlcv(values: Any) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     required = ["datetime", "open", "high", "low", "close"]
     df = df.dropna(subset=required)
+    prices = df[["open", "high", "low", "close"]]
+    valid = (np.isfinite(prices).all(axis=1) & (prices > 0).all(axis=1)
+             & (df["high"] >= prices.max(axis=1)) & (df["low"] <= prices.min(axis=1)))
+    df = df.loc[valid]
     return (
         df.drop_duplicates("datetime")
         .sort_values("datetime")
@@ -541,6 +605,8 @@ def fetch_market(symbol: str, outputsize: int = 5000) -> tuple[pd.DataFrame, str
         payload = response.json()
     except Exception as exc:
         return pd.DataFrame(), f"خطأ اتصال بمصدر البيانات: {exc}"
+    if not isinstance(payload, dict):
+        return pd.DataFrame(), "رد مصدر البيانات غير صالح"
     if "values" not in payload:
         message = str(payload.get("message") or payload)
         if td_is_rate_limit_message(message):
@@ -590,6 +656,8 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
     except Exception as exc:
         return {"connected": False, "error": str(exc)}
 
+    if not isinstance(payload, dict):
+        return {"connected": False, "error": "رد Quote غير صالح"}
     bid = payload.get("bid")
     ask = payload.get("ask")
     last = payload.get("close", payload.get("price", payload.get("last")))
@@ -1039,6 +1107,10 @@ def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]
 
     structural_ok = bool(base.get("ok", False) and not structural_reasons)
 
+    if not finite(quote.get("last")) or float(quote.get("last", 0)) <= 0:
+        execution_reasons.append("سعر Quote غير صالح")
+    if q_ts is not None and q_ts > now_utc() + pd.Timedelta(minutes=1):
+        execution_reasons.append("توقيت Quote في المستقبل")
     if not quote.get("connected"):
         execution_reasons.append("Quote المباشر غير متصل")
     if base.get("age_min", math.inf) > 15:
@@ -1350,11 +1422,13 @@ def stock_quote_guard(quote: dict[str, Any], reference_price: float) -> tuple[bo
         bid = float(quote["bid"])
         ask = float(quote["ask"])
         mid = (bid + ask) / 2.0
+        if bid <= 0 or ask <= 0 or ask < bid:
+            reasons.append("أسعار العرض والطلب غير صالحة")
         if mid > 0:
             spread_pct = (ask - bid) / mid * 100.0
             if spread_pct > 0.20:
                 reasons.append(f"سبريد السهم مرتفع ({spread_pct:.3f}%)")
-    if reference_price <= 0:
+    if not finite(reference_price) or reference_price <= 0:
         reasons.append("سعر السهم غير صالح")
     return not reasons, reasons, spread_pct
 
@@ -1365,8 +1439,8 @@ def quote_execution_ready(quote: dict[str, Any], max_age_minutes: float = 5.0) -
     q_ts, _ = quote_timestamp(quote)
     if q_ts is None:
         return False
-    age = max(0.0, (now_utc() - q_ts).total_seconds() / 60.0)
-    if age > max_age_minutes:
+    age = (now_utc() - q_ts).total_seconds() / 60.0
+    if float(quote["last"]) <= 0 or age < -1 or age > max_age_minutes:
         return False
     if quote.get("market_open") is False:
         return False
@@ -1761,7 +1835,9 @@ def build_trade_plan(
         raise ValueError("Signal must be BUY or SELL")
     if spec.asset_class == "STOCK" and signal == "SELL":
         raise ValueError("محرك الأسهم Cash/Long-only ولا يسمح بصفقات Short")
-    if equity <= 0 or risk_pct <= 0 or atr_value <= 0 or spec.point_value <= 0 or entry <= 0:
+    numeric = (equity, risk_pct, atr_value, entry, spec.point_value, spec.qty_step,
+               spec.min_qty, spec.max_qty, stop_atr, tp1_r, tp2_r)
+    if not all(finite(v) and v > 0 for v in numeric) or spec.min_qty > spec.max_qty or tp2_r <= tp1_r:
         raise ValueError("مدخلات المخاطرة غير صالحة")
 
     stop_distance = max(atr_value * stop_atr, 1e-9)
@@ -1794,6 +1870,8 @@ def build_trade_plan(
         tp1 = entry - stop_distance * tp1_r
         tp2 = entry - stop_distance * tp2_r
 
+    if min(stop, tp1, tp2) <= 0:
+        raise ValueError("الوقف أو الهدف خارج نطاق الأسعار الصالحة")
     estimated_risk = abs(entry - stop) * spec.point_value * qty
     actual_risk_pct = estimated_risk / equity * 100.0
 
@@ -1831,6 +1909,10 @@ def risk_gate(
     day_start_equity: float | None = None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
+    values = (equity, day_pnl, max_daily_loss_pct, max_order_risk_pct,
+              plan.get("qty"), plan.get("risk_pct"), plan.get("actual_risk_pct"))
+    if not all(finite(v) for v in values):
+        return False, ["مدخلات المخاطر تحتوي أرقامًا غير صالحة"]
     if equity <= 0:
         reasons.append("Equity غير صالح")
     if not trading_enabled:
@@ -1875,7 +1957,8 @@ def paper_unrealized_r(position: dict[str, Any], price: float) -> float:
     if distance <= 0:
         return 0.0
     direction = 1 if position["side"] == "BUY" else -1
-    return direction * (price - position["entry"]) / distance
+    return (float(position.get("realized_r", 0.0))
+            + float(position.get("remaining", 1.0)) * direction * (price - position["entry"]) / distance)
 
 
 def open_paper(
@@ -1888,8 +1971,13 @@ def open_paper(
     if st.session_state.paper_position:
         return False
 
-    if order_key and not remember_paper_order(order_key):
+    if st.session_state.get("_persistence_error"):
         return False
+    keys = list(st.session_state.get("paper_order_keys", []))
+    if order_key and order_key in keys:
+        return False
+    if order_key:
+        st.session_state.paper_order_keys = (keys + [order_key])[-500:]
 
     st.session_state.paper_position = {
         "id": uuid.uuid4().hex[:12],
@@ -1913,11 +2001,15 @@ def open_paper(
         "order_key": order_key,
     }
     st.session_state.paper_trades_today += 1
-    persist_paper_state()
-    return True
+    return persist_paper_state()
 
 
 def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_value: float) -> None:
+    current = st.session_state.get("paper_position")
+    if not current or current.get("id") != position.get("id"):
+        return
+    if not finite(exit_price) or exit_price <= 0 or not finite(r_value):
+        raise ValueError("سعر الإغلاق غير صالح")
     pnl = r_value * position["risk_money"]
     st.session_state.paper_balance += pnl
     st.session_state.paper_history.insert(
@@ -1945,7 +2037,7 @@ def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_valu
 
 def manage_paper(price: float) -> None:
     p = st.session_state.paper_position
-    if not p:
+    if not p or not finite(price) or price <= 0:
         return
     d = abs(p["entry"] - p["stop_initial"])
     if d <= 0:
@@ -1953,29 +2045,31 @@ def manage_paper(price: float) -> None:
 
     if p["side"] == "BUY":
         if price <= p["stop"]:
-            r = p["realized_r"] + p["remaining"] * ((p["stop"] - p["entry"]) / d)
-            close_paper(p, p["stop"], "STOP", r)
+            r = p["realized_r"] + p["remaining"] * ((price - p["entry"]) / d)
+            close_paper(p, price, "STOP", r)
             return
         if not p["tp1_hit"] and price >= p["tp1"]:
             p["tp1_hit"] = True
             p["remaining"] = 0.5
-            p["realized_r"] = 0.5
+            p["realized_r"] = 0.5 * abs(p["tp1"] - p["entry"]) / d
             p["stop"] = p["entry"]
-            persist_paper_state()
+            if not persist_paper_state():
+                return
         if p["tp1_hit"] and price >= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["tp2"] - p["entry"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
     else:
         if price >= p["stop"]:
-            r = p["realized_r"] + p["remaining"] * ((p["entry"] - p["stop"]) / d)
-            close_paper(p, p["stop"], "STOP", r)
+            r = p["realized_r"] + p["remaining"] * ((p["entry"] - price) / d)
+            close_paper(p, price, "STOP", r)
             return
         if not p["tp1_hit"] and price <= p["tp1"]:
             p["tp1_hit"] = True
             p["remaining"] = 0.5
-            p["realized_r"] = 0.5
+            p["realized_r"] = 0.5 * abs(p["tp1"] - p["entry"]) / d
             p["stop"] = p["entry"]
-            persist_paper_state()
+            if not persist_paper_state():
+                return
         if p["tp1_hit"] and price <= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["entry"] - p["tp2"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
@@ -4311,6 +4405,8 @@ if base_spec.asset_class == "STOCK":
     )
 
 persist_paper_state()
+if st.session_state.get("_persistence_error"):
+    st.error("تعذر حفظ المحفظة؛ أوقفنا فتح صفقات جديدة. " + st.session_state._persistence_error)
 
 advanced_settings = st.sidebar.toggle(
     "إعدادات متقدمة", value=False,
@@ -4544,7 +4640,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 v6.1 STOCK POLISH • Gold + U.S. Stocks • Paper Smart AutoPilot • "
+    "X10 v6.1.1 STOCK STABILITY • Gold + U.S. Stocks • Paper Smart AutoPilot • "
     "market-specific engines • automatic risk control"
 )
 
@@ -5230,6 +5326,9 @@ if mode == "Paper":
             True,
             float(st.session_state.paper_day_start_balance),
         )
+        if st.session_state.get("_persistence_error"):
+            p_gate_ok = False
+            p_gate_reasons.append("حفظ المحفظة غير متاح")
         if not feed.get("execution_ok", False):
             p_gate_ok = False
             p_gate_reasons.append(
@@ -5344,7 +5443,7 @@ if mode == "Paper":
     if advanced_ui:
         mini_grid(
             [
-                ("حفظ Paper", "مفعّل", "ok"),
+                ("حفظ Paper", "متوقف" if st.session_state.get("_persistence_error") else "مفعّل", "bad" if st.session_state.get("_persistence_error") else "ok"),
                 ("منع تكرار الأوامر", "مفعّل", "ok"),
                 ("DB", "SQLite", ""),
                 ("سجل الصفقات", str(len(st.session_state.paper_history)), ""),
@@ -6845,7 +6944,12 @@ if st.session_state.auto_refresh:
         It does not full-rerun the app, so mobile stays connected more reliably.
         It is NOT a 24/7 server worker and may pause if the browser session sleeps.
         """
-        if instrument.asset_class == "STOCK" and not stock_session_state()["regular"]:
+        roll_paper_day()
+        if st.session_state.get("_persistence_error"):
+            st.error("التداول التلقائي متوقف بسبب تعذر حفظ المحفظة")
+            return
+        if (instrument.asset_class == "STOCK" and not stock_session_state()["regular"]
+                and not st.session_state.paper_position):
             st.caption(
                 f"Paper heartbeat • {now_riyadh().strftime('%H:%M:%S')} • "
                 "السوق مغلق — متوقف تلقائيًا"
@@ -6877,7 +6981,8 @@ if st.session_state.auto_refresh:
                     manage_paper(paper_mark_price(_hp, _hpq, _hpfallback))
 
         if (
-            st.session_state.auto_paper
+            mode == "Paper"
+            and st.session_state.auto_paper
             and not st.session_state.paper_position
             and hb_feed.get("execution_ok", False)
         ):
@@ -6949,6 +7054,8 @@ if st.session_state.auto_refresh:
                         True,
                         float(st.session_state.paper_day_start_balance),
                     )
+                    if hb_active_candidate in SMART_PAPER_CANDIDATES:
+                        hb_ok = bool(hb_ok and adaptive_entry_brake(hb_profile, instrument.asset_class))
                     if instrument.asset_class == "STOCK":
                         _hg_ok, _, _ = stock_quote_guard(hb_quote, hb_price)
                         hb_ok = bool(hb_ok and _hg_ok and stock_session_state()["preferred"])
