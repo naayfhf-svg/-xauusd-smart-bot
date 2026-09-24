@@ -1,0 +1,38 @@
+name: Verify Streamlit App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile app
+        run: python -m py_compile app.py
+      - name: Install requirements
+        run: pip install --disable-pip-version-check -r requirements.txt
+      - name: Import dependencies
+        run: python - <<'PY'
+          import streamlit, altair, pandas, numpy, requests
+          print("imports-ok")
+          PY
+      - name: Smoke test Streamlit
+        run: |
+          set -o pipefail
+          timeout 20s streamlit run app.py --server.headless=true --server.port=8501 2>&1 | tee streamlit-smoke.log || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then
+            cat streamlit-smoke.log
+            exit "${code}"
+          fi
+          if grep -E "Traceback|ModuleNotFoundError|SyntaxError|NameError|TypeError|AttributeError" streamlit-smoke.log; then
+            cat streamlit-smoke.log
+            exit 1
+          fi
+          echo "streamlit-smoke-ok"
