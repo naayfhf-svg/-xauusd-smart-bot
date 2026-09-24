@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.3.2-gold-buy-validation-guard"
+VERSION = "6.4.0-gold-consensus-buy-validation"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -550,6 +550,8 @@ def init_state() -> None:
         "smart_alert_keys": [],
         "smart_alert_log": [],
         "last_reversal_alert": {},
+        "gold_buy_validation": None,
+        "gold_consensus_snapshot": None,
         "paper_day": now_riyadh().date().isoformat(),
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
@@ -852,6 +854,150 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
         }
     return {**base, "connected": False, "error": message}
 
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_goldapi_quote() -> dict[str, Any]:
+    """Optional second independent spot source for XAU/USD."""
+    key = str(secret("GOLDAPI_KEY", "") or "").strip()
+    if not key:
+        return {"connected": False, "configured": False, "error": "GOLDAPI_KEY غير موجود"}
+
+    t0 = time.perf_counter()
+    try:
+        response = requests.get(
+            "https://www.goldapi.io/api/price/XAU/USD",
+            headers={
+                "x-access-token": key,
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        payload = response.json()
+    except Exception as exc:
+        return {
+            "connected": False,
+            "configured": True,
+            "error": str(exc),
+            "request_latency_ms": (time.perf_counter() - t0) * 1000.0,
+        }
+
+    if response.status_code >= 400 or not isinstance(payload, dict):
+        return {
+            "connected": False,
+            "configured": True,
+            "error": f"GoldAPI HTTP {response.status_code}",
+            "request_latency_ms": latency_ms,
+        }
+
+    price = payload.get("price")
+    bid = payload.get("bid")
+    ask = payload.get("ask")
+    ts = parse_timestamp(payload.get("timestamp") or payload.get("datetime"))
+    return {
+        "connected": bool(finite(price) and float(price) > 0),
+        "configured": True,
+        "source": "GoldAPI",
+        "price": float(price) if finite(price) else None,
+        "bid": float(bid) if finite(bid) else None,
+        "ask": float(ask) if finite(ask) else None,
+        "timestamp": ts,
+        "request_latency_ms": latency_ms,
+        "raw": payload,
+    }
+
+
+def _broker_gold_confirmation(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"connected": False, "source": "الوسيط"}
+    state = broker_quote_state(payload)
+    ts = None
+    for key in ("timestamp", "time", "updated_at", "last_update_at", "datetime"):
+        ts = parse_timestamp(payload.get(key))
+        if ts is not None:
+            break
+    return {
+        "connected": bool(state.get("ok")),
+        "source": "الوسيط",
+        "price": float(state["price"]) if state.get("ok") and finite(state.get("price")) else None,
+        "timestamp": ts,
+    }
+
+
+def gold_price_consensus(
+    primary_quote: dict[str, Any],
+    broker_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Cross-check XAU/USD across independent sources.
+    Confirmation requires at least two fresh sources and <=0.20% dispersion.
+    """
+    now = now_utc()
+    rows: list[dict[str, Any]] = []
+
+    p_ts, _ = quote_timestamp(primary_quote)
+    if primary_quote.get("connected") and finite(primary_quote.get("last")):
+        age = None if p_ts is None else max(0.0, (now - p_ts).total_seconds())
+        rows.append({
+            "source": "Twelve Data",
+            "price": float(primary_quote["last"]),
+            "timestamp": p_ts,
+            "age_sec": age,
+            "fresh": bool(age is not None and age <= 90.0),
+        })
+
+    secondary = fetch_goldapi_quote()
+    if secondary.get("connected") and finite(secondary.get("price")):
+        s_ts = secondary.get("timestamp")
+        age = None if s_ts is None else max(0.0, (now - s_ts).total_seconds())
+        rows.append({
+            "source": "GoldAPI",
+            "price": float(secondary["price"]),
+            "timestamp": s_ts,
+            "age_sec": age,
+            "fresh": bool(age is not None and age <= 90.0),
+        })
+
+    broker = _broker_gold_confirmation(broker_payload)
+    if broker.get("connected") and finite(broker.get("price")):
+        b_ts = broker.get("timestamp")
+        age = None if b_ts is None else max(0.0, (now - b_ts).total_seconds())
+        rows.append({
+            "source": "الوسيط",
+            "price": float(broker["price"]),
+            "timestamp": b_ts,
+            "age_sec": age,
+            "fresh": bool(age is not None and age <= 90.0),
+        })
+
+    fresh = [r for r in rows if r["fresh"]]
+    prices = [float(r["price"]) for r in fresh]
+    dispersion_pct = None
+    consensus_price = None
+    if prices:
+        consensus_price = float(np.median(prices))
+        if consensus_price > 0:
+            dispersion_pct = (max(prices) - min(prices)) / consensus_price * 100.0
+
+    reasons: list[str] = []
+    if len(fresh) < 2:
+        reasons.append("يلزم مصدران حديثان على الأقل")
+    if dispersion_pct is not None and dispersion_pct > 0.20:
+        reasons.append(f"اختلاف الأسعار بين المصادر مرتفع ({dispersion_pct:.3f}%)")
+
+    ok = bool(len(fresh) >= 2 and dispersion_pct is not None and dispersion_pct <= 0.20)
+    return {
+        "ok": ok,
+        "sources": rows,
+        "fresh_sources": len(fresh),
+        "configured_sources": 1
+            + int(bool(secret("GOLDAPI_KEY")))
+            + int(bool(broker_payload)),
+        "consensus_price": consensus_price,
+        "dispersion_pct": dispersion_pct,
+        "reasons": reasons,
+        "checked_at": now_riyadh().isoformat(),
+    }
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -3346,6 +3492,10 @@ def prepare_research_context(raw: pd.DataFrame) -> dict[str, Any]:
 
 
 def _variant_signal(base_signal: str, hour: int, regime_ok: bool, variant: str) -> str:
+    if variant == "BUY_ONLY":
+        return "BUY" if base_signal == "BUY" else "WAIT"
+    if variant == "BUY_SESSION_VOL":
+        return "BUY" if base_signal == "BUY" and 6 <= hour < 20 and regime_ok else "WAIT"
     if variant == "SELL_ONLY":
         return "SELL" if base_signal == "SELL" else "WAIT"
     if variant == "SELL_SESSION":
@@ -3376,7 +3526,7 @@ def _research_signal_from_row(row: Any, variant: str) -> str:
     regime_ok = bool(row.regime_ok)
 
     # Preserve legacy research variants exactly.
-    if variant in {"STRICT_BOTH", "SELL_ONLY", "SELL_SESSION", "SELL_SESSION_VOL"}:
+    if variant in {"STRICT_BOTH", "BUY_ONLY", "BUY_SESSION_VOL", "SELL_ONLY", "SELL_SESSION", "SELL_SESSION_VOL"}:
         return _variant_signal(base_signal, hour, regime_ok, variant)
 
     if variant not in WF_CANDIDATES:
@@ -4111,6 +4261,8 @@ def _validation_cost_row(
 
 RESEARCH_VARIANTS = {
     "STRICT_BOTH": "Baseline BUY + SELL",
+    "BUY_ONLY": "BUY only — strict MTF + B2",
+    "BUY_SESSION_VOL": "BUY only + UTC 06:00–20:00 + prior-only volatility filter",
     "SELL_ONLY": "SELL only",
     "SELL_SESSION": "SELL only + UTC 06:00–20:00",
     "SELL_SESSION_VOL": "SELL only + UTC 06:00–20:00 + prior-only volatility filter",
