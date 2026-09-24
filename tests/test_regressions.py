@@ -240,3 +240,83 @@ def test_option_invalid_plan(engine):
         engine.create_option_watch('AAPL','Put','2030-01-01',100,2,2.2,1.5,3,4,1,100,'2030-01-01')
     with pytest.raises(ValueError):
         engine.create_option_watch('AAPL','Put','2030-02-01',100,2,2.2,3,3,4,1,100,'2030-01-01')
+
+
+def smart_snap(bull=True):
+    return dict(trend='UP' if bull else 'DOWN', rsi=60 if bull else 40,
+                adx=25, momentum=1 if bull else -1, macd_hist=1 if bull else -1,
+                close=100, ema20=99, ema50=98)
+
+
+@pytest.mark.parametrize('kind', ['Call', 'Put'])
+def test_direction_rules_are_symmetric_and_fresh(engine, kind):
+    snaps={tf:smart_snap(kind=='Call') for tf in ('M5','M15','H1')}
+    event=dict(valid=True,side='BUY' if kind=='Call' else 'SELL')
+    result=engine.option_direction(snaps,event,True)
+    assert result['setup'] and result['bias']==kind
+    assert not engine.option_direction(snaps,event,False)['setup']
+    assert not engine.option_direction(snaps,dict(valid=False),True)['setup']
+    snaps['H1']=smart_snap(kind!='Call')
+    assert engine.option_direction(snaps,event,True)['bias']=='WAIT'
+
+
+def test_direction_missing_and_nonfinite(engine):
+    assert not engine.option_direction({}, {}, True)['setup']
+    snaps={tf:smart_snap() for tf in ('M5','M15','H1')}
+    snaps['M5']['rsi']=float('nan')
+    assert not engine.option_direction(snaps,dict(valid=True,side='BUY'),True)['setup']
+
+
+def reviewed_watch(m,kind='Call'):
+    w=option_plan(m,kind)
+    w['last_quote']=dict(timestamp='2030-01-02T16:00:00Z',bid=2.05,ask=2.1,source='manual')
+    return w
+
+
+@pytest.mark.parametrize('kind', ['Call', 'Put'])
+def test_smart_review_budget_and_break_even(engine,kind):
+    w=reviewed_watch(engine,kind)
+    direction=dict(setup=True,bias=kind)
+    now='2030-01-02T16:00:01Z'
+    result=engine.option_smart_review(w,direction,300,now)
+    assert result['state']=='REVIEW_ENTRY'
+    assert result['max_qty']==1
+    assert result['cost']==pytest.approx(210)
+    assert result['breakeven']==pytest.approx(102.2 if kind=='Call' else 97.8)
+    # Stop-distance risk is only $60, but budget must cover the entire $210 premium.
+    assert engine.option_smart_review(w,direction,100,now)['state']=='WAIT'
+    assert engine.option_smart_review(w,direction,float('inf'),now)['state']=='WAIT'
+
+
+@pytest.mark.parametrize('mutation', ['stale','wide','opposite','no_setup','expiry','price_chase','rr'])
+def test_smart_entry_blockers(engine,mutation):
+    w=reviewed_watch(engine)
+    d=dict(setup=True,bias='Call')
+    if mutation=='stale': w['last_quote']['timestamp']='2030-01-02T15:00:00Z'
+    if mutation=='wide': w['last_quote']['bid']=.5
+    if mutation=='opposite': d['bias']='Put'
+    if mutation=='no_setup': d['setup']=False
+    if mutation=='expiry': w['expiry']='2030-01-03'
+    if mutation=='price_chase': w['last_quote']['ask']=2.3
+    if mutation=='rr': w['tp2']=2.5
+    assert engine.option_smart_review(w,d,500,'2030-01-02T16:00:01Z')['state']!='REVIEW_ENTRY'
+
+
+def test_exit_not_blocked_by_spread_or_budget(engine):
+    w=reviewed_watch(engine,'Put')
+    w.update(entered=True,actual_entry=2.1)
+    w['last_quote']['bid']=0
+    r=engine.option_smart_review(w,dict(setup=False,bias='WAIT'),0,'2030-01-02T16:00:01Z')
+    assert r['state']=='REVIEW_EXIT'
+    assert r['pnl']==pytest.approx(-210)
+
+
+def test_reversal_and_expiry_reviews(engine):
+    w=reviewed_watch(engine)
+    w.update(entered=True,actual_entry=2.1)
+    d=dict(setup=True,bias='Put')
+    assert engine.option_smart_review(w,d,0,'2030-01-02T16:00:01Z')['state']=='REVIEW_REVERSAL'
+    w['expiry']='2030-01-03'
+    assert engine.option_smart_review(w,d,0,'2030-01-02T16:00:01Z')['state']=='REVIEW_EXPIRY'
+    w['expiry']='2030-01-01'
+    assert engine.option_smart_review(w,d,0,'2030-01-02T16:00:01Z')['state']=='EXPIRED'
