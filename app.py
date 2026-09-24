@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.2.0-all-option-opportunities"
+VERSION = "6.2.1-simple-options-decision"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -4852,7 +4852,7 @@ def _option_contract_status(row: dict[str, Any], direction: dict[str, Any]) -> t
             reasons.append("Delta خارج نطاق المتابعة 0.20–0.85")
 
     ok = not reasons
-    return ("مستوفٍ للفلاتر" if ok else "مراقبة: " + "، ".join(reasons)), ok
+    return ("✅ جاهز للمراجعة" if ok else "⏳ انتظار: " + "، ".join(reasons)), ok
 
 
 def build_all_option_opportunities(symbol: str, max_dte: int = 60) -> dict[str, Any]:
@@ -4920,7 +4920,7 @@ def build_all_option_opportunities(symbol: str, max_dte: int = 60) -> dict[str, 
     }
 
 
-def render_all_option_opportunities(symbol: str) -> None:
+def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
     st.subheader("كل فرص العقود")
     st.caption(
         "يعرض جميع العقود ضمن نافذة الانتهاء التي تختارها، ثم يفصل العقود المستوفية "
@@ -4962,10 +4962,71 @@ def render_all_option_opportunities(symbol: str) -> None:
         ("الفرص المستوفية", str(len(result["opportunities"])), "ok" if result["opportunities"] else "wait"),
     ], "plan-grid")
 
-    if result["status"] != "OK":
-        st.warning(result["status"])
+    # -------------------- simple decision panel --------------------
+    st.markdown("### القرار المبسط")
+    opportunities = result["opportunities"]
 
-    tab1, tab2 = st.tabs(["الفرص المستوفية", "كل العقود"])
+    if result["status"] != "OK":
+        st.error(
+            "🔴 البيانات غير مكتملة — لا تعتمد على هذه الشاشة للدخول الآن. "
+            "سبب الاتصال: " + str(result["status"])
+        )
+    elif not direction.get("setup"):
+        missing = [label for label, ok in direction.get("checks", []) if not ok]
+        st.warning("🟡 انتظار — شروط الأصل لم تكتمل بعد")
+        if missing:
+            st.caption("الناقص الآن: " + " • ".join(missing[:5]))
+    elif not opportunities:
+        st.warning(
+            "🟡 اتجاه الأصل مكتمل، لكن لا يوجد عقد اجتاز فلاتر السيولة والتنفيذ حاليًا. "
+            "انتظر عقدًا ببيانات أفضل بدل اختيار عقد ضعيف."
+        )
+    else:
+        focus = opportunities[0]
+        ask = focus.get("Ask")
+        bid = focus.get("Bid")
+        spread = focus.get("Spread %")
+        iv = focus.get("IV")
+        delta = focus.get("Delta")
+        st.success(
+            f"🟢 شروط النظام مكتملة — يوجد {len(opportunities)} عقد/عقود جاهزة للمراجعة "
+            f"باتجاه {direction.get('bias', '—')}"
+        )
+        st.caption(
+            "هذه إشارة اكتمال قواعد النظام وليست ضمان ربح أو أمر شراء. "
+            "العقد الظاهر أدناه هو أول عقد بعد فرز السيولة، وليس توقعًا بأنه الأعلى ربحًا."
+        )
+        mini_grid([
+            ("العقد", str(focus.get("العقد") or "—"), "ok"),
+            ("النوع", str(focus.get("النوع") or "—"), "ok"),
+            ("Strike", fmt(focus.get("Strike"), 2), ""),
+            ("الانتهاء", str(focus.get("الانتهاء") or "—"), ""),
+            ("DTE", str(focus.get("DTE") or "—"), ""),
+            ("Bid / Ask", f"{fmt(bid, 3)} / {fmt(ask, 3)}", ""),
+            ("Spread", "—" if not finite(spread) else f"{float(spread):.1f}%", "ok" if finite(spread) and float(spread) <= 10 else "wait"),
+            ("Delta", fmt(delta, 3), ""),
+            ("Volume / OI", f"{int(focus.get('Volume') or 0):,} / {int(focus.get('OI') or 0):,}", ""),
+            ("IV", fmt(iv, 3), ""),
+        ], "plan-grid")
+        if finite(budget) and float(budget) > 0 and finite(ask) and float(ask) > 0:
+            est_contract_cost = float(ask) * 100.0
+            max_qty = int(float(budget) // est_contract_cost) if est_contract_cost > 0 else 0
+            st.caption(
+                f"على مضاعف قياسي 100: تكلفة عقد واحد تقريبًا ${est_contract_cost:,.2f} قبل الرسوم "
+                f"• ميزانيتك الحالية تسمح حسابيًا بحد أقصى {max_qty} عقد/عقود. "
+                "تحقق من مضاعف العقد الفعلي قبل التنفيذ."
+            )
+
+        compact_cols = ["العقد", "النوع", "الانتهاء", "DTE", "Strike", "Ask", "Spread %", "Volume", "OI", "Delta", "الحالة"]
+        compact_df = pd.DataFrame(opportunities[:8])
+        st.dataframe(
+            compact_df[[x for x in compact_cols if x in compact_df.columns]],
+            hide_index=True,
+            use_container_width=True,
+            height=min(350, 70 + 35 * len(compact_df)),
+        )
+
+    tab1, tab2 = st.tabs(["✅ الجاهزة للمراجعة", "كل العقود والتفاصيل"])
     with tab1:
         if result["opportunities"]:
             opp_df = pd.DataFrame(result["opportunities"])
@@ -5025,7 +5086,7 @@ def render_options_workspace():
     budget = st.number_input('ميزانية شراء العقود بالدولار — مبلغ تتحمل خسارته كاملًا', min_value=0.0, value=0.0, key='opt_budget')
     st.caption('يعتمد فحص الميزانية على كامل علاوة الشراء، وليس على الوقف فقط. لا يرسل التطبيق أوامر إلى سهم.')
 
-    render_all_option_opportunities(analysis_symbol)
+    render_all_option_opportunities(analysis_symbol, budget=budget)
 
     @st.fragment(run_every=60)
     def smart_panel():
