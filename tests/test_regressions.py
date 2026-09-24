@@ -181,3 +181,62 @@ def test_broker_timestamp_guards(engine):
         quote = {"last": 100, "timestamp": (now + engine.pd.Timedelta(minutes=minutes)).isoformat()}
         assert not engine.broker_quote_state(quote)["ok"]
     assert engine.broker_quote_state({"bid": 100, "ask": 101, "timestamp": now.isoformat()})["ok"]
+
+
+def option_plan(m, kind='Call'):
+    return m.create_option_watch('AAPL', kind, '2030-02-01', 100, 2, 2.2,
+                                 1.5, 3, 4, 1, 100, '2030-01-01')
+
+
+def option_quote(w, bid=2, ask=2.1, timestamp='2030-01-02T16:00:00Z'):
+    return dict(watch_id=w['id'], bid=bid, ask=ask, timestamp=timestamp, source='manual')
+
+
+@pytest.mark.parametrize('kind', ['Call', 'Put'])
+def test_option_entry_then_exit_dedup(engine, kind):
+    m = engine
+    w = option_plan(m, kind)
+    w, events, _ = m.evaluate_option_watch(w, option_quote(w), '2030-01-02T16:00:01Z')
+    assert [e['code'] for e in events] == ['ENTRY']
+    assert not w['entered']  # A price alert must never claim a fill.
+    w, events, _ = m.evaluate_option_watch(w, option_quote(w, timestamp='2030-01-02T16:00:02Z'), '2030-01-02T16:00:03Z')
+    assert not events
+    w['entered'] = True
+    w, events, _ = m.evaluate_option_watch(w, option_quote(w, 3.1, 3.2, '2030-01-02T16:00:04Z'), '2030-01-02T16:00:05Z')
+    assert [e['code'] for e in events] == ['TP1']
+    w, events, _ = m.evaluate_option_watch(w, option_quote(w, 0, .1, '2030-01-02T16:00:06Z'), '2030-01-02T16:00:07Z')
+    assert [e['code'] for e in events] == ['STOP']
+    assert not w['closed']  # No automated execution implied.
+
+
+@pytest.mark.parametrize('patch', [
+    {'watch_id':'other'}, {'timestamp':'2030-01-02T15:00:00Z'},
+    {'timestamp':'2030-01-02T17:00:00Z'}, {'timestamp':'2030-01-02T16:00:00'},
+    {'bid':float('nan')}, {'ask':float('inf')}, {'bid':3, 'ask':2},
+    {'source':'stock-price'}, {'ask':0},
+])
+def test_option_reject_bad_quote(engine, patch):
+    w = option_plan(engine)
+    q = option_quote(w)
+    q.update(patch)
+    updated, events, _ = engine.evaluate_option_watch(w, q, '2030-01-02T16:00:01Z')
+    assert not events
+    assert updated == w
+
+
+def test_option_expiry_and_jump(engine):
+    w = option_plan(engine)
+    expired, events, _ = engine.evaluate_option_watch(w, option_quote(w), '2030-02-02T16:00:01Z')
+    assert not events and expired == w
+    w['entered'] = True
+    w, events, _ = engine.evaluate_option_watch(w, option_quote(w, 4.1, 4.2), '2030-01-02T16:00:01Z')
+    assert [e['code'] for e in events] == ['TP2']
+    w, events, _ = engine.evaluate_option_watch(w, option_quote(w, 3.1, 3.2, '2030-01-02T16:00:02Z'), '2030-01-02T16:00:03Z')
+    assert not events
+
+
+def test_option_invalid_plan(engine):
+    with pytest.raises(ValueError):
+        engine.create_option_watch('AAPL','Put','2030-01-01',100,2,2.2,1.5,3,4,1,100,'2030-01-01')
+    with pytest.raises(ValueError):
+        engine.create_option_watch('AAPL','Put','2030-02-01',100,2,2.2,3,3,4,1,100,'2030-01-01')
