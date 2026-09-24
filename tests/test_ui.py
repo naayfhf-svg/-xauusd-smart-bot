@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-APP=Path(__file__).resolve().parents[1]/'app.py'
+APP=Path(__file__).resolve().parents[1]/'app_core.py'
 
 class Response:
     status_code=200
