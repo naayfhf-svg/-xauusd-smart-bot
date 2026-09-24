@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.5.0-gold-intraday-scalp"
+VERSION = "6.5.1-gold-compact-ui"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -5843,6 +5843,12 @@ instrument = InstrumentSpec(
     max_qty=float(max_qty),
 )
 
+gold_compact_mode = bool(
+    instrument.asset_class == "GOLD"
+    and not advanced_ui
+    and mode != "Live"
+)
+
 ADAPTIVE_PROFILE_CANDIDATES = {
     "صارم": "V410_ADAPTIVE_STRICT",
     "متوازن": "V410_ADAPTIVE_BALANCED",
@@ -6189,20 +6195,27 @@ if bridge:
 
 broker_quote = broker_quote_state(broker_quote_payload)
 
-st.markdown(
-    f"<div class='hero'><div class='kicker'>GOLD AI • X10 MULTI-ASSET TERMINAL</div>"
-    f"<div class='big gold'>{instrument.symbol}</div>"
-    f"<p class='muted'>{instrument.asset_class} • Decision Engine • Risk Engine • Paper/Live Bridge</p>"
-    f"<span class='badge'>v{VERSION}</span></div>",
-    unsafe_allow_html=True,
-)
-
-st.caption(
-    f"X10 v{VERSION} • Gold + U.S. Stocks • Paper Smart AutoPilot • "
-    "market-specific engines • automatic risk control"
-)
-
-render_readiness_panel()
+if gold_compact_mode:
+    st.markdown(
+        f"<div class='hero'><div class='kicker'>⚡ مضاربة الذهب</div>"
+        f"<div class='big gold'>{instrument.symbol}</div>"
+        f"<p class='muted'>قرار واضح • دخول • وقف • هدف • خطر</p>"
+        f"<span class='badge'>v{VERSION}</span></div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f"<div class='hero'><div class='kicker'>GOLD AI • X10 MULTI-ASSET TERMINAL</div>"
+        f"<div class='big gold'>{instrument.symbol}</div>"
+        f"<p class='muted'>{instrument.asset_class} • Decision Engine • Risk Engine • Paper/Live Bridge</p>"
+        f"<span class='badge'>v{VERSION}</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"X10 v{VERSION} • Gold + U.S. Stocks • Paper Smart AutoPilot • "
+        "market-specific engines • automatic risk control"
+    )
+    render_readiness_panel()
 
 if instrument.asset_class == "STOCK":
     st.info(
@@ -6210,7 +6223,7 @@ if instrument.asset_class == "STOCK":
         "والتذبذب تلقائيًا. رموز القائمة لا تُعتبر فحصًا شرعيًا بحد ذاتها؛ "
         "الفحص الشرعي يحتاج مصدرًا محدثًا منفصلًا."
     )
-elif instrument.asset_class == "GOLD":
+elif instrument.asset_class == "GOLD" and not gold_compact_mode:
     if gold_buy_validation_passed():
         st.success(
             "✅ مسار شراء الذهب اجتاز بوابة التحقق BUY-only في هذه الجلسة. "
@@ -6244,16 +6257,17 @@ elif data_status != "OK":
 quality = data_quality(raw)
 quote = fetch_quote(instrument.symbol)
 feed = feed_integrity(raw, quote)
-with st.expander("فحص اتصال الأسعار والتنفيذ", expanded=not feed.get("execution_ok", False)):
-    if feed.get("execution_ok", False):
-        st.success("اجتازت بيانات السوق فحص الحداثة والسلامة لهذه الدورة. هذا لا يفعّل التداول الحقيقي.")
-    else:
-        for reason in feed.get("execution_reasons", []):
-            st.warning(reason)
-    quote_time, _ = quote_timestamp(quote)
-    if quote_time is not None:
-        st.caption(f"وقت سعر المصدر: {quote_time.tz_convert(TZ).isoformat()}")
-    st.caption("فحص البيانات مستقل عن وجود المفتاح وعن شروط وسيط التنفيذ.")
+if not gold_compact_mode:
+    with st.expander("فحص اتصال الأسعار والتنفيذ", expanded=not feed.get("execution_ok", False)):
+        if feed.get("execution_ok", False):
+            st.success("اجتازت بيانات السوق فحص الحداثة والسلامة لهذه الدورة. هذا لا يفعّل التداول الحقيقي.")
+        else:
+            for reason in feed.get("execution_reasons", []):
+                st.warning(reason)
+        quote_time, _ = quote_timestamp(quote)
+        if quote_time is not None:
+            st.caption(f"وقت سعر المصدر: {quote_time.tz_convert(TZ).isoformat()}")
+        st.caption("فحص البيانات مستقل عن وجود المفتاح وعن شروط وسيط التنفيذ.")
 reference_price = (
     float(quote["last"])
     if quote.get("connected") and finite(quote.get("last"))
@@ -6302,7 +6316,7 @@ if instrument.asset_class == "GOLD":
 
 analysis = analyze_mtf(raw)
 
-if instrument.asset_class == "GOLD":
+if instrument.asset_class == "GOLD" and not gold_compact_mode:
     st.markdown("### تحقق شراء الذهب")
     _buy_validation = st.session_state.get("gold_buy_validation")
     if isinstance(_buy_validation, dict) and _buy_validation.get("ok"):
@@ -6584,17 +6598,18 @@ if (
     _display_signal = "شراء غير معتمد"
     _display_signal_state = "wait"
 
-mini_grid(
-    [
-        ("السعر", fmt(reference_price, 4), ""),
-        ("القرار", _display_signal, _display_signal_state),
-        ("القوة", f"{execution_analysis['strength']}%", ""),
-        ("بيانات التنفيذ", execution_label, execution_state),
-        ("التداول الحقيقي", "مفتوح" if live_unlocked else "مقفل", "ok" if live_unlocked else "wait"),
-        ("قفل الأمان", "مفعل" if st.session_state.kill_switch else "غير مفعل", "wait" if st.session_state.kill_switch else "ok"),
-    ],
-    "status-grid",
-)
+if not gold_compact_mode:
+    mini_grid(
+        [
+            ("السعر", fmt(reference_price, 4), ""),
+            ("القرار", _display_signal, _display_signal_state),
+            ("القوة", f"{execution_analysis['strength']}%", ""),
+            ("بيانات التنفيذ", execution_label, execution_state),
+            ("التداول الحقيقي", "مفتوح" if live_unlocked else "مقفل", "ok" if live_unlocked else "wait"),
+            ("قفل الأمان", "مفعل" if st.session_state.kill_switch else "غير مفعل", "wait" if st.session_state.kill_switch else "ok"),
+        ],
+        "status-grid",
+    )
 
 c_refresh1, c_refresh2 = st.columns(2)
 with c_refresh1:
@@ -6839,15 +6854,16 @@ event_display = (
     else ("جاهز" if forward_analysis.get("event_ok") else "بانتظار حدث الدخول")
 )
 
-st.markdown(
-    f"<div class='card'><div class='kicker'>قرار Paper</div>"
-    f"<div class='big {forward_signal_class}'>{forward_display}</div>"
-    f"<p>{forward_analysis.get('reason','')}</p>"
-    f"<div class='muted'>{candidate_display} • "
-    f"الجاهزية {int(forward_analysis.get('readiness_pct',0))}% • "
-    f"{event_display}</div></div>",
-    unsafe_allow_html=True,
-)
+if not gold_compact_mode:
+    st.markdown(
+        f"<div class='card'><div class='kicker'>قرار Paper</div>"
+        f"<div class='big {forward_signal_class}'>{forward_display}</div>"
+        f"<p>{forward_analysis.get('reason','')}</p>"
+        f"<div class='muted'>{candidate_display} • "
+        f"الجاهزية {int(forward_analysis.get('readiness_pct',0))}% • "
+        f"{event_display}</div></div>",
+        unsafe_allow_html=True,
+    )
 
 forward_gate_cards = [
     (
@@ -6879,7 +6895,8 @@ if instrument.asset_class == "STOCK":
             "ok" if forward_analysis.get("volume_ok") else "wait",
         )
     )
-mini_grid(forward_gate_cards, "tf-grid")
+if not gold_compact_mode:
+    mini_grid(forward_gate_cards, "tf-grid")
 
 if near_entry:
     st.warning(
@@ -6912,33 +6929,34 @@ if near_entry:
         st.toast("قريب من الدخول: باقي حدث الدخول فقط", icon="🟡")
 
 # ---------------------------- chart ---------------------------
-chart_df = raw.tail(288)[["datetime", "close"]].copy()
-chart_min = float(chart_df["close"].min())
-chart_max = float(chart_df["close"].max())
-chart_span = max(chart_max - chart_min, max(abs(reference_price) * 0.00005, 1e-6))
-chart_pad = chart_span * 0.14
+if not gold_compact_mode:
+    chart_df = raw.tail(288)[["datetime", "close"]].copy()
+    chart_min = float(chart_df["close"].min())
+    chart_max = float(chart_df["close"].max())
+    chart_span = max(chart_max - chart_min, max(abs(reference_price) * 0.00005, 1e-6))
+    chart_pad = chart_span * 0.14
 
-price_chart = (
-    alt.Chart(chart_df)
-    .mark_line(strokeWidth=2)
-    .encode(
-        x=alt.X("datetime:T", title=None, axis=alt.Axis(labelOverlap=True, grid=False)),
-        y=alt.Y(
-            "close:Q",
-            title=None,
-            scale=alt.Scale(zero=False, domain=[chart_min - chart_pad, chart_max + chart_pad]),
-            axis=alt.Axis(format=",.2f"),
-        ),
-        tooltip=[
-            alt.Tooltip("datetime:T", title="Time"),
-            alt.Tooltip("close:Q", title="Close", format=",.4f"),
-        ],
+    price_chart = (
+        alt.Chart(chart_df)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("datetime:T", title=None, axis=alt.Axis(labelOverlap=True, grid=False)),
+            y=alt.Y(
+                "close:Q",
+                title=None,
+                scale=alt.Scale(zero=False, domain=[chart_min - chart_pad, chart_max + chart_pad]),
+                axis=alt.Axis(format=",.2f"),
+            ),
+            tooltip=[
+                alt.Tooltip("datetime:T", title="Time"),
+                alt.Tooltip("close:Q", title="Close", format=",.4f"),
+            ],
+        )
+        .properties(height=285)
     )
-    .properties(height=285)
-)
-st.markdown("<div class='chart-wrap'>", unsafe_allow_html=True)
-st.altair_chart(price_chart, use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<div class='chart-wrap'>", unsafe_allow_html=True)
+    st.altair_chart(price_chart, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------- decision diagnostics -----------------
 diag_analysis = forward_analysis if instrument.asset_class == "STOCK" else analysis
@@ -6976,15 +6994,16 @@ if instrument.asset_class == "STOCK":
         ]
     )
 
-with st.expander("لماذا هذا القرار؟", expanded=False):
-    for label, value, passed in diag_rows:
-        state = "state-ok" if passed else "state-wait"
-        icon = "✓" if passed else "•"
-        st.markdown(
-            f"<div class='gate-row'><div>{label}</div>"
-            f"<div class='{state}'>{icon} {value}</div></div>",
-            unsafe_allow_html=True,
-        )
+if not gold_compact_mode:
+    with st.expander("لماذا هذا القرار؟", expanded=False):
+        for label, value, passed in diag_rows:
+            state = "state-ok" if passed else "state-wait"
+            icon = "✓" if passed else "•"
+            st.markdown(
+                f"<div class='gate-row'><div>{label}</div>"
+                f"<div class='{state}'>{icon} {value}</div></div>",
+                unsafe_allow_html=True,
+            )
 
 # ----------------------- analysis trade plan ------------------
 paper_plan: dict[str, Any] | None = None
@@ -7012,27 +7031,109 @@ if execution_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
     except ValueError as exc:
         st.warning(f"لا يمكن بناء خطة بالحجم الحالي: {exc}")
 
-if instrument.asset_class == "GOLD" and bool(st.session_state.get("gold_intraday_mode", True)):
-    st.info(
-        "⚡ وضع المضاربة السريعة مفعّل: القرار يعتمد على M5/M15/H1 ويبحث عن فرص أقصر. "
-        "هذا الوضع تجريبي/Paper للمراجعة ولا يفتح تداول Live تلقائيًا."
-    )
+if not gold_compact_mode:
+    if instrument.asset_class == "GOLD" and bool(st.session_state.get("gold_intraday_mode", True)):
+        st.info(
+            "⚡ وضع المضاربة السريعة مفعّل: القرار يعتمد على M5/M15/H1 ويبحث عن فرص أقصر. "
+            "هذا الوضع تجريبي/Paper للمراجعة ولا يفتح تداول Live تلقائيًا."
+        )
 
-if paper_plan:
-    st.subheader("خطة الصفقة — تحليل / تجريبي")
+    if paper_plan:
+        st.subheader("خطة الصفقة — تحليل / تجريبي")
+        mini_grid(
+            [
+                ("الاتجاه", signal_ar(paper_plan["side"]), "ok"),
+                ("الكمية", fmt(paper_plan["qty"], 6), ""),
+                ("الدخول", fmt(paper_plan["entry_reference"], 4), ""),
+                ("وقف الخسارة", fmt(paper_plan["stop_loss"], 4), "bad"),
+                ("الهدف الأول", fmt(paper_plan["take_profit_1"], 4), "ok"),
+                ("الهدف الثاني", fmt(paper_plan["take_profit_2"], 4), "ok"),
+                ("المخاطرة المقدرة", "$" + fmt(paper_plan["estimated_risk"], 2), "wait"),
+                ("المخاطرة الفعلية %", fmt(paper_plan["actual_risk_pct"], 3) + "%", "ok"),
+            ],
+            "plan-grid",
+        )
+
+if gold_compact_mode:
+    _p = st.session_state.get("paper_position")
+    if _p and str(_p.get("symbol")) == instrument.symbol:
+        _q_decision = "داخل " + signal_ar(_p.get("side"))
+        _q_state = "ok"
+        _q_entry = fmt(_p.get("entry"), 3)
+        _q_stop = fmt(_p.get("stop"), 3)
+        _q_target = f"{fmt(_p.get('tp1'), 3)} / {fmt(_p.get('tp2'), 3)}"
+        _q_risk = "$" + fmt(_p.get("risk_money"), 2)
+        _q_reason = "صفقة تجريبية مفتوحة — راقب الوقف والهدف."
+    else:
+        _q_signal = execution_analysis.get("signal", "WAIT")
+        if _q_signal == "BUY" and not gold_buy_validation_passed():
+            _q_signal = "WAIT"
+            _q_reason = "شراء الذهب ينتظر اكتمال فحص الشراء."
+        else:
+            _q_reason = str(execution_analysis.get("reason") or "")
+        _q_decision = signal_ar(_q_signal)
+        _q_state = "ok" if _q_signal in {"BUY", "SELL"} else "wait"
+        _q_entry = fmt(paper_plan.get("entry_reference"), 3) if paper_plan else "—"
+        _q_stop = fmt(paper_plan.get("stop_loss"), 3) if paper_plan else "—"
+        _q_target = (
+            f"{fmt(paper_plan.get('take_profit_1'), 3)} / {fmt(paper_plan.get('take_profit_2'), 3)}"
+            if paper_plan else "—"
+        )
+        _q_risk = f"{fmt(paper_plan.get('actual_risk_pct'), 3)}%" if paper_plan else "لا صفقة"
+
+    st.markdown("### القرار السريع")
     mini_grid(
         [
-            ("الاتجاه", signal_ar(paper_plan["side"]), "ok"),
-            ("الكمية", fmt(paper_plan["qty"], 6), ""),
-            ("الدخول", fmt(paper_plan["entry_reference"], 4), ""),
-            ("وقف الخسارة", fmt(paper_plan["stop_loss"], 4), "bad"),
-            ("الهدف الأول", fmt(paper_plan["take_profit_1"], 4), "ok"),
-            ("الهدف الثاني", fmt(paper_plan["take_profit_2"], 4), "ok"),
-            ("المخاطرة المقدرة", "$" + fmt(paper_plan["estimated_risk"], 2), "wait"),
-            ("المخاطرة الفعلية %", fmt(paper_plan["actual_risk_pct"], 3) + "%", "ok"),
+            ("القرار", _q_decision, _q_state),
+            ("السعر الآن", fmt(reference_price, 3), ""),
+            ("الدخول", _q_entry, "ok" if paper_plan or _p else "wait"),
+            ("الخروج / الوقف", _q_stop, "bad" if paper_plan or _p else "wait"),
+            ("الهدف 1 / 2", _q_target, "ok" if paper_plan or _p else "wait"),
+            ("الخطر", _q_risk, "wait"),
         ],
-        "plan-grid",
+        "status-grid",
     )
+    st.caption(_q_reason or "بانتظار فرصة مكتملة.")
+
+    _src_ok = bool(isinstance(gold_consensus, dict) and gold_consensus.get("ok"))
+    _src_n = int((gold_consensus or {}).get("fresh_sources", 0))
+    st.caption(
+        f"الأمان: البيانات {'جاهزة' if feed.get('execution_ok') else 'محجوبة'} • "
+        f"المصادر {_src_n}/2 {'✓' if _src_ok else '✕'} • "
+        f"فحص الشراء {'✓' if gold_buy_validation_passed() else 'لم يكتمل'}"
+    )
+    if st.button("🔄 تحديث الآن", use_container_width=True, key="gold_quick_refresh"):
+        fetch_market.clear()
+        fetch_quote.clear()
+        fetch_goldapi_quote.clear()
+        st.rerun()
+
+    with st.expander("تفاصيل إضافية", expanded=False):
+        mini_grid(
+            [
+                ("قوة الإشارة", f"{int(execution_analysis.get('strength', 0))}%", ""),
+                ("البيانات", "جاهزة" if feed.get("execution_ok") else "محجوبة", "ok" if feed.get("execution_ok") else "bad"),
+                ("المصادر", "مؤكدة" if _src_ok else "غير مؤكدة", "ok" if _src_ok else "bad"),
+                ("فحص الشراء", "ناجح" if gold_buy_validation_passed() else "لم يكتمل", "ok" if gold_buy_validation_passed() else "wait"),
+            ],
+            "tf-grid",
+        )
+        if not gold_buy_validation_passed():
+            if st.button("فحص شراء الذهب — 180 يوم", use_container_width=True, key="gold_quick_validation"):
+                with st.status("جاري الفحص...", expanded=False) as _s:
+                    try:
+                        _r = run_gold_buy_validation(instrument, risk_pct=float(risk_pct), history_days=180)
+                        st.session_state.gold_buy_validation = _r
+                        if _r.get("ok") and (_r.get("gate") or {}).get("passed"):
+                            _s.update(label="نجح فحص الشراء", state="complete")
+                        else:
+                            _s.update(label="فحص الشراء لم يجتز الشروط", state="error")
+                    except Exception as exc:
+                        _s.update(label="تعذر الفحص", state="error")
+                        st.error(str(exc))
+                st.rerun()
+        if not _src_ok:
+            st.caption("يلزم مصدر سعر ثانٍ حديث قبل اعتماد دخول الذهب.")
 
 # ------------------------- compact status ----------------------
 mini_grid(
