@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.4.0-gold-consensus-buy-validation"
+VERSION = "6.4.1-gold-entry-hardening"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -904,6 +904,31 @@ def fetch_goldapi_quote() -> dict[str, Any]:
         "timestamp": ts,
         "request_latency_ms": latency_ms,
         "raw": payload,
+    }
+
+
+def gold_entry_data_gate(
+    frame: pd.DataFrame,
+    consensus: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Gold entry freshness guard: consensus + no more than one stale M5 update."""
+    reasons: list[str] = []
+    if not isinstance(consensus, dict) or not consensus.get("ok"):
+        reasons.append("تأكيد السعر من مصدرين غير مكتمل")
+
+    bar_age_sec = None
+    if frame.empty:
+        reasons.append("لا توجد شموع M5")
+    else:
+        last_bar_end = pd.Timestamp(frame.iloc[-1]["datetime"]) + pd.Timedelta(minutes=5)
+        bar_age_sec = max(0.0, (now_utc() - last_bar_end).total_seconds())
+        if bar_age_sec > 390.0:
+            reasons.append(f"آخر شمعة M5 قديمة ({bar_age_sec:.1f} ثانية)")
+
+    return {
+        "ok": not reasons,
+        "bar_age_sec": bar_age_sec,
+        "reasons": reasons,
     }
 
 
@@ -4330,6 +4355,9 @@ def run_gold_buy_validation(
     )
     return {
         "ok": True,
+        "schema": GOLD_BUY_VALIDATION_SCHEMA,
+        "symbol": spec.symbol,
+        "risk_pct": float(risk_pct),
         "context": context,
         "variant": "BUY_ONLY",
         "history_meta": history_meta,
@@ -5809,6 +5837,7 @@ ADAPTIVE_PROFILE_CANDIDATES = {
 }
 ADAPTIVE_CANDIDATES = set(ADAPTIVE_PROFILE_CANDIDATES.values())
 GOLD_BUY_CANDIDATE = "BUY_STRICT_VALIDATED"
+GOLD_BUY_VALIDATION_SCHEMA = "BUY_STRICT_MTF_B2_V1"
 SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES | {GOLD_BUY_CANDIDATE}
 
 def gold_buy_validation_passed() -> bool:
@@ -5816,7 +5845,18 @@ def gold_buy_validation_passed() -> bool:
     if not isinstance(validation, dict):
         return False
     gate = validation.get("gate") or {}
-    return bool(gate.get("passed"))
+    if not gate.get("passed"):
+        return False
+    if validation.get("schema") != GOLD_BUY_VALIDATION_SCHEMA:
+        return False
+    if str(validation.get("symbol", "")).upper() != str(instrument.symbol).upper():
+        return False
+    try:
+        if abs(float(validation.get("risk_pct")) - float(risk_pct)) > 1e-9:
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def analyze_gold_buy_candidate(raw_df: pd.DataFrame) -> dict[str, Any]:
@@ -6254,19 +6294,18 @@ execution_analysis = (
     else analysis
 )
 
-if (
-    instrument.asset_class == "GOLD"
-    and (not isinstance(gold_consensus, dict) or not gold_consensus.get("ok"))
-    and execution_analysis.get("signal") in {"BUY", "SELL"}
-):
-    execution_analysis = {
-        **execution_analysis,
-        "signal": "WAIT",
-        "reason": (
-            "تم حجب إشارة الذهب: نحتاج توافق مصدرين حديثين على الأقل "
-            "واختلاف سعر لا يتجاوز 0.20%"
-        ),
-    }
+gold_entry_gate = None
+if instrument.asset_class == "GOLD":
+    gold_entry_gate = gold_entry_data_gate(raw, gold_consensus)
+    if (
+        not gold_entry_gate.get("ok")
+        and execution_analysis.get("signal") in {"BUY", "SELL"}
+    ):
+        execution_analysis = {
+            **execution_analysis,
+            "signal": "WAIT",
+            "reason": "تم حجب إشارة الذهب: " + "، ".join(gold_entry_gate.get("reasons", [])),
+        }
 
 candle_id = str(raw["datetime"].iloc[-1])
 research_context = hashlib.sha256(
@@ -6315,8 +6354,7 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
             st.session_state.last_alert_candle[instrument.symbol] = alert_key
             asset_label = "الذهب" if instrument.asset_class == "GOLD" else instrument.symbol
 
-            # Gold AutoPilot research path is currently sell-side only.
-            # Do not convert an unvalidated baseline BUY into an actionable alert.
+            # BUY alerts remain blocked unless the dedicated BUY validation context is valid.
             if (
                 instrument.asset_class == "GOLD"
                 and execution_analysis["signal"] == "BUY"
@@ -6849,17 +6887,17 @@ if execution_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
         st.warning(f"لا يمكن بناء خطة بالحجم الحالي: {exc}")
 
 if paper_plan:
-    st.subheader("Trade Plan — Analysis/Paper")
+    st.subheader("خطة الصفقة — تحليل / تجريبي")
     mini_grid(
         [
-            ("Side", paper_plan["side"], "ok"),
-            ("Qty", fmt(paper_plan["qty"], 6), ""),
-            ("Entry", fmt(paper_plan["entry_reference"], 4), ""),
-            ("SL", fmt(paper_plan["stop_loss"], 4), "bad"),
-            ("TP1", fmt(paper_plan["take_profit_1"], 4), "ok"),
-            ("TP2", fmt(paper_plan["take_profit_2"], 4), "ok"),
-            ("Est. Risk", "$" + fmt(paper_plan["estimated_risk"], 2), "wait"),
-            ("Actual Risk %", fmt(paper_plan["actual_risk_pct"], 3) + "%", "ok"),
+            ("الاتجاه", signal_ar(paper_plan["side"]), "ok"),
+            ("الكمية", fmt(paper_plan["qty"], 6), ""),
+            ("الدخول", fmt(paper_plan["entry_reference"], 4), ""),
+            ("وقف الخسارة", fmt(paper_plan["stop_loss"], 4), "bad"),
+            ("الهدف الأول", fmt(paper_plan["take_profit_1"], 4), "ok"),
+            ("الهدف الثاني", fmt(paper_plan["take_profit_2"], 4), "ok"),
+            ("المخاطرة المقدرة", "$" + fmt(paper_plan["estimated_risk"], 2), "wait"),
+            ("المخاطرة الفعلية %", fmt(paper_plan["actual_risk_pct"], 3) + "%", "ok"),
         ],
         "plan-grid",
     )
@@ -6952,8 +6990,17 @@ if mode == "Paper":
         if not feed.get("execution_ok", False):
             p_gate_ok = False
             p_gate_reasons.append(
-                "Execution Feed غير جاهز؛ لا يتم فتح Paper على سعر قديم/غير قابل للتحقق"
+                "بيانات التنفيذ غير جاهزة؛ لا يتم فتح صفقة على سعر قديم أو غير قابل للتحقق"
             )
+        if instrument.asset_class == "GOLD":
+            if not isinstance(gold_entry_gate, dict) or not gold_entry_gate.get("ok"):
+                p_gate_ok = False
+                p_gate_reasons.extend(
+                    (gold_entry_gate or {}).get("reasons", ["تأكيد مصادر الذهب غير مكتمل"])
+                )
+            if paper_plan.get("side") == "BUY" and not gold_buy_validation_passed():
+                p_gate_ok = False
+                p_gate_reasons.append("شراء الذهب مقفل حتى يجتاز اختبار BUY-only المستقل")
 
         # Stock execution-quality brakes before the generic adaptive brakes.
         if instrument.asset_class == "STOCK":
@@ -7043,17 +7090,17 @@ if mode == "Paper":
                 [
                     (
                         "صارم",
-                        f"{int((auto_eval.get('صارم') or {}).get('readiness',0))}% • {(auto_eval.get('صارم') or {}).get('signal','WAIT')}",
+                        f"{int((auto_eval.get('صارم') or {}).get('readiness',0))}% • {signal_ar((auto_eval.get('صارم') or {}).get('signal','WAIT'))}",
                         "ok" if (auto_eval.get("صارم") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                     (
                         "متوازن",
-                        f"{int((auto_eval.get('متوازن') or {}).get('readiness',0))}% • {(auto_eval.get('متوازن') or {}).get('signal','WAIT')}",
+                        f"{int((auto_eval.get('متوازن') or {}).get('readiness',0))}% • {signal_ar((auto_eval.get('متوازن') or {}).get('signal','WAIT'))}",
                         "ok" if (auto_eval.get("متوازن") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                     (
                         "مرن",
-                        f"{int((auto_eval.get('مرن') or {}).get('readiness',0))}% • {(auto_eval.get('مرن') or {}).get('signal','WAIT')}",
+                        f"{int((auto_eval.get('مرن') or {}).get('readiness',0))}% • {signal_ar((auto_eval.get('مرن') or {}).get('signal','WAIT'))}",
                         "ok" if (auto_eval.get("مرن") or {}).get("signal") in {"BUY", "SELL"} else "wait",
                     ),
                 ],
@@ -8517,6 +8564,9 @@ if advanced_ui:
         {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
         {"Component": "Paper engine", "Status": "ONLINE"},
         {"Component": "Stock Smart Engine", "Status": "ONLINE" if instrument.asset_class == "STOCK" else "STANDBY"},
+        {"Component": "Gold second source", "Status": "ONLINE" if secret("GOLDAPI_KEY") else ("BROKER" if broker_quote.get("ok") else "NOT CONFIGURED")},
+        {"Component": "Gold source consensus", "Status": "PASS" if ((st.session_state.get("gold_consensus_snapshot") or {}).get("ok")) else "BLOCKED"},
+        {"Component": "Gold BUY validation", "Status": "PASS" if gold_buy_validation_passed() else "LOCKED"},
         {"Component": "Stock scanner", "Status": "AUTO" if st.session_state.get("stock_auto_scan", False) else "MANUAL"},
         {"Component": "Paper persistence", "Status": "ACTIVE"},
         {"Component": "Order idempotency", "Status": "ACTIVE"},
@@ -8652,16 +8702,23 @@ if st.session_state.auto_refresh:
             else:
                 hb_analysis = analyze_forward_candidate(hb_raw, hb_active_candidate)
 
-            if (
-                instrument.asset_class == "GOLD"
-                and hb_analysis.get("signal") in {"BUY", "SELL"}
-                and (not isinstance(hb_gold_consensus, dict) or not hb_gold_consensus.get("ok"))
-            ):
-                hb_analysis = {
-                    **hb_analysis,
-                    "signal": "WAIT",
-                    "reason": "Heartbeat: إشارة الذهب محجوبة حتى يتفق مصدران حديثان",
-                }
+            if instrument.asset_class == "GOLD":
+                _hb_gold_gate = gold_entry_data_gate(hb_raw, hb_gold_consensus)
+                if (
+                    hb_analysis.get("signal") in {"BUY", "SELL"}
+                    and not _hb_gold_gate.get("ok")
+                ):
+                    hb_analysis = {
+                        **hb_analysis,
+                        "signal": "WAIT",
+                        "reason": "نبض الذهب: " + "، ".join(_hb_gold_gate.get("reasons", [])),
+                    }
+                if hb_analysis.get("signal") == "BUY" and not gold_buy_validation_passed():
+                    hb_analysis = {
+                        **hb_analysis,
+                        "signal": "WAIT",
+                        "reason": "نبض الذهب: شراء BUY-only لم يجتز بوابة التحقق",
+                    }
 
             hb_m5 = hb_analysis.get("snapshots", {}).get("M5")
             hb_candle = str(hb_raw["datetime"].iloc[-1])
