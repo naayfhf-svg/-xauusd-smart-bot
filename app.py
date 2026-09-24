@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.5.1-gold-compact-ui"
+VERSION = "6.5.2-gold-clean-screen"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -6251,7 +6251,7 @@ if raw.empty:
             "وسيعاود المحرك الطلب تلقائيًا بعد تجدد رصيد الدقيقة."
         )
     st.stop()
-elif data_status != "OK":
+elif data_status != "OK" and not gold_compact_mode:
     st.warning(data_status)
 
 quality = data_quality(raw)
@@ -6612,37 +6612,38 @@ if not gold_compact_mode:
         "status-grid",
     )
 
-c_refresh1, c_refresh2 = st.columns(2)
-with c_refresh1:
-    if st.button("تحديث البيانات الآن", use_container_width=True):
-        fetch_market.clear()
-        fetch_quote.clear()
-        st.rerun()
-with c_refresh2:
-    if st.button("مسح كاش التاريخ", use_container_width=True):
-        fetch_long_history.clear()
-        st.session_state.backtest = None
-        st.session_state.research_gate = {
-            "passed": False,
-            "context": None,
-            "rules": [],
-            "reasons": ["تم مسح كاش التاريخ؛ أعد Final Research Audit"],
-        }
-        st.rerun()
+if not gold_compact_mode:
+    c_refresh1, c_refresh2 = st.columns(2)
+    with c_refresh1:
+        if st.button("تحديث البيانات الآن", use_container_width=True):
+            fetch_market.clear()
+            fetch_quote.clear()
+            st.rerun()
+    with c_refresh2:
+        if st.button("مسح كاش التاريخ", use_container_width=True):
+            fetch_long_history.clear()
+            st.session_state.backtest = None
+            st.session_state.research_gate = {
+                "passed": False,
+                "context": None,
+                "rules": [],
+                "reasons": ["تم مسح كاش التاريخ؛ أعد Final Research Audit"],
+            }
+            st.rerun()
 
-if not feed.get("trusted", False):
-    st.error("فحص بنية بيانات السوق لم ينجح. تم حجب أي إشارة تنفيذية.")
-    for reason in feed.get("structural_reasons", []):
-        st.caption("• " + reason)
-elif instrument.asset_class == "STOCK" and stock_market_closed:
-    st.info("السوق الأمريكي مغلق الآن. التحليل يبقى ظاهرًا، والتنفيذ والماسح الثقيل متوقفان تلقائيًا حتى الجلسة.")
-    if advanced_ui:
+    if not feed.get("trusted", False):
+        st.error("فحص بنية بيانات السوق لم ينجح. تم حجب أي إشارة تنفيذية.")
+        for reason in feed.get("structural_reasons", []):
+            st.caption("• " + reason)
+    elif instrument.asset_class == "STOCK" and stock_market_closed:
+        st.info("السوق الأمريكي مغلق الآن. التحليل يبقى ظاهرًا، والتنفيذ والماسح الثقيل متوقفان تلقائيًا حتى الجلسة.")
+        if advanced_ui:
+            for reason in feed.get("execution_reasons", []):
+                st.caption("• " + reason)
+    elif not feed.get("execution_ok", False):
+        st.warning("السوق يفترض أنه مفتوح، لكن سعر التنفيذ غير جاهز أو قديم. تم حجب أي دخول حتى تتحدث البيانات.")
         for reason in feed.get("execution_reasons", []):
             st.caption("• " + reason)
-elif not feed.get("execution_ok", False):
-    st.warning("السوق يفترض أنه مفتوح، لكن سعر التنفيذ غير جاهز أو قديم. تم حجب أي دخول حتى تتحدث البيانات.")
-    for reason in feed.get("execution_reasons", []):
-        st.caption("• " + reason)
 
 # ------------------------- smart stock desk --------------------
 if instrument.asset_class == "STOCK":
@@ -7138,36 +7139,37 @@ if gold_compact_mode:
             st.caption("يلزم مصدر سعر ثانٍ حديث قبل اعتماد دخول الذهب.")
 
 # ------------------------- compact status ----------------------
-mini_grid(
-    [
-        (
-            "السوق",
-            "مفتوح" if feed.get("market_open") else "مغلق" if feed.get("market_open") is not None else "غير معروف",
-            "ok" if feed.get("market_open") else "wait",
-        ),
-        (
-            "بيانات التنفيذ",
-            "جاهزة" if feed.get("execution_ok") else "محجوبة",
-            "ok" if feed.get("execution_ok") else "bad",
-        ),
-        ("الحفظ", "مفعّل", "ok"),
-        (
-            "التلقائي",
-            "مفعّل" if st.session_state.auto_paper else "متوقف",
-            "ok" if st.session_state.auto_paper else "wait",
-        ),
-        (
-            "نمط الدخول",
+if not gold_compact_mode:
+    mini_grid(
+        [
             (
-                adaptive_profile
-                if active_candidate in SMART_PAPER_CANDIDATES
-                else "محافظ"
+                "السوق",
+                "مفتوح" if feed.get("market_open") else "مغلق" if feed.get("market_open") is not None else "غير معروف",
+                "ok" if feed.get("market_open") else "wait",
             ),
-            "wait" if active_candidate in SMART_PAPER_CANDIDATES else "ok",
-        ),
-    ],
-    "status-grid",
-)
+            (
+                "بيانات التنفيذ",
+                "جاهزة" if feed.get("execution_ok") else "محجوبة",
+                "ok" if feed.get("execution_ok") else "bad",
+            ),
+            ("الحفظ", "مفعّل", "ok"),
+            (
+                "التلقائي",
+                "مفعّل" if st.session_state.auto_paper else "متوقف",
+                "ok" if st.session_state.auto_paper else "wait",
+            ),
+            (
+                "نمط الدخول",
+                (
+                    adaptive_profile
+                    if active_candidate in SMART_PAPER_CANDIDATES
+                    else "محافظ"
+                ),
+                "wait" if active_candidate in SMART_PAPER_CANDIDATES else "ok",
+            ),
+        ],
+        "status-grid",
+    )
 
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
