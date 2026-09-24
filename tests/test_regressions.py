@@ -163,3 +163,21 @@ def test_storage_failure_restores_memory(engine,monkeypatch):
     assert m.st.session_state.paper_position is None
     assert m.st.session_state.paper_trades_today == 0
     assert 'failed' not in m.st.session_state.paper_order_keys
+
+
+@pytest.mark.parametrize("values", [
+    {"last": 0}, {"last": -1}, {"last": float("inf")},
+    {"bid": -1, "ask": 2}, {"bid": 101, "ask": 100, "last": 100},
+    {"bid": 100, "last": 100},
+])
+def test_broker_invalid_prices_fail_closed(engine, values):
+    quote = {"timestamp": engine.now_utc().isoformat(), **values}
+    assert not engine.broker_quote_state(quote)["ok"]
+
+
+def test_broker_timestamp_guards(engine):
+    now = engine.now_utc()
+    for minutes in [-10, 10]:
+        quote = {"last": 100, "timestamp": (now + engine.pd.Timedelta(minutes=minutes)).isoformat()}
+        assert not engine.broker_quote_state(quote)["ok"]
+    assert engine.broker_quote_state({"bid": 100, "ask": 101, "timestamp": now.isoformat()})["ok"]
