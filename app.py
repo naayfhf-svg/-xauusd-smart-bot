@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.4.1-gold-entry-hardening"
+VERSION = "6.5.0-gold-intraday-scalp"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -362,6 +362,7 @@ PERSIST_KEYS = (
     "auto_paper",
     "forward_candidate",
     "adaptive_profile_choice",
+    "gold_intraday_mode",
     "stock_favorites",
     "stock_scan_cache",
     "stock_scan_cursor",
@@ -562,6 +563,7 @@ def init_state() -> None:
         "fresh_holdout": None,
         "forward_candidate": "V47_B2_VOL",
         "adaptive_profile_choice": "ذكي تلقائي",
+        "gold_intraday_mode": True,
         "stock_favorites": [],
         "stock_scan_cache": {},
         "stock_scan_cursor": 0,
@@ -5747,6 +5749,17 @@ st.session_state.adaptive_profile_choice = st.sidebar.selectbox(
     help="ذكي تلقائي يقارن الأنماط بنفسه. لا تحتاج ضبط ADX أو التذبذب أو المخاطرة يدويًا.",
 )
 
+if base_spec.asset_class == "GOLD":
+    st.sidebar.markdown("### ⚡ الذهب")
+    st.session_state.gold_intraday_mode = st.sidebar.toggle(
+        "مضاربة سريعة",
+        value=bool(st.session_state.get("gold_intraday_mode", True)),
+        help=(
+            "محرك مستقل للمضاربة اليومية على M5/M15/H1. "
+            "لا يفتح Live تلقائيًا، ويظل خاضعًا لتأكيد مصادر السعر وبوابات المخاطر."
+        ),
+    )
+
 if base_spec.asset_class == "STOCK":
     st.sidebar.markdown("### 📈 الأسهم")
     st.session_state.stock_auto_scan = st.sidebar.toggle(
@@ -5838,7 +5851,105 @@ ADAPTIVE_PROFILE_CANDIDATES = {
 ADAPTIVE_CANDIDATES = set(ADAPTIVE_PROFILE_CANDIDATES.values())
 GOLD_BUY_CANDIDATE = "BUY_STRICT_VALIDATED"
 GOLD_BUY_VALIDATION_SCHEMA = "BUY_STRICT_MTF_B2_V1"
-SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES | {GOLD_BUY_CANDIDATE}
+GOLD_INTRADAY_CANDIDATE = "GOLD_INTRADAY_M5"
+SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES | {
+    GOLD_BUY_CANDIDATE,
+    GOLD_INTRADAY_CANDIDATE,
+}
+
+
+def analyze_gold_intraday(raw_df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Faster M5/M15/H1 intraday review engine.
+    It is intentionally Paper/review-only until a dedicated forward validation exists.
+    """
+    base = closed_m5(raw_df)
+    frames = {
+        "M5": base,
+        "M15": resample_closed(base, "15min"),
+        "H1": resample_closed(base, "1h"),
+    }
+    snaps = {name: snapshot(frame) for name, frame in frames.items()}
+    if any(v is None for v in snaps.values()):
+        return {
+            "signal": "WAIT",
+            "strength": 0,
+            "reason": "مضاربة: بيانات غير كافية على M5/M15/H1",
+            "candidate": GOLD_INTRADAY_CANDIDATE,
+            "snapshots": snaps,
+            "b2": {},
+            "buy_score": 0,
+            "sell_score": 0,
+            "near_entry": False,
+        }
+
+    m5 = snaps["M5"]
+    m15 = snaps["M15"]
+    h1 = snaps["H1"]
+    b2 = b2_signal(m5["frame"], lookback=12, retest_atr=0.35)
+
+    calc = m5["frame"]
+    micro_buy = False
+    micro_sell = False
+    if len(calc) >= 8:
+        prior = calc.iloc[-7:-1]
+        micro_buy = float(calc.iloc[-1]["close"]) > float(prior["high"].max())
+        micro_sell = float(calc.iloc[-1]["close"]) < float(prior["low"].min())
+
+    buy_checks = [
+        ("اتجاه الساعة صاعد", h1["trend"] == "UP"),
+        ("اتجاه 15 دقيقة صاعد", m15["trend"] == "UP"),
+        ("ترتيب المتوسطات صاعد", m5["close"] > m5["ema20"] > m5["ema50"]),
+        ("RSI مناسب", 50 <= m5["rsi"] <= 70),
+        ("الزخم موجب", m5["momentum"] > 0),
+        ("MACD موجب", m5["macd_hist"] > 0),
+        ("قوة الحركة كافية", max(float(m5["adx"]), float(m15["adx"])) >= 18),
+        ("حدث دخول", (b2.get("valid") and b2.get("side") == "BUY") or micro_buy),
+    ]
+    sell_checks = [
+        ("اتجاه الساعة هابط", h1["trend"] == "DOWN"),
+        ("اتجاه 15 دقيقة هابط", m15["trend"] == "DOWN"),
+        ("ترتيب المتوسطات هابط", m5["close"] < m5["ema20"] < m5["ema50"]),
+        ("RSI مناسب", 30 <= m5["rsi"] <= 50),
+        ("الزخم سالب", m5["momentum"] < 0),
+        ("MACD سالب", m5["macd_hist"] < 0),
+        ("قوة الحركة كافية", max(float(m5["adx"]), float(m15["adx"])) >= 18),
+        ("حدث دخول", (b2.get("valid") and b2.get("side") == "SELL") or micro_sell),
+    ]
+
+    buy_score = round(sum(bool(ok) for _, ok in buy_checks) / len(buy_checks) * 100)
+    sell_score = round(sum(bool(ok) for _, ok in sell_checks) / len(sell_checks) * 100)
+
+    if all(ok for _, ok in buy_checks):
+        signal = "BUY"
+        checks = buy_checks
+        reason = "مضاربة سريعة: اتجاه + زخم + حدث دخول شراء مكتملة"
+    elif all(ok for _, ok in sell_checks):
+        signal = "SELL"
+        checks = sell_checks
+        reason = "مضاربة سريعة: اتجاه + زخم + حدث دخول بيع مكتملة"
+    else:
+        signal = "WAIT"
+        checks = buy_checks if buy_score >= sell_score else sell_checks
+        missing = [name for name, ok in checks if not ok]
+        reason = "مضاربة: انتظار — الناقص: " + "، ".join(missing[:3])
+
+    strength = max(buy_score, sell_score)
+    return {
+        "signal": signal,
+        "strength": strength,
+        "reason": reason,
+        "candidate": GOLD_INTRADAY_CANDIDATE,
+        "snapshots": snaps,
+        "b2": b2,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "readiness_pct": strength,
+        "near_entry": bool(signal == "WAIT" and strength >= 75),
+        "checks": checks,
+        "intraday": True,
+    }
+
 
 def gold_buy_validation_passed() -> bool:
     validation = st.session_state.get("gold_buy_validation")
@@ -6260,6 +6371,21 @@ if instrument.asset_class == "STOCK":
         forward_analysis = analyze_stock_candidate(raw, adaptive_profile)
     if mode == "Paper":
         paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "STOCK")
+elif (
+    instrument.asset_class == "GOLD"
+    and bool(st.session_state.get("gold_intraday_mode", True))
+):
+    adaptive_profile = "مضاربة سريعة"
+    active_candidate = GOLD_INTRADAY_CANDIDATE
+    forward_analysis = analyze_gold_intraday(raw)
+    smart_autopilot_meta = {
+        "mode": "INTRADAY_REVIEW",
+        "loss_streak": recent_paper_loss_streak("GOLD"),
+        "reason": "محرك مضاربة M5/M15/H1 مستقل؛ أسرع من محرك الاتجاه الكامل",
+        "evaluations": {},
+    }
+    if mode == "Paper":
+        paper_risk_pct = 0.03
 elif instrument.asset_class == "GOLD" and selected_profile == "ذكي تلقائي":
     (
         adaptive_profile,
@@ -6885,6 +7011,12 @@ if execution_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
         )
     except ValueError as exc:
         st.warning(f"لا يمكن بناء خطة بالحجم الحالي: {exc}")
+
+if instrument.asset_class == "GOLD" and bool(st.session_state.get("gold_intraday_mode", True)):
+    st.info(
+        "⚡ وضع المضاربة السريعة مفعّل: القرار يعتمد على M5/M15/H1 ويبحث عن فرص أقصر. "
+        "هذا الوضع تجريبي/Paper للمراجعة ولا يفتح تداول Live تلقائيًا."
+    )
 
 if paper_plan:
     st.subheader("خطة الصفقة — تحليل / تجريبي")
@@ -8678,13 +8810,19 @@ if st.session_state.auto_refresh:
 
             if adaptive_paper_mode and selected_profile == "ذكي تلقائي":
                 if instrument.asset_class == "GOLD":
-                    (
-                        hb_profile,
-                        hb_active_candidate,
-                        hb_analysis,
-                        _hb_meta,
-                    ) = choose_smart_autopilot(hb_raw)
-                    hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
+                    if bool(st.session_state.get("gold_intraday_mode", True)):
+                        hb_profile = "مضاربة سريعة"
+                        hb_active_candidate = GOLD_INTRADAY_CANDIDATE
+                        hb_analysis = analyze_gold_intraday(hb_raw)
+                        hb_risk_pct = 0.03
+                    else:
+                        (
+                            hb_profile,
+                            hb_active_candidate,
+                            hb_analysis,
+                            _hb_meta,
+                        ) = choose_smart_autopilot(hb_raw)
+                        hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
                 elif instrument.asset_class == "STOCK":
                     (
                         hb_profile,
