@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.3.1-arabic-alerts-ui"
+VERSION = "6.3.2-gold-buy-validation-guard"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -5722,6 +5722,16 @@ if instrument.asset_class == "STOCK":
         "والتذبذب تلقائيًا. رموز القائمة لا تُعتبر فحصًا شرعيًا بحد ذاتها؛ "
         "الفحص الشرعي يحتاج مصدرًا محدثًا منفصلًا."
     )
+elif instrument.asset_class == "GOLD":
+    st.warning(
+        "⚠️ تنبيه تحقق مهم: مسار الذهب الذكي AutoPilot الحالي مبني على مرشحات بيع "
+        "متحقق منها داخل المحرك. أي إشارة شراء من شاشة التحليل الأساسية لا تُعامل "
+        "كدخول شراء معتمد، وتم حجب تنبيه الدخول شراء حتى يوجد اختبار مستقل لمسار الشراء."
+    )
+    st.caption(
+        "لا تعتمد على التطبيق وحده في قرار مالي حقيقي، ولا تستخدم مالًا مقترضًا "
+        "أو مبلغًا لا تستطيع تحمل خسارته بالكامل."
+    )
 
 raw, data_status = fetch_market(instrument.symbol)
 if raw.empty:
@@ -5859,25 +5869,47 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
         alert_key = f"{instrument.symbol}:{candle_id}:{execution_analysis['signal']}"
         if st.session_state.last_alert_candle.get(instrument.symbol) != alert_key:
             st.session_state.last_alert_candle[instrument.symbol] = alert_key
-            side_ar = "شراء" if execution_analysis["signal"] == "BUY" else "بيع"
             asset_label = "الذهب" if instrument.asset_class == "GOLD" else instrument.symbol
-            emit_smart_alert(
-                f"entry-signal:{alert_key}",
-                f"🚨 إشارة دخول {side_ar} — {asset_label}",
-                (
-                    f"السعر {fmt(reference_price, 4)} • قوة الإشارة {execution_analysis['strength']}% • "
-                    f"{execution_analysis.get('reason', '')}"
-                ),
-                icon="⚡",
-                payload={
-                    "symbol": instrument.symbol,
-                    "asset_class": instrument.asset_class,
-                    "side": execution_analysis["signal"],
-                    "price": reference_price,
-                    "strength": execution_analysis["strength"],
-                    "type": "ENTRY_SIGNAL",
-                },
-            )
+
+            # Gold AutoPilot research path is currently sell-side only.
+            # Do not convert an unvalidated baseline BUY into an actionable alert.
+            if instrument.asset_class == "GOLD" and execution_analysis["signal"] == "BUY":
+                emit_smart_alert(
+                    f"gold-buy-blocked:{alert_key}",
+                    "⛔ شراء الذهب غير معتمد",
+                    (
+                        f"ظهرت إشارة شراء في التحليل الأساسي عند {fmt(reference_price, 4)}، "
+                        "لكن مسار الشراء لم يجتز تحققًا مستقلاً في AutoPilot؛ انتظر ولا تدخل اعتمادًا عليها."
+                    ),
+                    icon="⏰",
+                    payload={
+                        "symbol": instrument.symbol,
+                        "asset_class": instrument.asset_class,
+                        "side": "BUY",
+                        "price": reference_price,
+                        "strength": execution_analysis["strength"],
+                        "type": "UNVALIDATED_GOLD_BUY_BLOCK",
+                    },
+                )
+            else:
+                side_ar = "شراء" if execution_analysis["signal"] == "BUY" else "بيع"
+                emit_smart_alert(
+                    f"entry-signal:{alert_key}",
+                    f"🚨 إشارة دخول {side_ar} — {asset_label}",
+                    (
+                        f"السعر {fmt(reference_price, 4)} • قوة الإشارة {execution_analysis['strength']}% • "
+                        f"{execution_analysis.get('reason', '')}"
+                    ),
+                    icon="⚡",
+                    payload={
+                        "symbol": instrument.symbol,
+                        "asset_class": instrument.asset_class,
+                        "side": execution_analysis["signal"],
+                        "price": reference_price,
+                        "strength": execution_analysis["strength"],
+                        "type": "ENTRY_SIGNAL",
+                    },
+                )
 
 
 # Fresh opposite signal against an open Paper position => exit-review alert.
@@ -5930,10 +5962,16 @@ execution_state = (
     else ("wait" if stock_market_closed else "bad")
 )
 
+_display_signal = signal_ar(execution_analysis["signal"])
+_display_signal_state = "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"
+if instrument.asset_class == "GOLD" and execution_analysis["signal"] == "BUY":
+    _display_signal = "شراء غير معتمد"
+    _display_signal_state = "wait"
+
 mini_grid(
     [
         ("السعر", fmt(reference_price, 4), ""),
-        ("القرار", signal_ar(execution_analysis["signal"]), "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"),
+        ("القرار", _display_signal, _display_signal_state),
         ("القوة", f"{execution_analysis['strength']}%", ""),
         ("بيانات التنفيذ", execution_label, execution_state),
         ("التداول الحقيقي", "مفتوح" if live_unlocked else "مقفل", "ok" if live_unlocked else "wait"),
