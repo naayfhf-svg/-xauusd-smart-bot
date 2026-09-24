@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.2-readiness-guards"
+VERSION = "6.1.3-options-watch"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -4364,6 +4364,180 @@ def self_test() -> tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
 
+def create_option_watch(symbol, kind, expiry, strike, entry_low, entry_high,
+                        stop, tp1, tp2, qty, multiplier, today):
+    """User-defined long-option thresholds; never infer premiums from a stock."""
+    symbol = str(symbol).strip().upper()
+    if not symbol or len(symbol) > 12 or not all(c.isalnum() or c == '.' for c in symbol) or not symbol.isascii():
+        raise ValueError("اكتب رمز الأصل بالإنجليزية كما يظهر في سهم")
+    if kind not in {"Call", "Put"}:
+        raise ValueError("نوع العقد غير صالح")
+    expiry = pd.Timestamp(expiry).date()
+    if expiry <= pd.Timestamp(today).date():
+        raise ValueError("اختر انتهاء بعد اليوم؛ متابعة دخول عقود يوم الانتهاء غير متاحة")
+    values = (strike, entry_low, entry_high, stop, tp1, tp2, qty, multiplier)
+    if not all(finite(v) and float(v) > 0 for v in values):
+        raise ValueError("أدخل أسعارًا وكميات موجبة وصحيحة")
+    if int(qty) != qty or int(multiplier) != multiplier:
+        raise ValueError("الكمية ومضاعف العقد يجب أن يكونا عددين صحيحين")
+    if not stop < entry_low <= entry_high < tp1 < tp2:
+        raise ValueError("يلزم: الوقف < أقل دخول ≤ أعلى دخول < الهدف الأول < الهدف الثاني")
+    return dict(id=uuid.uuid4().hex, symbol=symbol, kind=kind,
+                expiry=expiry.isoformat(), strike=float(strike),
+                entry_low=float(entry_low), entry_high=float(entry_high),
+                stop=float(stop), tp1=float(tp1), tp2=float(tp2), qty=int(qty),
+                multiplier=int(multiplier), entered=False, closed=False,
+                fired=[], events=[], last_quote=None)
+
+
+def evaluate_option_watch(watch, quote, now):
+    """Evaluate an explicit premium snapshot, with identity and freshness checks."""
+    result = copy.deepcopy(watch)
+    current = pd.Timestamp(now)
+    if current.tzinfo is None:
+        raise ValueError("وقت الفحص يجب أن يتضمن المنطقة الزمنية")
+    if result['closed']:
+        return result, [], "المتابعة مغلقة يدويًا"
+    if pd.Timestamp(result['expiry']).date() < current.tz_convert('America/New_York').date():
+        return result, [], "انتهى تاريخ العقد؛ راجع حالة التسوية لدى سهم"
+    if quote.get('watch_id') != result['id'] or quote.get('source') != 'manual':
+        return result, [], "السعر لا يطابق العقد المحدد"
+    try:
+        ts = pd.Timestamp(quote['timestamp'])
+        if ts.tzinfo is None or not -5 <= (current - ts).total_seconds() <= 120:
+            return result, [], "السعر قديم أو توقيته غير صالح؛ حدّث سعر العقد"
+        bid, ask = float(quote['bid']), float(quote['ask'])
+        if not finite(bid) or not finite(ask) or not 0 <= bid <= ask or ask <= 0:
+            return result, [], "أسعار Bid وAsk غير صالحة"
+    except (KeyError, TypeError, ValueError):
+        return result, [], "بيانات السعر غير مكتملة"
+    last = result.get('last_quote')
+    if last and ts <= pd.Timestamp(last['timestamp']):
+        return result, [], "هذا التحديث سبق فحصه"
+    result['last_quote'] = dict(timestamp=ts.isoformat(), bid=bid, ask=ask, source='manual')
+    fired = set(result['fired'])
+    events = []
+    checks = []
+    if result['entered']:
+        # For both purchased Calls and Puts, exit value is the option Bid.
+        if bid <= result['stop']:
+            checks = [('STOP', 'وصل Bid إلى الوقف أو أقل؛ راجع الخروج في سهم')]
+        elif bid >= result['tp2']:
+            checks = [('TP2', 'وصل Bid إلى الهدف الثاني؛ راجع الخروج في سهم')]
+        elif bid >= result['tp1']:
+            checks = [('TP1', 'وصل Bid إلى الهدف الأول؛ راجع جني الربح في سهم')]
+    elif pd.Timestamp(result['expiry']).date() == current.tz_convert('America/New_York').date():
+        return result, [], "يوم انتهاء العقد: تنبيهات الدخول محجوبة"
+    elif result['entry_low'] <= ask <= result['entry_high']:
+        checks = [('ENTRY', 'وصل Ask إلى نطاق دخولك المحدد؛ ليس تأكيد تنفيذ أو توصية شراء')]
+    for code, message in checks:
+        if code not in fired:
+            events.append(dict(code=code, message=message, time=current.isoformat(),
+                               premium=bid if result['entered'] else ask, source='إدخال يدوي'))
+            fired.add(code)
+            if code == 'TP2':
+                fired.add('TP1')
+    result['fired'] = sorted(fired)
+    result['events'] = (result['events'] + events)[-50:]
+    return result, events, "تم فحص السعر المُدخل يدويًا"
+
+
+def render_options_workspace():
+    st.title("عقود الخيارات — سهم")
+    st.caption(f"v{VERSION} • Call / Put • متابعة شراء العقود وتنفيذ يدوي")
+    st.info("هذه متابعة لحدود تختارها أنت. لا يوجد اتصال بأسعار عقود سهم أو بحسابك. "
+            "يظهر التنبيه عند تحديث السعر هنا فقط، ولا تصلك إشعارات عند إغلاق التطبيق.")
+    st.caption("أسعار الدخول والوقف والأهداف هي علاوة الخيار بالدولار للوحدة، وليست سعر السهم. "
+               "الوقف تنبيه وليس أمرًا لدى الوسيط؛ يمكن أن تتجاوز الخسارة الوقف حتى كامل تكلفة الشراء. "
+               "المتابعة محفوظة في الجلسة الحالية فقط؛ إعادة فتح الجلسة قد تفقدها.")
+    watch = st.session_state.get('option_watch')
+    if not watch or watch.get('closed'):
+        with st.form('option_create'):
+            symbol = st.text_input("رمز السهم أو المؤشر", key='opt_symbol', placeholder="AAPL")
+            kind = st.selectbox("نوع العقد المشترى", ['Call', 'Put'], key='opt_kind')
+            expiry = st.date_input("تاريخ انتهاء العقد", value=now_riyadh().date() + pd.Timedelta(days=7), key='opt_expiry')
+            strike = st.number_input("سعر التنفيذ Strike", min_value=0.0, value=0.0, key='opt_strike')
+            low = st.number_input("أقل سعر دخول للعقد", min_value=0.0, value=0.0, format='%.3f', key='opt_low')
+            high = st.number_input("أعلى سعر دخول للعقد", min_value=0.0, value=0.0, format='%.3f', key='opt_high')
+            stop = st.number_input("وقف سعر العقد", min_value=0.0, value=0.0, format='%.3f', key='opt_stop')
+            tp1 = st.number_input("الهدف الأول للعقد", min_value=0.0, value=0.0, format='%.3f', key='opt_tp1')
+            tp2 = st.number_input("الهدف الثاني للعقد", min_value=0.0, value=0.0, format='%.3f', key='opt_tp2')
+            qty = st.number_input("عدد العقود", min_value=1, value=1, step=1, key='opt_qty')
+            multiplier = st.number_input("مضاعف العقد — طابقه مع مواصفاته في سهم", min_value=1, value=100, step=1, key='opt_multiplier')
+            if st.form_submit_button("حفظ خطة المتابعة"):
+                try:
+                    st.session_state.option_watch = create_option_watch(symbol, kind, expiry, strike,
+                        low, high, stop, tp1, tp2, qty, multiplier, now_riyadh().date())
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        if watch:
+            st.caption("سجل المتابعة السابقة")
+            st.dataframe(watch['events'], hide_index=True)
+        return
+    st.subheader(f"{watch['symbol']} · {watch['kind']} · {watch['strike']:g} · {watch['expiry']}")
+    st.write("الحالة: " + ("تم تسجيل الدخول يدويًا" if watch['entered'] else "بانتظار تسجيل دخولك في سهم"))
+    mini_grid([
+        ("نطاق الدخول $", f"{watch['entry_low']:.3f} – {watch['entry_high']:.3f}", ""),
+        ("الوقف $", fmt(watch['stop'], 3), "bad"),
+        ("هدف 1 $", fmt(watch['tp1'], 3), "ok"),
+        ("هدف 2 $", fmt(watch['tp2'], 3), "ok"),
+        ("عدد العقود", str(watch['qty']), ""),
+        ("تكلفة الشراء القصوى قبل الرسوم $", fmt(watch['entry_high'] * watch['qty'] * watch['multiplier'], 2), "wait"),
+    ], "plan-grid")
+    if not watch['entered']:
+        with st.form('option_enter'):
+            actual = st.number_input("سعر الدخول الفعلي للعقد بعد تنفيذه في سهم", min_value=0.0,
+                                     value=0.0, format='%.3f', key='opt_actual')
+            if st.form_submit_button("سجل أنني اشتريت العقد في سهم"):
+                if not watch['stop'] < actual < watch['tp1']:
+                    st.error("يلزم أن يكون الدخول الفعلي بين الوقف والهدف الأول؛ أعد بناء الخطة إن اختلف التنفيذ")
+                elif pd.Timestamp(watch['expiry']).date() <= now_utc().tz_convert('America/New_York').date():
+                    st.error("تسجيل دخول يوم الانتهاء غير متاح")
+                else:
+                    watch['entered'] = True
+                    watch['actual_entry'] = float(actual)
+                    watch['last_quote'] = None
+                    st.session_state.option_watch = watch
+                    st.rerun()
+    else:
+        st.caption(f"دخولك المسجل: ${watch['actual_entry']:.3f} • لا نتأكد من التنفيذ لدى سهم")
+    with st.form('option_quote'):
+        st.write("حدّث أسعار نفس العقد من سهم")
+        bid = st.number_input("Bid — سعر بيع العقد", min_value=0.0, value=0.0, format='%.3f', key='opt_bid')
+        ask = st.number_input("Ask — سعر شراء العقد", min_value=0.0, value=0.0, format='%.3f', key='opt_ask')
+        age = st.number_input("عمر السعر بالثواني", min_value=0, value=0, step=1, key='opt_age')
+        checked = st.checkbox("طابقت نوع العقد وStrike والانتهاء والسعر الحالي في سهم", key='opt_checked')
+        if st.form_submit_button("تحديث السعر وفحص التنبيهات"):
+            if not checked:
+                st.warning("طابق بيانات العقد أولًا")
+            else:
+                now = now_utc()
+                watch, events, message = evaluate_option_watch(watch, dict(watch_id=watch['id'],
+                    bid=bid, ask=ask, source='manual', timestamp=(now-pd.Timedelta(seconds=int(age))).isoformat()), now)
+                st.session_state.option_watch = watch
+                st.info(message)
+                for event in events:
+                    st.toast(event['message'], icon='🔔')
+    if watch['last_quote']:
+        q = watch['last_quote']
+        st.caption(f"آخر سعر يدوي: Bid {q['bid']:.3f} / Ask {q['ask']:.3f} • "
+                   f"{pd.Timestamp(q['timestamp']).tz_convert(TZ).strftime('%Y-%m-%d %H:%M:%S')} الرياض — ليس بثًا مباشرًا")
+    st.subheader("سجل التنبيهات — لا يمثل صفقات منفذة")
+    if watch['events']:
+        for event in reversed(watch['events']):
+            stamp = pd.Timestamp(event['time']).tz_convert(TZ).strftime('%m-%d %H:%M:%S')
+            st.warning(f"{stamp} • {event['message']} • ${event['premium']:.3f} • إدخال يدوي")
+    else:
+        st.caption("لا توجد تنبيهات مسجلة")
+    st.download_button("تنزيل الخطة وسجل التنبيهات", json.dumps(watch, ensure_ascii=False, indent=2),
+                       file_name='option-watch.json', mime='application/json')
+    if st.button("إنهاء المتابعة وبدء خطة جديدة", key='opt_close'):
+        watch['closed'] = True
+        st.session_state.option_watch = watch
+        st.rerun()
+
+
 # ----------------------------- app ----------------------------
 engine_ok, engine_error = self_test()
 if not engine_ok:
@@ -4390,11 +4564,14 @@ section_map = {
     "الأسهم": [k for k,v in PRESETS.items() if v.asset_class == "STOCK"],
     "العقود": [k for k,v in PRESETS.items() if v.asset_class == "FUTURES"],
 }
-section_options = ["الذهب", "الأسهم", "العقود"]
+section_options = ["الذهب", "الأسهم", "العقود", "خيارات سهم"]
 current_section = st.session_state.get("market_section", "الذهب")
 if current_section not in section_options:
     current_section = "الذهب"
 market_section = st.sidebar.radio("القسم", section_options, key="market_section")
+if market_section == "خيارات سهم":
+    render_options_workspace()
+    st.stop()
 market_options = section_map[market_section]
 current_preset = st.session_state.get("market_preset")
 if current_preset not in market_options:
