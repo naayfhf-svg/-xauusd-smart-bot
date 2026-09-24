@@ -29,10 +29,11 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.5-subsecond-timing"
+VERSION = "6.2.0-all-option-opportunities"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
+TRADIER_DEFAULT_BASE_URL = "https://api.tradier.com/v1"
 TIMEFRAMES = ("M5", "M15", "H1", "H4")
 TF_RULES = {"M5": "5min", "M15": "15min", "H1": "1h", "H4": "4h"}
 
@@ -4641,6 +4642,372 @@ def render_option_intelligence(symbol, budget):
     st.session_state.option_review = review
 
 
+
+def _tradier_token() -> str:
+    return str(secret("TRADIER_API_TOKEN", "") or "").strip()
+
+
+def _tradier_base_url() -> str:
+    value = str(secret("TRADIER_BASE_URL", TRADIER_DEFAULT_BASE_URL) or TRADIER_DEFAULT_BASE_URL).strip()
+    return value.rstrip("/")
+
+
+def _tradier_headers() -> dict[str, str]:
+    token = _tradier_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def tradier_option_expirations(symbol: str) -> tuple[list[str], str]:
+    """Return every listed expiration reported by Tradier for one underlying."""
+    token = _tradier_token()
+    if not token:
+        return [], "TRADIER_API_TOKEN غير موجود"
+    symbol = str(symbol).strip().upper()
+    try:
+        response = requests.get(
+            f"{_tradier_base_url()}/markets/options/expirations",
+            headers=_tradier_headers(),
+            params={
+                "symbol": symbol,
+                "includeAllRoots": "true",
+                "strikes": "false",
+                "contractSize": "false",
+                "expirationType": "false",
+            },
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return [], f"Tradier expirations HTTP {response.status_code}: {response.text[:180]}"
+        payload = response.json()
+    except Exception as exc:
+        return [], f"تعذر جلب تواريخ الانتهاء: {exc}"
+
+    dates = ((payload.get("expirations") or {}).get("date")
+             if isinstance(payload, dict) else None)
+    if dates is None:
+        return [], "لم ترجع Tradier تواريخ انتهاء"
+    if not isinstance(dates, list):
+        dates = [dates]
+
+    clean = []
+    for item in dates:
+        if isinstance(item, dict):
+            item = item.get("date") or item.get("expiration")
+        if item:
+            try:
+                clean.append(pd.Timestamp(item).date().isoformat())
+            except Exception:
+                continue
+    return sorted(set(clean)), "OK"
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def tradier_option_chain(symbol: str, expiration: str) -> tuple[list[dict[str, Any]], str]:
+    """Fetch the complete call/put chain for one expiration, including Greeks when provided."""
+    token = _tradier_token()
+    if not token:
+        return [], "TRADIER_API_TOKEN غير موجود"
+    symbol = str(symbol).strip().upper()
+    try:
+        t0 = time.perf_counter()
+        response = requests.get(
+            f"{_tradier_base_url()}/markets/options/chains",
+            headers=_tradier_headers(),
+            params={"symbol": symbol, "expiration": expiration, "greeks": "true"},
+            timeout=20,
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        if response.status_code != 200:
+            return [], f"Tradier chain HTTP {response.status_code}: {response.text[:180]}"
+        payload = response.json()
+    except Exception as exc:
+        return [], f"تعذر جلب سلسلة العقود: {exc}"
+
+    options = ((payload.get("options") or {}).get("option")
+               if isinstance(payload, dict) else None)
+    if options is None:
+        return [], "لم ترجع Tradier عقودًا لهذا الانتهاء"
+    if not isinstance(options, list):
+        options = [options]
+
+    rows: list[dict[str, Any]] = []
+    today_ny = now_utc().tz_convert("America/New_York").date()
+    exp_date = pd.Timestamp(expiration).date()
+    dte = (exp_date - today_ny).days
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        greeks = opt.get("greeks") if isinstance(opt.get("greeks"), dict) else {}
+
+        def _num(name, default=None):
+            value = opt.get(name, default)
+            return float(value) if finite(value) else None
+
+        def _gnum(*names):
+            for name in names:
+                value = greeks.get(name)
+                if finite(value):
+                    return float(value)
+            return None
+
+        bid = _num("bid")
+        ask = _num("ask")
+        mid = ((bid + ask) / 2.0) if bid is not None and ask is not None and ask >= bid else None
+        spread_pct = (
+            ((ask - bid) / mid * 100.0)
+            if mid is not None and mid > 0 and bid is not None and ask is not None
+            else None
+        )
+        option_type = str(opt.get("option_type") or opt.get("type") or "").strip().lower()
+        rows.append({
+            "العقد": str(opt.get("symbol") or ""),
+            "النوع": "Call" if option_type.startswith("call") else ("Put" if option_type.startswith("put") else option_type),
+            "الانتهاء": expiration,
+            "DTE": dte,
+            "Strike": _num("strike"),
+            "Bid": bid,
+            "Ask": ask,
+            "Mid": mid,
+            "Spread %": spread_pct,
+            "Last": _num("last"),
+            "Volume": int(float(opt.get("volume"))) if finite(opt.get("volume")) else 0,
+            "OI": int(float(opt.get("open_interest"))) if finite(opt.get("open_interest")) else 0,
+            "Delta": _gnum("delta"),
+            "Gamma": _gnum("gamma"),
+            "Theta": _gnum("theta"),
+            "Vega": _gnum("vega"),
+            "IV": _gnum("mid_iv", "smv_vol", "iv"),
+            "آخر تحديث API ms": latency_ms,
+        })
+    return rows, "OK"
+
+
+def option_underlying_setup(symbol: str) -> dict[str, Any]:
+    """Reuse the app's existing explainable setup logic for the selected underlying."""
+    raw, status = fetch_market(symbol)
+    quote = fetch_quote(symbol)
+    if raw.empty:
+        return {
+            "bias": "WAIT",
+            "setup": False,
+            "reason": status,
+            "spot": None,
+            "quote": quote,
+            "feed": {},
+        }
+    feed = feed_integrity(raw, quote)
+    frames = {
+        "M5": closed_m5(raw),
+        "M15": resample_closed(raw, "15min"),
+        "H1": resample_closed(raw, "1h"),
+    }
+    snaps = {tf: snapshot(frame) for tf, frame in frames.items()}
+    event = b2_signal(snaps["M5"]["frame"]) if snaps.get("M5") else {}
+    direction = option_direction(
+        snaps,
+        event,
+        bool(feed.get("execution_ok")
+             and quote.get("market_open") is True
+             and stock_session_state()["regular"]),
+    )
+    return {
+        **direction,
+        "spot": float(quote["last"]) if finite(quote.get("last")) else float(raw["close"].iloc[-1]),
+        "quote": quote,
+        "feed": feed,
+    }
+
+
+def _option_contract_status(row: dict[str, Any], direction: dict[str, Any]) -> tuple[str, bool]:
+    """Liquidity/structure screen only; not a probability estimate."""
+    option_type = row.get("النوع")
+    dte = int(row.get("DTE") or 0)
+    bid = row.get("Bid")
+    ask = row.get("Ask")
+    spread = row.get("Spread %")
+    volume = int(row.get("Volume") or 0)
+    oi = int(row.get("OI") or 0)
+    delta = row.get("Delta")
+
+    reasons = []
+    if not direction.get("setup"):
+        reasons.append("سيناريو الأصل غير مكتمل")
+    if option_type != direction.get("bias"):
+        reasons.append("نوع العقد عكس اتجاه السيناريو")
+    if dte < 2:
+        reasons.append("قريب جدًا من الانتهاء")
+    if not finite(bid) or not finite(ask) or float(bid) <= 0 or float(ask) <= 0:
+        reasons.append("Bid/Ask غير صالح")
+    if finite(spread) and float(spread) > 20:
+        reasons.append("Spread أعلى من 20%")
+    if volume <= 0 and oi <= 0:
+        reasons.append("لا Volume ولا OI")
+    if finite(delta):
+        abs_delta = abs(float(delta))
+        if abs_delta < 0.20 or abs_delta > 0.85:
+            reasons.append("Delta خارج نطاق المتابعة 0.20–0.85")
+
+    ok = not reasons
+    return ("مستوفٍ للفلاتر" if ok else "مراقبة: " + "، ".join(reasons)), ok
+
+
+def build_all_option_opportunities(symbol: str, max_dte: int = 60) -> dict[str, Any]:
+    """Load every contract in every listed expiration inside the requested DTE window."""
+    direction = option_underlying_setup(symbol)
+    expirations, exp_status = tradier_option_expirations(symbol)
+    if not expirations:
+        return {
+            "direction": direction,
+            "all_rows": [],
+            "opportunities": [],
+            "status": exp_status,
+            "expirations_checked": 0,
+        }
+
+    today_ny = now_utc().tz_convert("America/New_York").date()
+    chosen = []
+    for expiration in expirations:
+        try:
+            dte = (pd.Timestamp(expiration).date() - today_ny).days
+        except Exception:
+            continue
+        if 0 <= dte <= int(max_dte):
+            chosen.append(expiration)
+
+    all_rows: list[dict[str, Any]] = []
+    statuses = []
+    for expiration in chosen:
+        rows, status = tradier_option_chain(symbol, expiration)
+        statuses.append(status)
+        all_rows.extend(rows)
+
+    opportunities = []
+    for row in all_rows:
+        status_text, ok = _option_contract_status(row, direction)
+        row["الحالة"] = status_text
+        row["سيناريو الأصل"] = direction.get("bias", "WAIT")
+        if ok:
+            opportunities.append(dict(row))
+
+    # Show every qualifying contract. Sorting is for readability only and does
+    # not claim a higher probability of profit.
+    opportunities.sort(
+        key=lambda r: (
+            int(r.get("OI") or 0),
+            int(r.get("Volume") or 0),
+            -(float(r.get("Spread %")) if finite(r.get("Spread %")) else 999.0),
+        ),
+        reverse=True,
+    )
+    all_rows.sort(
+        key=lambda r: (
+            int(r.get("DTE") or 0),
+            float(r.get("Strike") or 0),
+            str(r.get("النوع") or ""),
+        )
+    )
+    bad_status = next((s for s in statuses if s != "OK"), None)
+    return {
+        "direction": direction,
+        "all_rows": all_rows,
+        "opportunities": opportunities,
+        "status": bad_status or "OK",
+        "expirations_checked": len(chosen),
+    }
+
+
+def render_all_option_opportunities(symbol: str) -> None:
+    st.subheader("كل فرص العقود")
+    st.caption(
+        "يعرض جميع العقود ضمن نافذة الانتهاء التي تختارها، ثم يفصل العقود المستوفية "
+        "لفلاتر الاتجاه والسيولة. لا يتم إخفاء بقية العقود."
+    )
+    if not _tradier_token():
+        st.warning(
+            "لإظهار كل Call وPut تلقائيًا نحتاج TRADIER_API_TOKEN في Streamlit Secrets. "
+            "Twelve Data المستخدم حاليًا ممتاز لسعر الأصل لكنه لا يزوّد هذا التطبيق بسلسلة عقود كاملة عبر REST."
+        )
+        return
+
+    max_dte = st.slider(
+        "أقصى مدة انتهاء للفحص (DTE)",
+        min_value=7,
+        max_value=365,
+        value=60,
+        step=7,
+        key="opt_chain_max_dte",
+    )
+
+    if st.button("فحص كل الفرص الآن", type="primary", use_container_width=True, key="scan_all_options"):
+        st.cache_data.clear()
+
+    result = build_all_option_opportunities(symbol, max_dte=max_dte)
+    direction = result["direction"]
+    spot = direction.get("spot")
+    feed = direction.get("feed") or {}
+    quote_age = feed.get("quote_age_sec")
+
+    mini_grid([
+        ("الأصل", symbol, ""),
+        ("سعر الأصل", fmt(spot, 2), ""),
+        ("اتجاه السيناريو", str(direction.get("bias", "WAIT")), "ok" if direction.get("setup") else "wait"),
+        ("اكتمال السيناريو", "مكتمل" if direction.get("setup") else "انتظار", "ok" if direction.get("setup") else "wait"),
+        ("عمر Quote", "—" if quote_age is None else f"{float(quote_age):.3f}s", "ok" if quote_age is not None and float(quote_age) <= 5 else "wait"),
+        ("تواريخ فُحصت", str(result.get("expirations_checked", 0)), ""),
+        ("كل العقود", str(len(result["all_rows"])), ""),
+        ("الفرص المستوفية", str(len(result["opportunities"])), "ok" if result["opportunities"] else "wait"),
+    ], "plan-grid")
+
+    if result["status"] != "OK":
+        st.warning(result["status"])
+
+    tab1, tab2 = st.tabs(["الفرص المستوفية", "كل العقود"])
+    with tab1:
+        if result["opportunities"]:
+            opp_df = pd.DataFrame(result["opportunities"])
+            cols = [
+                "العقد", "النوع", "الانتهاء", "DTE", "Strike", "Bid", "Ask",
+                "Spread %", "Volume", "OI", "Delta", "Gamma", "Theta", "Vega", "IV",
+                "الحالة",
+            ]
+            st.dataframe(
+                opp_df[[x for x in cols if x in opp_df.columns]],
+                hide_index=True,
+                use_container_width=True,
+                height=520,
+            )
+            st.caption(
+                "هذه كل العقود التي اجتازت الفلاتر داخل النافذة المختارة؛ "
+                "ترتيب الجدول للقراءة وليس توقعًا لاحتمال الربح."
+            )
+        else:
+            st.info(
+                "لا يوجد عقد اجتاز كل الفلاتر حاليًا. افتح «كل العقود» لرؤية جميع Call وPut "
+                "والسبب الذي منع كل عقد من الظهور كفرصة مستوفية."
+            )
+
+    with tab2:
+        if result["all_rows"]:
+            all_df = pd.DataFrame(result["all_rows"])
+            cols = [
+                "العقد", "النوع", "الانتهاء", "DTE", "Strike", "Bid", "Ask",
+                "Spread %", "Volume", "OI", "Delta", "Gamma", "Theta", "Vega", "IV",
+                "سيناريو الأصل", "الحالة",
+            ]
+            st.dataframe(
+                all_df[[x for x in cols if x in all_df.columns]],
+                hide_index=True,
+                use_container_width=True,
+                height=620,
+            )
+        else:
+            st.info("لم تصل عقود من مزود السلسلة ضمن نافذة DTE الحالية.")
+
+
 def render_options_workspace():
     st.title("عقود الخيارات — سهم")
     st.caption(f"v{VERSION} • Call / Put • متابعة شراء العقود وتنفيذ يدوي")
@@ -4657,6 +5024,9 @@ def render_options_workspace():
         analysis_symbol = st.text_input('رمز الأصل للمراجعة الفنية', value='AAPL', key='opt_analysis_symbol').strip().upper()
     budget = st.number_input('ميزانية شراء العقود بالدولار — مبلغ تتحمل خسارته كاملًا', min_value=0.0, value=0.0, key='opt_budget')
     st.caption('يعتمد فحص الميزانية على كامل علاوة الشراء، وليس على الوقف فقط. لا يرسل التطبيق أوامر إلى سهم.')
+
+    render_all_option_opportunities(analysis_symbol)
+
     @st.fragment(run_every=60)
     def smart_panel():
         render_option_intelligence(analysis_symbol, budget)
