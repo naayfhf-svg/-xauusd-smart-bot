@@ -1,0 +1,26 @@
+language: ar
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    base_branches:
+      - "^review-baseline-v612$"
+  path_instructions:
+    - path: "app.py"
+      instructions: |
+        Review correctness, security, and performance of this Streamlit trading-analysis app.
+        Prioritize reproducible defects over stylistic suggestions. Report severity and a regression test.
+        Trace option identity, Call/Put symmetry, bid/ask usage, stale or future timestamps,
+        expiry/timezones, finite numbers, full-premium budget, session isolation, and alert deduplication.
+        Check fragment reruns, cache lifetime, API quotas, synchronous network timeouts, repeated
+        indicator calculations and dataframe copies. Distinguish measured latency from suspected bottlenecks.
+        Preserve all live-trading safeguards. Never treat test passes as strategy profitability.
+        Check whether manual quotes and incomplete Greeks/news are accurately disclosed to the user.
+    - path: "tests/**"
+      instructions: |
+        Check coverage of real UI control flow, not just extracted engine functions.
+        Identify gaps in stale data, adverse fills, reconnects, multi-user state and duplicate alerts.
+    - path: "tools/benchmark_options.py"
+      instructions: |
+        Verify scope and repeatability. This measures offline computation only, not deployed latency or load.
