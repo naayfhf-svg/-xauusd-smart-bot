@@ -6279,40 +6279,41 @@ if instrument.asset_class == "GOLD":
     gold_consensus = gold_price_consensus(quote, broker_quote_payload)
     st.session_state.gold_consensus_snapshot = gold_consensus
     _disp = gold_consensus.get("dispersion_pct")
-    mini_grid(
-        [
-            ("تأكيد المصادر", "مؤكد" if gold_consensus.get("ok") else "غير مؤكد",
-             "ok" if gold_consensus.get("ok") else "bad"),
-            ("مصادر حديثة", str(gold_consensus.get("fresh_sources", 0)),
-             "ok" if gold_consensus.get("fresh_sources", 0) >= 2 else "wait"),
-            ("سعر الإجماع", fmt(gold_consensus.get("consensus_price"), 3), ""),
-            ("اختلاف المصادر", "—" if _disp is None else f"{float(_disp):.3f}%",
-             "ok" if _disp is not None and float(_disp) <= 0.20 else "wait"),
-        ],
-        "tf-grid",
-    )
-    if gold_consensus.get("sources"):
-        _source_rows = []
-        for _src in gold_consensus["sources"]:
-            _source_rows.append({
-                "المصدر": _src.get("source"),
-                "السعر": _src.get("price"),
-                "عمر السعر بالثواني": (
-                    None if _src.get("age_sec") is None else round(float(_src["age_sec"]), 3)
-                ),
-                "حديث": "نعم" if _src.get("fresh") else "لا",
-            })
-        st.dataframe(_source_rows, hide_index=True, use_container_width=True)
-    if not gold_consensus.get("ok"):
-        st.warning(
-            "⛔ تأكيد الذهب من أكثر من مصدر غير مكتمل: "
-            + "، ".join(gold_consensus.get("reasons") or ["تحقق من مصادر الأسعار"])
+    if not gold_compact_mode:
+        mini_grid(
+            [
+                ("تأكيد المصادر", "مؤكد" if gold_consensus.get("ok") else "غير مؤكد",
+                 "ok" if gold_consensus.get("ok") else "bad"),
+                ("مصادر حديثة", str(gold_consensus.get("fresh_sources", 0)),
+                 "ok" if gold_consensus.get("fresh_sources", 0) >= 2 else "wait"),
+                ("سعر الإجماع", fmt(gold_consensus.get("consensus_price"), 3), ""),
+                ("اختلاف المصادر", "—" if _disp is None else f"{float(_disp):.3f}%",
+                 "ok" if _disp is not None and float(_disp) <= 0.20 else "wait"),
+            ],
+            "tf-grid",
         )
-        if not secret("GOLDAPI_KEY") and not broker_quote_payload:
-            st.caption(
-                "للمصدر الثاني أضف GOLDAPI_KEY في Secrets أو اربط Broker Bridge. "
-                "لن يعتمد المحرك دخول الذهب من مصدر واحد فقط."
+        if gold_consensus.get("sources"):
+            _source_rows = []
+            for _src in gold_consensus["sources"]:
+                _source_rows.append({
+                    "المصدر": _src.get("source"),
+                    "السعر": _src.get("price"),
+                    "عمر السعر بالثواني": (
+                        None if _src.get("age_sec") is None else round(float(_src["age_sec"]), 3)
+                    ),
+                    "حديث": "نعم" if _src.get("fresh") else "لا",
+                })
+            st.dataframe(_source_rows, hide_index=True, use_container_width=True)
+        if not gold_consensus.get("ok"):
+            st.warning(
+                "⛔ تأكيد الذهب من أكثر من مصدر غير مكتمل: "
+                + "، ".join(gold_consensus.get("reasons") or ["تحقق من مصادر الأسعار"])
             )
+            if not secret("GOLDAPI_KEY") and not broker_quote_payload:
+                st.caption(
+                    "للمصدر الثاني أضف GOLDAPI_KEY في Secrets أو اربط Broker Bridge. "
+                    "لن يعتمد المحرك دخول الذهب من مصدر واحد فقط."
+                )
 
 analysis = analyze_mtf(raw)
 
@@ -6898,29 +6899,30 @@ if instrument.asset_class == "STOCK":
 if not gold_compact_mode:
     mini_grid(forward_gate_cards, "tf-grid")
 
-if near_entry:
-    st.warning(
-        "🟡 قريب من الدخول: الاتجاه + التذبذب + وقت التداول مكتملة. "
-        "ننتظر حدث الدخول فقط. لن يفتح Paper قبل اكتماله."
-    )
-elif forward_analysis.get("signal") in {"BUY", "SELL"}:
-    _side = forward_analysis.get("signal")
-    st.success(
-        f"🟢 اكتملت شروط {_side}. إذا التداول التجريبي التلقائي مفعّل وبوابة المخاطر تسمح، "
-        "سيتم فتح صفقة Paper تلقائيًا."
-    )
+if not gold_compact_mode:
+    if near_entry:
+        st.warning(
+            "🟡 قريب من الدخول: الاتجاه + التذبذب + وقت التداول مكتملة. "
+            "ننتظر حدث الدخول فقط. لن يفتح Paper قبل اكتماله."
+        )
+    elif forward_analysis.get("signal") in {"BUY", "SELL"}:
+        _side = forward_analysis.get("signal")
+        st.success(
+            f"🟢 اكتملت شروط {_side}. إذا التداول التجريبي التلقائي مفعّل وبوابة المخاطر تسمح، "
+            "سيتم فتح صفقة Paper تلقائيًا."
+        )
 
-if mode == "Paper":
-    if instrument.asset_class == "STOCK":
-        st.info(
-            "Stock Paper جاهز على السهم المختار بأموال افتراضية. "
-            "الدخول الذكي للأسهم BUY فقط، والمخاطرة تُضبط تلقائيًا."
-        )
-    else:
-        st.info(
-            "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
-            "مركز واحد فقط مع إدارة مخاطر تلقائية."
-        )
+    if mode == "Paper":
+        if instrument.asset_class == "STOCK":
+            st.info(
+                "Stock Paper جاهز على السهم المختار بأموال افتراضية. "
+                "الدخول الذكي للأسهم BUY فقط، والمخاطرة تُضبط تلقائيًا."
+            )
+        else:
+            st.info(
+                "Paper Forward جاهز للتجربة على السوق الحالي بدون أموال حقيقية. "
+                "مركز واحد فقط مع إدارة مخاطر تلقائية."
+            )
 
 if near_entry:
     near_key = f"{instrument.symbol}:{candle_id}:{active_candidate}:NEAR"
@@ -7169,8 +7171,9 @@ mini_grid(
 
 # --------------------------- Paper ----------------------------
 if mode == "Paper":
-    st.subheader("التداول التجريبي — السوق الحي")
-    if active_candidate in SMART_PAPER_CANDIDATES:
+    if not gold_compact_mode:
+        st.subheader("التداول التجريبي — السوق الحي")
+    if active_candidate in SMART_PAPER_CANDIDATES and not gold_compact_mode:
         if selected_profile == "ذكي تلقائي":
             engine_name = "الأسهم" if instrument.asset_class == "STOCK" else "الذهب"
             st.info(
@@ -7351,11 +7354,12 @@ if mode == "Paper":
             "tf-grid",
         )
 
-    st.caption(
-        "التداول التجريبي التلقائي: "
-        + ("مفعّل" if st.session_state.auto_paper else "متوقف")
-        + " — التحكم من القائمة الجانبية."
-    )
+    if not gold_compact_mode:
+        st.caption(
+            "التداول التجريبي التلقائي: "
+            + ("مفعّل" if st.session_state.auto_paper else "متوقف")
+            + " — التحكم من القائمة الجانبية."
+        )
 
     if paper_plan and not st.session_state.paper_position:
         if st.button(
@@ -7386,8 +7390,13 @@ if mode == "Paper":
                 persist_paper_state()
                 st.rerun()
 
-    for reason in dict.fromkeys(p_gate_reasons):
-        st.warning(reason)
+    if gold_compact_mode:
+        _compact_reasons = list(dict.fromkeys(p_gate_reasons))
+        if _compact_reasons and paper_plan:
+            st.caption("سبب الحجب: " + _compact_reasons[0])
+    else:
+        for reason in dict.fromkeys(p_gate_reasons):
+            st.warning(reason)
 
     p = st.session_state.paper_position
     if p:
@@ -7416,7 +7425,7 @@ if mode == "Paper":
                 "فقد تحتاج لاحقًا قاعدة بيانات خارجية دائمة."
             )
 
-    if st.session_state.paper_history:
+    if st.session_state.paper_history and not gold_compact_mode:
         paper_df = pd.DataFrame(st.session_state.paper_history)
         if instrument.asset_class == "STOCK" and "asset_class" in paper_df.columns:
             stock_hist = paper_df[paper_df["asset_class"] == "STOCK"].copy()
