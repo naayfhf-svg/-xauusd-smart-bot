@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.3-options-watch"
+VERSION = "6.1.4-options-review"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -4442,6 +4442,163 @@ def evaluate_option_watch(watch, quote, now):
     return result, events, "تم فحص السعر المُدخل يدويًا"
 
 
+def option_direction(snaps, event, feed_ready):
+    """Symmetric, explainable underlying-price rules; not a probability model."""
+    required = ('M5', 'M15', 'H1')
+    if any(not snaps.get(tf) for tf in required):
+        return dict(bias='WAIT', setup=False, checks=[], reason='شموع غير كافية للأطر 5 و15 و60 دقيقة')
+    m5, m15, h1 = (snaps[tf] for tf in required)
+    if any(not finite(s.get(k)) for s in (m5, m15, h1)
+           for k in ('rsi', 'adx', 'momentum', 'macd_hist', 'close', 'ema20', 'ema50')):
+        return dict(bias='WAIT', setup=False, checks=[], reason='مؤشرات غير مكتملة')
+    bias = 'Call' if h1['trend'] == m15['trend'] == 'UP' else 'Put' if h1['trend'] == m15['trend'] == 'DOWN' else 'WAIT'
+    bullish = bias == 'Call'
+    checks = [
+        ('اتفاق اتجاه الساعة و15 دقيقة', bias != 'WAIT'),
+        ('اتجاه 5 دقائق متوافق', m5['trend'] == ('UP' if bullish else 'DOWN') and bias != 'WAIT'),
+        ('الزخم وMACD متوافقان', (m5['momentum'] > 0 and m5['macd_hist'] > 0) if bullish else (m5['momentum'] < 0 and m5['macd_hist'] < 0)),
+        ('RSI داخل نطاق المحرك', (50 <= m5['rsi'] <= 68) if bullish else (32 <= m5['rsi'] <= 50)),
+        ('قوة الاتجاه ADX ≥ 20', m15['adx'] >= 20),
+        ('اختراق وإعادة اختبار مكتملان', bool(event.get('valid')) and event.get('side') == ('BUY' if bullish else 'SELL')),
+        ('بيانات أصل حديثة وجلسة مفتوحة', bool(feed_ready)),
+    ]
+    ready = all(ok for _, ok in checks)
+    return dict(bias=bias, setup=ready, checks=checks,
+                reason='اكتملت شروط سيناريو الأصل؛ يلزم فحص العقد' if ready else 'انتظار: ' + '، '.join(label for label, ok in checks if not ok))
+
+
+def option_smart_review(watch, direction, budget, now):
+    """Contract checks use only the saved option quote, never the stock price."""
+    current = pd.Timestamp(now)
+    dte = (pd.Timestamp(watch['expiry']).date() - current.tz_convert('America/New_York').date()).days
+    result = dict(state='WAIT', reasons=[], dte=dte, spread=None, pnl=None, rr=None, cost=None, breakeven=None, max_qty=None)
+    if watch.get('closed'):
+        result['reasons'] = ['المتابعة مغلقة']
+        return result
+    if dte < 0:
+        result['state'] = 'EXPIRED'
+        result['reasons'] = ['انتهى العقد؛ راجع التسوية أو التنفيذ لدى سهم']
+        return result
+    q = watch.get('last_quote') or {}
+    ts = parse_timestamp(q.get('timestamp'))
+    if ts is None or not -5 <= (current - ts).total_seconds() <= 120:
+        result['state'] = 'UPDATE_QUOTE'
+        result['reasons'] = ['حدّث Bid وAsk للعقد من سهم؛ لا يوجد سعر عقد حديث']
+        if dte <= 2:
+            result['reasons'].append('العقد قريب من الانتهاء')
+        return result
+    bid, ask = q.get('bid'), q.get('ask')
+    if not finite(bid) or not finite(ask) or not 0 <= bid <= ask or ask <= 0:
+        result['reasons'] = ['سعر العقد غير صالح']
+        return result
+    result['spread'] = 100 * (ask - bid) / ((ask + bid) / 2)
+    result['cost'] = ask * watch['qty'] * watch['multiplier']
+    entry = watch.get('actual_entry', watch['entry_high'])
+    result['breakeven'] = watch['strike'] + entry if watch['kind'] == 'Call' else watch['strike'] - entry
+    if finite(budget) and budget > 0:
+        result['max_qty'] = max(0, int(budget // (ask * watch['multiplier'])))
+    if watch['entered']:
+        result['pnl'] = (bid - entry) * watch['qty'] * watch['multiplier']
+        if bid <= watch['stop']:
+            result.update(state='REVIEW_EXIT', reasons=['Bid عند الوقف أو دونه؛ راجع الخروج في سهم'])
+        elif bid >= watch['tp2']:
+            result.update(state='REVIEW_EXIT', reasons=['Bid عند الهدف الثاني؛ راجع جني الربح'])
+        elif bid >= watch['tp1']:
+            result.update(state='REVIEW_PROFIT', reasons=['Bid عند الهدف الأول؛ راجع جني الربح وفق خطتك'])
+        elif dte <= 2:
+            result.update(state='REVIEW_EXPIRY', reasons=['بقي يومان أو أقل؛ راجع انتهاء العقد والتسوية'])
+        elif direction.get('setup') and direction['bias'] != watch['kind']:
+            result.update(state='REVIEW_REVERSAL', reasons=['ظهر سيناريو معاكس على الأصل؛ راجع العقد قبل الاستمرار'])
+        else:
+            result.update(state='MONITOR', reasons=['لم يصل السعر المُدخل إلى الوقف أو الأهداف'])
+        if not direction.get('setup'):
+            result['reasons'].append('لا يوجد سيناريو أصل مؤكد حاليًا؛ المتابعة هنا تعتمد على سعر العقد المُدخل')
+        if result['spread'] > 10:
+            result['reasons'].append('فرق Bid/Ask واسع؛ سعر التنفيذ الفعلي قد يختلف')
+        return result
+    reasons = []
+    if not direction.get('setup') or direction.get('bias') != watch['kind']:
+        reasons.append('سيناريو الأصل لم يكتمل لصالح نوع عقدك')
+    if dte <= 2:
+        reasons.append('المحرك يحجب الدخول خلال آخر يومين قبل الانتهاء')
+    if result['spread'] > 10 or bid == 0:
+        reasons.append('فرق الأسعار يتجاوز حد المحرك 10% أو لا يوجد Bid موجب')
+    if not watch['entry_low'] <= ask <= watch['entry_high']:
+        reasons.append('Ask خارج نطاق دخولك؛ لا تطارد السعر')
+    if not finite(budget) or budget <= 0 or result['cost'] > budget:
+        reasons.append('حدد ميزانية تتحمل خسارتها كاملة؛ تكلفة الشراء يجب ألا تتجاوزها')
+    if ask > watch['stop']:
+        result['rr'] = (watch['tp2'] - ask) / (ask - watch['stop'])
+    if result['rr'] is None or result['rr'] < 1.5:
+        reasons.append('عائد الهدف الثاني إلى مسافة الوقف أقل من حد المحرك 1.5')
+    result['state'] = 'REVIEW_ENTRY' if not reasons else 'WAIT'
+    result['reasons'] = reasons or ['اجتازت المدخلات قواعد المراجعة؛ تحقق من السعر والأخبار في سهم قبل أي قرار']
+    return result
+
+
+def render_option_intelligence(symbol, budget):
+    st.subheader('مراجعة ذكية — الأصل والعقد')
+    st.caption('قواعد فنية قابلة للفحص، وليست نسبة نجاح أو نموذجًا مثبت الربحية. تحليل الأصل يتحدث كل 60 ثانية أثناء فتح هذه الصفحة؛ سعر العقد يدوي.')
+    if not symbol or len(symbol) > 12 or not symbol.isascii() or not all(c.isalnum() or c == '.' for c in symbol):
+        st.info('أدخل رمز الأصل الصحيح لبدء التحليل')
+        return
+    raw, message = fetch_market(symbol)
+    quote = fetch_quote(symbol)
+    if raw.empty:
+        st.info('تحليل الأصل غير متاح؛ تحقق من مصدر البيانات أو دعم الرمز. ' + message)
+        direction = dict(bias='WAIT', setup=False, reason='لا توجد بيانات أصل', checks=[])
+    else:
+        feed = feed_integrity(raw, quote)
+        snaps = {tf: snapshot(frame) for tf, frame in {
+            'M5': closed_m5(raw), 'M15': resample_closed(raw, '15min'), 'H1': resample_closed(raw, '1h')}.items()}
+        event = b2_signal(snaps['M5']['frame']) if snaps['M5'] else {}
+        direction = option_direction(snaps, event, feed.get('execution_ok') and
+                                     quote.get('market_open') is True and stock_session_state()['regular'])
+        st.write(f"ميل الأصل {symbol}: **{direction['bias']}** • " + ('سيناريو مكتمل' if direction['setup'] else 'انتظار التأكيد'))
+        st.caption('آخر شمعة مغلقة: ' + pd.Timestamp(raw.iloc[-1]['datetime']).tz_convert(TZ).strftime('%Y-%m-%d %H:%M الرياض'))
+        st.dataframe([{'شرط المراجعة': label, 'الحالة': 'مكتمل' if ok else 'انتظار'} for label, ok in direction['checks']], hide_index=True)
+        if not feed.get('execution_ok'):
+            st.warning('تحليل تاريخي فقط: ' + '، '.join(feed.get('execution_reasons', [])))
+        st.line_chart(raw.tail(100).set_index('datetime')[['close']], height=180)
+        st.caption('الرسم لسعر الأصل، وليس لعلاوة الخيار')
+    watch = st.session_state.get('option_watch')
+    if not watch or watch.get('closed') or watch['symbol'] != symbol:
+        st.info('احفظ خطة عقد لربط مراجعة الأصل بفحص أسعار العقد')
+        return
+    review = option_smart_review(watch, direction, budget, now_utc())
+    labels = dict(WAIT='انتظار', UPDATE_QUOTE='تحديث سعر العقد مطلوب', EXPIRED='انتهى العقد',
+                  REVIEW_ENTRY='مرشح للمراجعة — ليس أمر دخول', REVIEW_EXIT='راجع الخروج',
+                  REVIEW_PROFIT='راجع جني الربح', REVIEW_EXPIRY='راجع قرب الانتهاء',
+                  REVIEW_REVERSAL='راجع انعكاس الاتجاه', MONITOR='متابعة السعر المُدخل')
+    st.warning(labels[review['state']])
+    for reason in review['reasons']:
+        st.write('• ' + reason)
+    mini_grid([
+        ('أيام حتى الانتهاء', str(review['dte']), 'wait'),
+        ('فرق Bid/Ask %', fmt(review['spread'], 1), ''),
+        ('ربح/خسارة تقديري قبل الرسوم $', fmt(review['pnl'], 2), ''),
+        ('الهدف الثاني ÷ مسافة الوقف', fmt(review['rr'], 2), ''),
+        ('تعادل الأصل عند الانتهاء قبل الرسوم $', fmt(review['breakeven'], 2), ''),
+        ('أقصى عدد بحسب الميزانية قبل الرسوم', str(review['max_qty']) if review['max_qty'] is not None else '—', ''),
+    ], 'plan-grid')
+    st.caption('لا توجد بيانات IV أو Delta أو Theta أو سلسلة عقود أو أخبار أرباح متصلة. اجتياز القواعد لا يعني أن العقد رخيص أو مناسب للشراء. حدود 10% و1.5 ويومين قواعد لهذا المحرك وليست ضمانات.')
+    # Deduplicate review alerts by watch and state. Do not imply a broker fill.
+    alert_states = {'REVIEW_ENTRY', 'REVIEW_EXIT', 'REVIEW_PROFIT', 'REVIEW_EXPIRY', 'REVIEW_REVERSAL'}
+    key = (watch['id'], review['state'])
+    if st.session_state.get('option_review_last') != key:
+        st.session_state.option_review_last = key
+        if review['state'] in alert_states:
+            st.toast(labels[review['state']], icon='🔔')
+    if st.session_state.get('option_review_audit_key') != key:
+        st.session_state.option_review_audit_key = key
+        watch['reviews'] = (watch.get('reviews', []) + [dict(
+            time=now_utc().isoformat(), state=review['state'], reasons=review['reasons'],
+            underlying_bias=direction.get('bias'), underlying_setup=direction.get('setup'),
+            premium_source='manual', version=VERSION)])[-50:]
+        st.session_state.option_watch = watch
+    st.session_state.option_review = review
+
+
 def render_options_workspace():
     st.title("عقود الخيارات — سهم")
     st.caption(f"v{VERSION} • Call / Put • متابعة شراء العقود وتنفيذ يدوي")
@@ -4451,6 +4608,17 @@ def render_options_workspace():
                "الوقف تنبيه وليس أمرًا لدى الوسيط؛ يمكن أن تتجاوز الخسارة الوقف حتى كامل تكلفة الشراء. "
                "المتابعة محفوظة في الجلسة الحالية فقط؛ إعادة فتح الجلسة قد تفقدها.")
     watch = st.session_state.get('option_watch')
+    active_watch = watch and not watch.get('closed')
+    if active_watch:
+        analysis_symbol = watch['symbol']
+    else:
+        analysis_symbol = st.text_input('رمز الأصل للمراجعة الفنية', value='AAPL', key='opt_analysis_symbol').strip().upper()
+    budget = st.number_input('ميزانية شراء العقود بالدولار — مبلغ تتحمل خسارته كاملًا', min_value=0.0, value=0.0, key='opt_budget')
+    st.caption('يعتمد فحص الميزانية على كامل علاوة الشراء، وليس على الوقف فقط. لا يرسل التطبيق أوامر إلى سهم.')
+    @st.fragment(run_every=60)
+    def smart_panel():
+        render_option_intelligence(analysis_symbol, budget)
+    smart_panel()
     if not watch or watch.get('closed'):
         with st.form('option_create'):
             symbol = st.text_input("رمز السهم أو المؤشر", key='opt_symbol', placeholder="AAPL")
@@ -4515,14 +4683,20 @@ def render_options_workspace():
                 now = now_utc()
                 watch, events, message = evaluate_option_watch(watch, dict(watch_id=watch['id'],
                     bid=bid, ask=ask, source='manual', timestamp=(now-pd.Timedelta(seconds=int(age))).isoformat()), now)
+                if message != 'تم فحص السعر المُدخل يدويًا':
+                    watch['last_quote'] = None
                 st.session_state.option_watch = watch
                 st.info(message)
                 for event in events:
                     st.toast(event['message'], icon='🔔')
+                st.session_state.option_quote_message = message
+                st.rerun()
     if watch['last_quote']:
         q = watch['last_quote']
         st.caption(f"آخر سعر يدوي: Bid {q['bid']:.3f} / Ask {q['ask']:.3f} • "
                    f"{pd.Timestamp(q['timestamp']).tz_convert(TZ).strftime('%Y-%m-%d %H:%M:%S')} الرياض — ليس بثًا مباشرًا")
+    if st.session_state.get('option_quote_message'):
+        st.caption(st.session_state.option_quote_message)
     st.subheader("سجل التنبيهات — لا يمثل صفقات منفذة")
     if watch['events']:
         for event in reversed(watch['events']):
@@ -4530,6 +4704,8 @@ def render_options_workspace():
             st.warning(f"{stamp} • {event['message']} • ${event['premium']:.3f} • إدخال يدوي")
     else:
         st.caption("لا توجد تنبيهات مسجلة")
+    with st.expander('سجل قرارات المراجعة الذكية'):
+        st.dataframe(watch.get('reviews', []), hide_index=True)
     st.download_button("تنزيل الخطة وسجل التنبيهات", json.dumps(watch, ensure_ascii=False, indent=2),
                        file_name='option-watch.json', mime='application/json')
     if st.button("إنهاء المتابعة وبدء خطة جديدة", key='opt_close'):
