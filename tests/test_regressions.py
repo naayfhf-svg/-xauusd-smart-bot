@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 
-APP = Path(__file__).resolve().parents[1] / 'app.py'
+APP = Path(__file__).resolve().parents[1] / 'app_core.py'
 
 class State(dict):
     __getattr__ = dict.__getitem__
