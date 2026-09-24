@@ -19,10 +19,8 @@ jobs:
       - name: Install requirements
         run: pip install --disable-pip-version-check -r requirements.txt
       - name: Import dependencies
-        run: python - <<'PY'
-          import streamlit, altair, pandas, numpy, requests
-          print("imports-ok")
-          PY
+        run: |
+          python -c "import streamlit, altair, pandas, numpy, requests; print('imports-ok')"
       - name: Smoke test Streamlit
         run: |
           set -o pipefail
