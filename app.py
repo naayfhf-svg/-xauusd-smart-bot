@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.4-options-review"
+VERSION = "6.1.5-subsecond-timing"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -674,6 +674,9 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
             "retry_after_seconds": wait_seconds,
         }
 
+    request_started = time.perf_counter()
+    received_at_utc = None
+    request_latency_ms = None
     try:
         response = requests.get(
             QUOTE_URL,
@@ -685,18 +688,34 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
             },
             timeout=10,
         )
+        received_at_utc = now_utc()
+        request_latency_ms = (time.perf_counter() - request_started) * 1000.0
         payload = response.json()
     except Exception as exc:
-        return {"connected": False, "error": str(exc)}
+        request_latency_ms = (time.perf_counter() - request_started) * 1000.0
+        return {
+            "connected": False,
+            "error": str(exc),
+            "request_latency_ms": request_latency_ms,
+        }
 
     if not isinstance(payload, dict):
-        return {"connected": False, "error": "رد Quote غير صالح"}
+        return {
+            "connected": False,
+            "error": "رد Quote غير صالح",
+            "request_latency_ms": request_latency_ms,
+        }
     bid = payload.get("bid")
     ask = payload.get("ask")
     last = payload.get("close", payload.get("price", payload.get("last")))
     market_open_raw = payload.get("is_market_open")
     market_open = market_open_raw if isinstance(market_open_raw, bool) else None
-    base = {"market_open": market_open, "raw": payload}
+    base = {
+        "market_open": market_open,
+        "raw": payload,
+        "received_at_utc": received_at_utc,
+        "request_latency_ms": request_latency_ms,
+    }
 
     if finite(bid) and finite(ask) and float(ask) >= float(bid):
         result = {
@@ -1073,6 +1092,7 @@ def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]
             "volatility_ratio": None,
             "recent_range_pct": None,
             "quote_age_min": None,
+            "quote_age_sec": None,
             "quote_ts_source": None,
             "market_open": quote.get("market_open"),
         }
@@ -1127,9 +1147,11 @@ def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]
         structural_reasons.append("التذبذب الحديث منخفض بشكل شاذ مقارنة بتاريخ الأصل")
 
     q_ts, q_source = quote_timestamp(quote)
+    q_age_sec = None
     q_age = None
     if q_ts is not None:
-        q_age = max(0.0, (now_utc() - q_ts).total_seconds() / 60.0)
+        q_age_sec = max(0.0, (now_utc() - q_ts).total_seconds())
+        q_age = q_age_sec / 60.0
 
     if quote.get("connected") and finite(quote.get("last")) and len(close):
         q = float(quote["last"])
@@ -1151,7 +1173,7 @@ def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]
     if q_ts is None:
         execution_reasons.append("لا يوجد توقيت موثوق لآخر Quote")
     elif q_age is not None and q_age > 5:
-        execution_reasons.append(f"Quote قديم ({q_age:.0f} دقيقة)")
+        execution_reasons.append(f"Quote قديم ({q_age_sec:.3f} ثانية)")
     if quote.get("market_open") is False:
         execution_reasons.append("السوق مغلق حسب مزود البيانات")
     if not structural_ok:
@@ -1171,6 +1193,7 @@ def feed_integrity(frame: pd.DataFrame, quote: dict[str, Any]) -> dict[str, Any]
         "volatility_ratio": volatility_ratio,
         "recent_range_pct": recent_range_pct,
         "quote_age_min": q_age,
+        "quote_age_sec": q_age_sec,
         "quote_ts_source": q_source,
         "market_open": quote.get("market_open"),
     }
@@ -4555,6 +4578,25 @@ def render_option_intelligence(symbol, budget):
         direction = option_direction(snaps, event, feed.get('execution_ok') and
                                      quote.get('market_open') is True and stock_session_state()['regular'])
         st.write(f"ميل الأصل {symbol}: **{direction['bias']}** • " + ('سيناريو مكتمل' if direction['setup'] else 'انتظار التأكيد'))
+
+        quote_age_sec = feed.get('quote_age_sec')
+        quote_age_text = '—' if quote_age_sec is None else f"{float(quote_age_sec):,.3f} ثانية"
+        quote_rtt_ms = quote.get('request_latency_ms')
+        quote_rtt_text = '—' if not finite(quote_rtt_ms) else f"{float(quote_rtt_ms):,.1f} ms"
+        last_bar_end = pd.Timestamp(raw.iloc[-1]['datetime']) + pd.Timedelta(minutes=5)
+        last_bar_age_sec = max(0.0, (now_utc() - last_bar_end).total_seconds())
+        market_text = 'مفتوح' if quote.get('market_open') is True else ('مغلق' if quote.get('market_open') is False else 'غير معروف')
+        mini_grid([
+            ('عمر آخر Quote', quote_age_text, 'ok' if quote_age_sec is not None and float(quote_age_sec) <= 5.0 else 'wait'),
+            ('عمر آخر M5', f"{last_bar_age_sec:,.3f} ثانية", 'ok' if last_bar_age_sec <= 15.0 else 'wait'),
+            ('زمن استجابة API', quote_rtt_text, ''),
+            ('حالة السوق', market_text, 'ok' if quote.get('market_open') is True else 'wait'),
+        ], 'tf-grid')
+        st.caption(
+            'عمر Quote بالثواني حتى 0.001 ثانية • '
+            f"مصدر توقيت Quote: {feed.get('quote_ts_source') or 'غير متاح'} • "
+            'زمن API هو زمن الطلب من التطبيق للمصدر، وليس تأخر السوق نفسه.'
+        )
         st.caption('آخر شمعة مغلقة: ' + pd.Timestamp(raw.iloc[-1]['datetime']).tz_convert(TZ).strftime('%Y-%m-%d %H:%M الرياض'))
         st.dataframe([{'شرط المراجعة': label, 'الحالة': 'مكتمل' if ok else 'انتظار'} for label, ok in direction['checks']], hide_index=True)
         if not feed.get('execution_ok'):
@@ -7269,8 +7311,13 @@ if advanced_ui:
 
     quote_age_label = (
         "N/A"
-        if feed.get("quote_age_min") is None
-        else f"{feed['quote_age_min']:.1f}m"
+        if feed.get("quote_age_sec") is None
+        else f"{feed['quote_age_sec']:.3f}s"
+    )
+    quote_latency_label = (
+        "N/A"
+        if not finite(quote.get("request_latency_ms"))
+        else f"{float(quote['request_latency_ms']):.1f}ms"
     )
     vol_ratio_label = (
         "N/A"
@@ -7287,6 +7334,7 @@ if advanced_ui:
         {"Component": "Engine self-test", "Status": "ONLINE"},
         {"Component": "Analysis market data", "Status": "ONLINE" if not raw.empty else "BLOCKED"},
         {"Component": "Paper quote API", "Status": "ONLINE" if quote.get("connected") else ("RATE GUARD" if quote.get("rate_guard") else "CHECK")},
+        {"Component": "Quote API RTT", "Status": quote_latency_label},
         {"Component": "Twelve Data budget", "Status": "PROTECTED (≤7/min)"},
         {"Component": "Feed structure", "Status": "OK" if feed.get("trusted") else "CHECK"},
         {"Component": "Paper execution feed", "Status": "READY" if feed.get("execution_ok") else "BLOCKED"},
@@ -7313,6 +7361,7 @@ if advanced_ui:
         f"{quality['label']} • Structure {'OK' if feed.get('trusted') else 'CHECK'} • "
         f"Paper Execution {'READY' if feed.get('execution_ok') else 'BLOCKED'} • "
         f"Market {market_label} • Quote age {quote_age_label} ({feed.get('quote_ts_source') or 'N/A'}) • "
+        f"API RTT {quote_latency_label} • "
         f"unique {feed.get('unique_ratio',0)*100:.0f}% • "
         f"alternation {feed.get('alternation_ratio',0)*100:.0f}% • "
         f"vol {vol_ratio_label} • {len(raw):,} bars"
