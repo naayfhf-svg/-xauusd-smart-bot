@@ -39,7 +39,7 @@ def test_ui_with_market_fixture(tmp_path,monkeypatch):
         assert not at.exception
         next(x for x in at.toggle if x.label=='إظهار أدوات البحث والتشخيص').set_value(True).run()
         assert not at.exception
-        for section in ['الذهب','العقود','الأسهم']:
+        for section in ['الذهب','العقود','خيارات سهم','الأسهم']:
             at.radio[0].set_value(section).run()
             assert not at.exception, [x.message for x in at.exception]
 
@@ -52,3 +52,36 @@ def test_missing_key_ui(tmp_path,monkeypatch):
     at=AppTest.from_file(str(APP),default_timeout=60).run()
     assert not at.exception
     assert any('مصدر البيانات' in x.value for x in at.error)
+
+
+def test_options_manual_workflow_without_data_key(tmp_path, monkeypatch):
+    monkeypatch.setenv('GOLD_AI_STATE_DB_PATH', str(tmp_path/'options.sqlite3'))
+    monkeypatch.delenv('TWELVE_DATA_API_KEY', raising=False)
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    at = AppTest.from_file(str(APP), default_timeout=60).run()
+    at.radio(key='market_section').set_value('خيارات سهم').run()
+    assert not at.exception
+    at.text_input(key='opt_symbol').input('AAPL')
+    at.selectbox(key='opt_kind').select('Put')
+    for key, value in [('opt_strike',100.),('opt_low',2.),('opt_high',2.2),('opt_stop',1.5),('opt_tp1',3.),('opt_tp2',4.)]:
+        at.number_input(key=key).set_value(value)
+    next(b for b in at.button if b.label == 'حفظ خطة المتابعة').click().run()
+    assert not at.exception
+    assert at.session_state.option_watch['kind'] == 'Put'
+    at.number_input(key='opt_bid').set_value(2.)
+    at.number_input(key='opt_ask').set_value(2.1)
+    at.checkbox(key='opt_checked').check()
+    next(b for b in at.button if b.label == 'تحديث السعر وفحص التنبيهات').click().run()
+    assert not at.exception
+    assert at.session_state.option_watch['events'][-1]['code'] == 'ENTRY'
+    at.number_input(key='opt_actual').set_value(2.1)
+    next(b for b in at.button if b.label == 'سجل أنني اشتريت العقد في سهم').click().run()
+    at.number_input(key='opt_bid').set_value(1.4)
+    at.number_input(key='opt_ask').set_value(1.45)
+    next(b for b in at.button if b.label == 'تحديث السعر وفحص التنبيهات').click().run()
+    assert not at.exception
+    assert at.session_state.option_watch['events'][-1]['code'] == 'STOP'
+    at.button(key='opt_close').click().run()
+    assert not at.exception
+    assert at.session_state.option_watch['closed']
