@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.3.0-smart-alerts-gold-options"
+VERSION = "6.3.1-arabic-alerts-ui"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -128,6 +128,24 @@ def secret(name: str, default: Any = None) -> Any:
 
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def signal_ar(value: Any) -> str:
+    """Arabic display label while keeping internal strategy constants unchanged."""
+    mapping = {
+        "BUY": "شراء",
+        "SELL": "بيع",
+        "WAIT": "انتظار",
+        "Call": "كول",
+        "Put": "بوت",
+        "OPEN": "مفتوح",
+        "CLOSED": "مغلق",
+        "READY": "جاهز",
+        "BLOCKED": "محجوب",
+        "UNLOCKED": "مفتوح",
+        "LOCKED": "مقفل",
+    }
+    return mapping.get(str(value), str(value))
 
 
 def smart_alert_channels() -> dict[str, bool]:
@@ -2226,7 +2244,7 @@ def manage_paper(price: float) -> None:
             emit_smart_alert(
                 f"paper-tp1:{p['id']}",
                 "🎯 الهدف الأول تحقق",
-                f"{p['symbol']} • BUY • TP1 {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
+                f"{p['symbol']} • شراء • الهدف الأول {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
                 icon="⏰",
                 payload={"symbol": p["symbol"], "side": "BUY", "type": "TP1"},
             )
@@ -2248,7 +2266,7 @@ def manage_paper(price: float) -> None:
             emit_smart_alert(
                 f"paper-tp1:{p['id']}",
                 "🎯 الهدف الأول تحقق",
-                f"{p['symbol']} • SELL • TP1 {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
+                f"{p['symbol']} • بيع • الهدف الأول {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
                 icon="⏰",
                 payload={"symbol": p["symbol"], "side": "SELL", "type": "TP1"},
             )
@@ -4703,7 +4721,7 @@ def render_option_intelligence(symbol, budget):
         event = b2_signal(snaps['M5']['frame']) if snaps['M5'] else {}
         direction = option_direction(snaps, event, feed.get('execution_ok') and
                                      quote.get('market_open') is True and stock_session_state()['regular'])
-        st.write(f"ميل الأصل {symbol}: **{direction['bias']}** • " + ('سيناريو مكتمل' if direction['setup'] else 'انتظار التأكيد'))
+        st.write(f"ميل الأصل {symbol}: **{signal_ar(direction['bias'])}** • " + ('سيناريو مكتمل' if direction['setup'] else 'انتظار التأكيد'))
 
         quote_age_sec = feed.get('quote_age_sec')
         quote_age_text = '—' if quote_age_sec is None else f"{float(quote_age_sec):,.3f} ثانية"
@@ -5101,7 +5119,7 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
     mini_grid([
         ("الأصل", symbol, ""),
         ("سعر الأصل", fmt(spot, 2), ""),
-        ("اتجاه السيناريو", str(direction.get("bias", "WAIT")), "ok" if direction.get("setup") else "wait"),
+        ("اتجاه السيناريو", signal_ar(direction.get("bias", "WAIT")), "ok" if direction.get("setup") else "wait"),
         ("اكتمال السيناريو", "مكتمل" if direction.get("setup") else "انتظار", "ok" if direction.get("setup") else "wait"),
         ("عمر Quote", "—" if quote_age is None else f"{float(quote_age):.3f}s", "ok" if quote_age is not None and float(quote_age) <= 5 else "wait"),
         ("تواريخ فُحصت", str(result.get("expirations_checked", 0)), ""),
@@ -5137,7 +5155,7 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
         delta = focus.get("Delta")
         st.success(
             f"🟢 شروط النظام مكتملة — يوجد {len(opportunities)} عقد/عقود جاهزة للمراجعة "
-            f"باتجاه {direction.get('bias', '—')}"
+            f"باتجاه {signal_ar(direction.get('bias', '—'))}"
         )
         st.caption(
             "هذه إشارة اكتمال قواعد النظام وليست ضمان ربح أو أمر شراء. "
@@ -5145,7 +5163,7 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
         )
         mini_grid([
             ("العقد", str(focus.get("العقد") or "—"), "ok"),
-            ("النوع", str(focus.get("النوع") or "—"), "ok"),
+            ("النوع", signal_ar(focus.get("النوع") or "—"), "ok"),
             ("Strike", fmt(focus.get("Strike"), 2), ""),
             ("الانتهاء", str(focus.get("الانتهاء") or "—"), ""),
             ("DTE", str(focus.get("DTE") or "—"), ""),
@@ -5186,6 +5204,8 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
             )
 
         compact_df = pd.DataFrame(opportunities[:8])
+        if "النوع" in compact_df.columns:
+            compact_df["النوع"] = compact_df["النوع"].map(signal_ar)
         st.dataframe(
             compact_df[[x for x in compact_cols if x in compact_df.columns]],
             hide_index=True,
@@ -5197,6 +5217,8 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
     with tab1:
         if result["opportunities"]:
             opp_df = pd.DataFrame(result["opportunities"])
+            if "النوع" in opp_df.columns:
+                opp_df["النوع"] = opp_df["النوع"].map(signal_ar)
             cols = [
                 "العقد", "النوع", "الانتهاء", "DTE", "Strike", "Bid", "Ask",
                 "Spread %", "Volume", "OI", "Delta", "Gamma", "Theta", "Vega", "IV",
@@ -5221,6 +5243,10 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
     with tab2:
         if result["all_rows"]:
             all_df = pd.DataFrame(result["all_rows"])
+            if "النوع" in all_df.columns:
+                all_df["النوع"] = all_df["النوع"].map(signal_ar)
+            if "سيناريو الأصل" in all_df.columns:
+                all_df["سيناريو الأصل"] = all_df["سيناريو الأصل"].map(signal_ar)
             cols = [
                 "العقد", "النوع", "الانتهاء", "DTE", "Strike", "Bid", "Ask",
                 "Spread %", "Volume", "OI", "Delta", "Gamma", "Theta", "Vega", "IV",
@@ -5238,7 +5264,7 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
 
 def render_options_workspace():
     st.title("عقود الخيارات — سهم")
-    st.caption(f"v{VERSION} • Call / Put • متابعة شراء العقود وتنفيذ يدوي")
+    st.caption(f"v{VERSION} • كول / بوت • متابعة شراء العقود وتنفيذ يدوي")
     st.info("هذه متابعة لحدود تختارها أنت. لا يوجد اتصال بأسعار عقود سهم أو بحسابك. "
             "يظهر التنبيه عند تحديث السعر هنا فقط، ولا تصلك إشعارات عند إغلاق التطبيق.")
     st.caption("أسعار الدخول والوقف والأهداف هي علاوة الخيار بالدولار للوحدة، وليست سعر السهم. "
@@ -5262,7 +5288,12 @@ def render_options_workspace():
     if not watch or watch.get('closed'):
         with st.form('option_create'):
             symbol = st.text_input("رمز السهم أو المؤشر", key='opt_symbol', placeholder="AAPL")
-            kind = st.selectbox("نوع العقد المشترى", ['Call', 'Put'], key='opt_kind')
+            kind = st.selectbox(
+                "نوع العقد المشترى",
+                ['Call', 'Put'],
+                format_func=lambda x: "كول" if x == "Call" else "بوت",
+                key='opt_kind',
+            )
             expiry = st.date_input("تاريخ انتهاء العقد", value=now_riyadh().date() + pd.Timedelta(days=7), key='opt_expiry')
             strike = st.number_input("سعر التنفيذ Strike", min_value=0.0, value=0.0, key='opt_strike')
             low = st.number_input("أقل سعر دخول للعقد", min_value=0.0, value=0.0, format='%.3f', key='opt_low')
@@ -5869,8 +5900,8 @@ if (
             f"reversal:{_rev_key}",
             "⚠️ انعكاس — راجع الخروج",
             (
-                f"{instrument.symbol} • الصفقة الحالية {_current_paper.get('side')} "
-                f"والإشارة الجديدة {execution_analysis.get('signal')} عند {fmt(reference_price, 4)}"
+                f"{instrument.symbol} • الصفقة الحالية {signal_ar(_current_paper.get('side'))} "
+                f"والإشارة الجديدة {signal_ar(execution_analysis.get('signal'))} عند {fmt(reference_price, 4)}"
             ),
             icon="⏰",
             payload={
@@ -5889,7 +5920,7 @@ stock_market_closed = bool(
     )
 )
 execution_label = (
-    "READY"
+    "جاهز"
     if feed.get("execution_ok")
     else ("السوق مغلق" if stock_market_closed else "تحقق مطلوب")
 )
@@ -5902,11 +5933,11 @@ execution_state = (
 mini_grid(
     [
         ("السعر", fmt(reference_price, 4), ""),
-        ("القرار", execution_analysis["signal"], "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"),
+        ("القرار", signal_ar(execution_analysis["signal"]), "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"),
         ("القوة", f"{execution_analysis['strength']}%", ""),
         ("بيانات التنفيذ", execution_label, execution_state),
-        ("Live", "UNLOCKED" if live_unlocked else "LOCKED", "ok" if live_unlocked else "wait"),
-        ("Kill Switch", "ON" if st.session_state.kill_switch else "OFF", "wait" if st.session_state.kill_switch else "ok"),
+        ("التداول الحقيقي", "مفتوح" if live_unlocked else "مقفل", "ok" if live_unlocked else "wait"),
+        ("قفل الأمان", "مفعل" if st.session_state.kill_switch else "غير مفعل", "wait" if st.session_state.kill_switch else "ok"),
     ],
     "status-grid",
 )
