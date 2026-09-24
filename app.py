@@ -4233,6 +4233,114 @@ def _independent_validation_gate(
     }
 
 
+def _gold_buy_validation_gate(
+    stats_2bps: dict[str, Any],
+    cost_df: pd.DataFrame,
+    robustness: dict[str, Any],
+    context: str,
+    history_days: int,
+    history_bars: int,
+) -> dict[str, Any]:
+    """Strict BUY-only gate. Passing unlocks alerts/Paper review, not guaranteed profitability."""
+    base = _research_gate(
+        stats_2bps,
+        cost_df,
+        context,
+        history_days=history_days,
+        history_bars=history_bars,
+    )
+    quarters = robustness.get("quarters", []) or []
+    profitable_quarters = sum(
+        1 for q in quarters
+        if float(q.get("Avg R", 0.0)) > 0.0
+    )
+    extra = [
+        {
+            "name": "Bootstrap 95% الأدنى > 0R",
+            "pass": float(robustness.get("bootstrap_low", -999.0)) > 0.0,
+            "value": float(robustness.get("bootstrap_low", -999.0)),
+        },
+        {
+            "name": "ربحية زمنية ≥ 3 من 4 أرباع",
+            "pass": profitable_quarters >= 3,
+            "value": profitable_quarters,
+        },
+    ]
+    rules = list(base.get("rules", [])) + extra
+    failed = [r["name"] for r in rules if not r.get("pass")]
+    return {
+        **base,
+        "passed": not failed,
+        "rules": rules,
+        "reasons": failed,
+        "profitable_quarters": profitable_quarters,
+        "checked_at": now_riyadh().isoformat(),
+    }
+
+
+def run_gold_buy_validation(
+    spec: InstrumentSpec,
+    risk_pct: float,
+    history_days: int = 180,
+) -> dict[str, Any]:
+    """Dedicated independent BUY-only audit using the exact strict BUY signal family."""
+    raw, history_meta = fetch_long_history(
+        spec.symbol,
+        history_days=int(history_days),
+        chunk_days=17,
+    )
+    prepared = prepare_research_context(raw)
+    if not prepared.get("ok", False):
+        return {
+            "ok": False,
+            "error": prepared.get("warning", "تعذر تجهيز بيانات تحقق الشراء"),
+        }
+
+    rows = []
+    trades_2 = pd.DataFrame()
+    stats_2: dict[str, Any] = {}
+    for cost in (2.0, 5.0, 10.0):
+        trades, stats = simulate_prepared_research(
+            prepared,
+            spec,
+            risk_pct=float(risk_pct),
+            cost_bps_roundtrip=cost,
+            research_variant="BUY_ONLY",
+        )
+        if cost == 2.0:
+            trades_2 = trades
+            stats_2 = stats
+        rows.append(_validation_cost_row(cost, stats))
+
+    cost_df = pd.DataFrame(rows)
+    robustness = _research_robustness(trades_2)
+    context = hashlib.sha256(
+        (
+            f"{VERSION}|{spec.symbol}|BUY_ONLY|{history_days}|"
+            f"{float(risk_pct):.6f}"
+        ).encode()
+    ).hexdigest()[:16]
+    gate = _gold_buy_validation_gate(
+        stats_2,
+        cost_df,
+        robustness,
+        context,
+        history_days=int(history_meta.get("requested_days", history_days)),
+        history_bars=int(history_meta.get("bars", len(raw))),
+    )
+    return {
+        "ok": True,
+        "context": context,
+        "variant": "BUY_ONLY",
+        "history_meta": history_meta,
+        "stats": stats_2,
+        "cost_scenarios": cost_df,
+        "robustness": robustness,
+        "gate": gate,
+        "checked_at": now_riyadh().isoformat(),
+    }
+
+
 def _validation_cost_row(
     cost_bps: float,
     stats: dict[str, Any],
@@ -5952,11 +6060,16 @@ if instrument.asset_class == "STOCK":
         "الفحص الشرعي يحتاج مصدرًا محدثًا منفصلًا."
     )
 elif instrument.asset_class == "GOLD":
-    st.warning(
-        "⚠️ تنبيه تحقق مهم: مسار الذهب الذكي AutoPilot الحالي مبني على مرشحات بيع "
-        "متحقق منها داخل المحرك. أي إشارة شراء من شاشة التحليل الأساسية لا تُعامل "
-        "كدخول شراء معتمد، وتم حجب تنبيه الدخول شراء حتى يوجد اختبار مستقل لمسار الشراء."
-    )
+    if gold_buy_validation_passed():
+        st.success(
+            "✅ مسار شراء الذهب اجتاز بوابة التحقق BUY-only في هذه الجلسة. "
+            "يبقى الدخول محجوبًا إذا لم تتفق مصادر السعر أو كانت البيانات قديمة."
+        )
+    else:
+        st.warning(
+            "⚠️ شراء الذهب مقفل حاليًا: يلزم اجتياز اختبار BUY-only التاريخي المستقل "
+            "قبل أن يعطي المحرك تنبيه دخول شراء."
+        )
     st.caption(
         "لا تعتمد على التطبيق وحده في قرار مالي حقيقي، ولا تستخدم مالًا مقترضًا "
         "أو مبلغًا لا تستطيع تحمل خسارته بالكامل."
@@ -6037,6 +6150,53 @@ if instrument.asset_class == "GOLD":
             )
 
 analysis = analyze_mtf(raw)
+
+if instrument.asset_class == "GOLD":
+    st.markdown("### تحقق شراء الذهب")
+    _buy_validation = st.session_state.get("gold_buy_validation")
+    if isinstance(_buy_validation, dict) and _buy_validation.get("ok"):
+        _buy_gate = _buy_validation.get("gate") or {}
+        _buy_stats = _buy_validation.get("stats") or {}
+        _buy_norm = _buy_stats.get("normalized") or {}
+        mini_grid(
+            [
+                ("حالة شراء الذهب", "مفتوح للمراجعة" if _buy_gate.get("passed") else "مقفل",
+                 "ok" if _buy_gate.get("passed") else "bad"),
+                ("عدد الصفقات التاريخية", str(_buy_stats.get("trades", 0)), ""),
+                ("معامل الربح", fmt(_buy_norm.get("profit_factor"), 2),
+                 "ok" if float(_buy_norm.get("profit_factor", 0.0)) >= 1.20 else "wait"),
+                ("متوسط R", f"{float(_buy_norm.get('avg_r_net', 0.0)):.3f}R",
+                 "ok" if float(_buy_norm.get("avg_r_net", 0.0)) > 0 else "bad"),
+            ],
+            "tf-grid",
+        )
+        if not _buy_gate.get("passed"):
+            st.caption("أسباب بقاء الشراء مقفلًا: " + " • ".join(_buy_gate.get("reasons", [])[:6]))
+    else:
+        st.info("لم يتم تشغيل اختبار شراء الذهب المستقل في هذه الجلسة.")
+
+    if st.button("تشغيل تحقق شراء الذهب — 180 يوم", use_container_width=True, key="gold_buy_validation_run"):
+        with st.status("جاري اختبار BUY-only تاريخيًا مع تكاليف 2 / 5 / 10 bps...", expanded=True) as _gb_status:
+            try:
+                _result = run_gold_buy_validation(
+                    instrument,
+                    risk_pct=float(risk_pct),
+                    history_days=180,
+                )
+                st.session_state.gold_buy_validation = _result
+                if _result.get("ok") and (_result.get("gate") or {}).get("passed"):
+                    _gb_status.update(label="اجتاز شراء الذهب بوابة التحقق", state="complete", expanded=False)
+                    st.success("✅ اجتاز مسار الشراء الاختبار المحدد. ما زال يحتاج توافق مصادر السعر لحظة الدخول.")
+                elif _result.get("ok"):
+                    _gb_status.update(label="لم يجتز شراء الذهب بوابة التحقق", state="error", expanded=False)
+                    st.error("⛔ لم يجتز مسار الشراء الاختبار؛ سيظل تنبيه الشراء مقفلًا.")
+                else:
+                    _gb_status.update(label="تعذر تشغيل تحقق الشراء", state="error", expanded=False)
+                    st.error(str(_result.get("error", "تعذر الاختبار")))
+            except Exception as exc:
+                _gb_status.update(label="تعذر تشغيل تحقق الشراء", state="error", expanded=False)
+                st.error(f"فشل تحقق شراء الذهب: {exc}")
+        st.rerun()
 
 smart_autopilot_meta: dict[str, Any] = {
     "mode": "MANUAL_PROFILE",
@@ -6157,7 +6317,11 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
 
             # Gold AutoPilot research path is currently sell-side only.
             # Do not convert an unvalidated baseline BUY into an actionable alert.
-            if instrument.asset_class == "GOLD" and execution_analysis["signal"] == "BUY":
+            if (
+                instrument.asset_class == "GOLD"
+                and execution_analysis["signal"] == "BUY"
+                and not gold_buy_validation_passed()
+            ):
                 emit_smart_alert(
                     f"gold-buy-blocked:{alert_key}",
                     "⛔ شراء الذهب غير معتمد",
@@ -6248,7 +6412,11 @@ execution_state = (
 
 _display_signal = signal_ar(execution_analysis["signal"])
 _display_signal_state = "ok" if execution_analysis["signal"] in {"BUY", "SELL"} else "wait"
-if instrument.asset_class == "GOLD" and execution_analysis["signal"] == "BUY":
+if (
+    instrument.asset_class == "GOLD"
+    and execution_analysis["signal"] == "BUY"
+    and not gold_buy_validation_passed()
+):
     _display_signal = "شراء غير معتمد"
     _display_signal_state = "wait"
 
