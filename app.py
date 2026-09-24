@@ -6824,18 +6824,18 @@ with st.expander("لماذا هذا القرار؟", expanded=False):
 
 # ----------------------- analysis trade plan ------------------
 paper_plan: dict[str, Any] | None = None
-m5_snap = forward_analysis.get("snapshots", {}).get("M5")
-if forward_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
+m5_snap = execution_analysis.get("snapshots", {}).get("M5")
+if execution_analysis["signal"] in {"BUY", "SELL"} and m5_snap:
     try:
         paper_entry_reference = reference_price
-        if instrument.asset_class == "STOCK" and forward_analysis["signal"] == "BUY":
+        if instrument.asset_class == "STOCK" and execution_analysis["signal"] == "BUY":
             paper_entry_reference = (
                 float(quote["ask"])
                 if finite(quote.get("ask"))
                 else float(reference_price) * (1.0 + 0.0002)
             )
         paper_plan = build_trade_plan(
-            forward_analysis["signal"],
+            execution_analysis["signal"],
             paper_entry_reference,
             float(m5_snap["atr"]),
             float(st.session_state.paper_balance),
@@ -7235,14 +7235,18 @@ if mode == "Live":
 
         live_plan = None
         if (
-            forward_analysis["signal"] in {"BUY", "SELL"}
+            execution_analysis["signal"] in {"BUY", "SELL"}
             and m5_snap
             and broker_quote.get("ok")
             and equity > 0
+            and (
+                instrument.asset_class != "GOLD"
+                or (isinstance(gold_consensus, dict) and gold_consensus.get("ok"))
+            )
         ):
             try:
                 live_plan = build_trade_plan(
-                    forward_analysis["signal"],
+                    execution_analysis["signal"],
                     float(broker_quote["price"]),
                     float(m5_snap["atr"]),
                     equity,
@@ -8590,6 +8594,11 @@ if st.session_state.auto_refresh:
 
         hb_quote = fetch_quote(instrument.symbol)
         hb_feed = feed_integrity(hb_raw, hb_quote)
+        hb_gold_consensus = (
+            gold_price_consensus(hb_quote, broker_quote_payload)
+            if instrument.asset_class == "GOLD"
+            else None
+        )
         hb_price = (
             float(hb_quote["last"])
             if hb_quote.get("connected") and finite(hb_quote.get("last"))
@@ -8642,6 +8651,17 @@ if st.session_state.auto_refresh:
                 hb_risk_pct = adaptive_paper_risk_pct(hb_profile, instrument.asset_class)
             else:
                 hb_analysis = analyze_forward_candidate(hb_raw, hb_active_candidate)
+
+            if (
+                instrument.asset_class == "GOLD"
+                and hb_analysis.get("signal") in {"BUY", "SELL"}
+                and (not isinstance(hb_gold_consensus, dict) or not hb_gold_consensus.get("ok"))
+            ):
+                hb_analysis = {
+                    **hb_analysis,
+                    "signal": "WAIT",
+                    "reason": "Heartbeat: إشارة الذهب محجوبة حتى يتفق مصدران حديثان",
+                }
 
             hb_m5 = hb_analysis.get("snapshots", {}).get("M5")
             hb_candle = str(hb_raw["datetime"].iloc[-1])
@@ -8711,9 +8731,16 @@ if st.session_state.auto_refresh:
                 except ValueError:
                     pass
 
+        _hb_ready = bool(hb_feed.get("execution_ok"))
+        if instrument.asset_class == "GOLD":
+            _hb_ready = bool(
+                _hb_ready
+                and isinstance(hb_gold_consensus, dict)
+                and hb_gold_consensus.get("ok")
+            )
         st.caption(
-            f"Paper heartbeat • {now_riyadh().strftime('%H:%M:%S')} • "
-            f"{'READY' if hb_feed.get('execution_ok') else 'BLOCKED'}"
+            f"نبض Paper • {now_riyadh().strftime('%H:%M:%S')} • "
+            f"{'جاهز' if _hb_ready else 'محجوب'}"
         )
 
     _paper_heartbeat()
