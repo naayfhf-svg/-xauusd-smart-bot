@@ -5700,7 +5700,54 @@ ADAPTIVE_PROFILE_CANDIDATES = {
     "مرن": "V410_ADAPTIVE_FLEX",
 }
 ADAPTIVE_CANDIDATES = set(ADAPTIVE_PROFILE_CANDIDATES.values())
-SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES
+GOLD_BUY_CANDIDATE = "BUY_STRICT_VALIDATED"
+SMART_PAPER_CANDIDATES = ADAPTIVE_CANDIDATES | STOCK_CANDIDATES | {GOLD_BUY_CANDIDATE}
+
+def gold_buy_validation_passed() -> bool:
+    validation = st.session_state.get("gold_buy_validation")
+    if not isinstance(validation, dict):
+        return False
+    gate = validation.get("gate") or {}
+    return bool(gate.get("passed"))
+
+
+def analyze_gold_buy_candidate(raw_df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Strict BUY candidate matched to the BUY_ONLY historical research variant.
+    It is actionable only after the dedicated validation gate passes.
+    """
+    result = analyze_mtf(closed_m5(raw_df))
+    raw_signal = result.get("signal", "WAIT")
+    validated = gold_buy_validation_passed()
+    if raw_signal == "BUY" and validated:
+        return {
+            **result,
+            "signal": "BUY",
+            "candidate": GOLD_BUY_CANDIDATE,
+            "readiness_pct": int(result.get("buy_score", result.get("strength", 0))),
+            "buy_validation_ok": True,
+            "reason": "شراء صارم: MTF + B2 مكتملة، واختبار BUY المستقل ناجح",
+        }
+    if raw_signal == "BUY" and not validated:
+        return {
+            **result,
+            "signal": "WAIT",
+            "candidate": GOLD_BUY_CANDIDATE,
+            "readiness_pct": int(result.get("buy_score", result.get("strength", 0))),
+            "buy_validation_ok": False,
+            "near_entry": True,
+            "reason": "ظهرت شروط شراء صارمة، لكن اختبار BUY المستقل لم يجتز البوابة بعد",
+        }
+    return {
+        **result,
+        "signal": "WAIT",
+        "candidate": GOLD_BUY_CANDIDATE,
+        "readiness_pct": int(result.get("buy_score", 0)),
+        "buy_validation_ok": validated,
+        "near_entry": False,
+        "reason": "شراء: بانتظار اكتمال شروط الاتجاه والزخم وB2",
+    }
+
 
 def recent_paper_loss_streak(asset_class: str | None = None) -> int:
     streak = 0
@@ -5776,7 +5823,7 @@ def choose_smart_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, An
     loss_streak = recent_paper_loss_streak("GOLD")
     allowed = ["صارم"] if loss_streak >= 1 else profile_order
 
-    # Strongest valid signal wins.
+    # Strongest valid SELL signal wins first.
     for profile in allowed:
         result = evaluations[profile]
         if result.get("signal") == "SELL":
@@ -5787,7 +5834,7 @@ def choose_smart_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, An
                 {
                     "mode": "AUTO_SIGNAL",
                     "loss_streak": loss_streak,
-                    "reason": f"اختير {profile} لأنه أقوى نمط لديه إشارة مكتملة",
+                    "reason": f"اختير {profile} لأنه أقوى نمط بيع لديه إشارة مكتملة",
                     "evaluations": {
                         p: {
                             "signal": evaluations[p].get("signal"),
@@ -5798,6 +5845,36 @@ def choose_smart_autopilot(raw_df: pd.DataFrame) -> tuple[str, str, dict[str, An
                     },
                 },
             )
+
+    # BUY uses a separate strict model and cannot become actionable until its
+    # own historical validation gate has passed.
+    buy_result = analyze_gold_buy_candidate(raw_df)
+    if buy_result.get("signal") == "BUY":
+        return (
+            "صارم",
+            GOLD_BUY_CANDIDATE,
+            buy_result,
+            {
+                "mode": "AUTO_SIGNAL_BUY_VALIDATED",
+                "loss_streak": loss_streak,
+                "reason": "شراء صارم اجتاز شروط اللحظة وبوابة التحقق التاريخي المستقلة",
+                "evaluations": {
+                    **{
+                        p: {
+                            "signal": evaluations[p].get("signal"),
+                            "readiness": int(evaluations[p].get("readiness_pct", 0)),
+                            "event": evaluations[p].get("event"),
+                        }
+                        for p in profile_order
+                    },
+                    "شراء": {
+                        "signal": buy_result.get("signal"),
+                        "readiness": int(buy_result.get("readiness_pct", 0)),
+                        "event": "B2_BUY",
+                    },
+                },
+            },
+        )
 
     # No entry yet: show the candidate nearest to completion.
     priority = {"صارم": 3, "متوازن": 2, "مرن": 1}
@@ -5919,6 +5996,46 @@ reference_price = (
     else float(raw["close"].iloc[-1])
 )
 
+gold_consensus = None
+if instrument.asset_class == "GOLD":
+    gold_consensus = gold_price_consensus(quote, broker_quote_payload)
+    st.session_state.gold_consensus_snapshot = gold_consensus
+    _disp = gold_consensus.get("dispersion_pct")
+    mini_grid(
+        [
+            ("تأكيد المصادر", "مؤكد" if gold_consensus.get("ok") else "غير مؤكد",
+             "ok" if gold_consensus.get("ok") else "bad"),
+            ("مصادر حديثة", str(gold_consensus.get("fresh_sources", 0)),
+             "ok" if gold_consensus.get("fresh_sources", 0) >= 2 else "wait"),
+            ("سعر الإجماع", fmt(gold_consensus.get("consensus_price"), 3), ""),
+            ("اختلاف المصادر", "—" if _disp is None else f"{float(_disp):.3f}%",
+             "ok" if _disp is not None and float(_disp) <= 0.20 else "wait"),
+        ],
+        "tf-grid",
+    )
+    if gold_consensus.get("sources"):
+        _source_rows = []
+        for _src in gold_consensus["sources"]:
+            _source_rows.append({
+                "المصدر": _src.get("source"),
+                "السعر": _src.get("price"),
+                "عمر السعر بالثواني": (
+                    None if _src.get("age_sec") is None else round(float(_src["age_sec"]), 3)
+                ),
+                "حديث": "نعم" if _src.get("fresh") else "لا",
+            })
+        st.dataframe(_source_rows, hide_index=True, use_container_width=True)
+    if not gold_consensus.get("ok"):
+        st.warning(
+            "⛔ تأكيد الذهب من أكثر من مصدر غير مكتمل: "
+            + "، ".join(gold_consensus.get("reasons") or ["تحقق من مصادر الأسعار"])
+        )
+        if not secret("GOLDAPI_KEY") and not broker_quote_payload:
+            st.caption(
+                "للمصدر الثاني أضف GOLDAPI_KEY في Secrets أو اربط Broker Bridge. "
+                "لن يعتمد المحرك دخول الذهب من مصدر واحد فقط."
+            )
+
 analysis = analyze_mtf(raw)
 
 smart_autopilot_meta: dict[str, Any] = {
@@ -5943,14 +6060,15 @@ if instrument.asset_class == "STOCK":
         forward_analysis = analyze_stock_candidate(raw, adaptive_profile)
     if mode == "Paper":
         paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "STOCK")
-elif mode == "Paper" and adaptive_paper_mode and selected_profile == "ذكي تلقائي" and instrument.asset_class == "GOLD":
+elif instrument.asset_class == "GOLD" and selected_profile == "ذكي تلقائي":
     (
         adaptive_profile,
         active_candidate,
         forward_analysis,
         smart_autopilot_meta,
     ) = choose_smart_autopilot(raw)
-    paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "GOLD")
+    if mode == "Paper":
+        paper_risk_pct = adaptive_paper_risk_pct(adaptive_profile, "GOLD")
 else:
     forward_analysis = analyze_forward_candidate(raw, active_candidate)
     if active_candidate in SMART_PAPER_CANDIDATES:
@@ -5972,9 +6090,23 @@ if not feed.get("trusted", False):
 
 execution_analysis = (
     forward_analysis
-    if instrument.asset_class == "STOCK" or mode in {"Paper", "Live"}
+    if instrument.asset_class in {"STOCK", "GOLD"} or mode in {"Paper", "Live"}
     else analysis
 )
+
+if (
+    instrument.asset_class == "GOLD"
+    and (not isinstance(gold_consensus, dict) or not gold_consensus.get("ok"))
+    and execution_analysis.get("signal") in {"BUY", "SELL"}
+):
+    execution_analysis = {
+        **execution_analysis,
+        "signal": "WAIT",
+        "reason": (
+            "تم حجب إشارة الذهب: نحتاج توافق مصدرين حديثين على الأقل "
+            "واختلاف سعر لا يتجاوز 0.20%"
+        ),
+    }
 
 candle_id = str(raw["datetime"].iloc[-1])
 research_context = hashlib.sha256(
