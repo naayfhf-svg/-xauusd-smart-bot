@@ -39,7 +39,7 @@ def test_ui_with_market_fixture(tmp_path,monkeypatch):
         assert not at.exception
         next(x for x in at.toggle if x.label=='إظهار أدوات البحث والتشخيص').set_value(True).run()
         assert not at.exception
-        for section in ['الذهب','العقود','الأسهم']:
+        for section in ['الذهب','العقود','خيارات سهم','الأسهم']:
             at.radio[0].set_value(section).run()
             assert not at.exception, [x.message for x in at.exception]
 
