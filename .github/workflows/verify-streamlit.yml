@@ -21,6 +21,18 @@ jobs:
       - name: Import dependencies
         run: |
           python -c "import streamlit, altair, pandas, numpy, requests; print('imports-ok')"
+      - name: Execute app with Streamlit AppTest
+        run: |
+          python - <<'PY'
+          from streamlit.testing.v1 import AppTest
+          at = AppTest.from_file("app.py")
+          at.run(timeout=90)
+          if at.exception:
+              for exc in at.exception:
+                  print(exc.value)
+              raise SystemExit(1)
+          print("apptest-ok")
+          PY
       - name: Smoke test Streamlit
         run: |
           set -o pipefail
