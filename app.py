@@ -7284,28 +7284,30 @@ if mode == "Paper":
 
     gate_label = "انتظار إشارة" if not paper_plan else ("جاهز" if p_gate_ok else "محجوب")
     gate_state = "wait" if not paper_plan else ("ok" if p_gate_ok else "bad")
-    mini_grid(
-        [
-            ("الرصيد التجريبي", f"${st.session_state.paper_balance:,.2f}", ""),
-            ("ربح/خسارة اليوم", f"${day_pnl:,.2f}", "ok" if day_pnl >= 0 else "bad"),
-            ("صفقات اليوم", str(st.session_state.paper_trades_today), ""),
-            ("صفقة مفتوحة", "نعم" if st.session_state.paper_position else "لا", "wait" if st.session_state.paper_position else ""),
-            ("بوابة المخاطر", gate_label, gate_state),
-        ],
-        "paper-grid",
-    )
+    if not gold_compact_mode:
+        mini_grid(
+            [
+                ("الرصيد التجريبي", f"${st.session_state.paper_balance:,.2f}", ""),
+                ("ربح/خسارة اليوم", f"${day_pnl:,.2f}", "ok" if day_pnl >= 0 else "bad"),
+                ("صفقات اليوم", str(st.session_state.paper_trades_today), ""),
+                ("صفقة مفتوحة", "نعم" if st.session_state.paper_position else "لا", "wait" if st.session_state.paper_position else ""),
+                ("بوابة المخاطر", gate_label, gate_state),
+            ],
+            "paper-grid",
+        )
 
-    if advanced_ui:
-        st.caption(
-            f"Candidate: {active_candidate} • Risk {float(paper_risk_pct):.3f}% • "
-            "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
-            "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
-        )
-    else:
-        st.caption(
-            f"المخاطرة الحالية {float(paper_risk_pct):.3f}% • Paper فقط • "
-            "الحفظ ومنع تكرار الأوامر مفعّلان تلقائيًا."
-        )
+    if not gold_compact_mode:
+        if advanced_ui:
+            st.caption(
+                f"Candidate: {active_candidate} • Risk {float(paper_risk_pct):.3f}% • "
+                "Paper فقط؛ لا يتم إرسال أي أمر حقيقي. "
+                "الرصيد، المركز المفتوح، السجل ومفاتيح منع التكرار تُحفظ تلقائيًا."
+            )
+        else:
+            st.caption(
+                f"المخاطرة الحالية {float(paper_risk_pct):.3f}% • Paper فقط • "
+                "الحفظ ومنع تكرار الأوامر مفعّلان تلقائيًا."
+            )
 
 
     if active_candidate in SMART_PAPER_CANDIDATES and advanced_ui:
@@ -7407,11 +7409,15 @@ if mode == "Paper":
             mark = paper_mark_price(p, _display_quote, _fallback)
             ur = paper_unrealized_r(p, mark)
             upnl = ur * p["risk_money"]
-            st.info(
-                f"{p['side']} {p['symbol']} • Entry {fmt(p['entry'],4)} • "
-                f"Mark {fmt(mark,4)} • Unrealized {ur:.2f}R / ${upnl:,.2f}"
-            )
-            if st.button("إغلاق Paper يدوي", use_container_width=True):
+            if not gold_compact_mode:
+                st.info(
+                    f"{p['side']} {p['symbol']} • Entry {fmt(p['entry'],4)} • "
+                    f"Mark {fmt(mark,4)} • Unrealized {ur:.2f}R / ${upnl:,.2f}"
+                )
+            if st.button(
+                "خروج تجريبي الآن" if gold_compact_mode else "إغلاق Paper يدوي",
+                use_container_width=True,
+            ):
                 close_paper(p, mark, "MANUAL", ur)
                 st.rerun()
         else:
