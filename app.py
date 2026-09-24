@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.2.1-simple-options-decision"
+VERSION = "6.3.0-smart-alerts-gold-options"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -128,6 +128,85 @@ def secret(name: str, default: Any = None) -> Any:
 
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def smart_alert_channels() -> dict[str, bool]:
+    """Notification channels. In-app is always available while the session is open."""
+    return {
+        "in_app": True,
+        "telegram": bool(secret("TELEGRAM_BOT_TOKEN") and secret("TELEGRAM_CHAT_ID")),
+        "webhook": bool(secret("SMART_ALERT_WEBHOOK_URL")),
+    }
+
+
+def emit_smart_alert(
+    event_key: str,
+    title: str,
+    body: str,
+    icon: str = "⏰",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, bool]:
+    """Deduplicated alert for entry, exit, target, stop and reversal events."""
+    keys = list(st.session_state.get("smart_alert_keys", []))
+    if event_key in keys:
+        return {"in_app": False, "telegram": False, "webhook": False}
+
+    st.session_state.smart_alert_keys = (keys + [event_key])[-1000:]
+    stamp = now_riyadh().strftime("%Y-%m-%d %H:%M:%S")
+    message = f"{title}\n{body}\n⏱ {stamp} الرياض"
+    result = {"in_app": True, "telegram": False, "webhook": False}
+
+    try:
+        st.toast(f"{title} — {body}", icon=icon)
+    except Exception:
+        result["in_app"] = False
+
+    log = list(st.session_state.get("smart_alert_log", []))
+    log.insert(0, {
+        "time": now_riyadh().isoformat(),
+        "key": event_key,
+        "title": title,
+        "body": body,
+        **(payload or {}),
+    })
+    st.session_state.smart_alert_log = log[:200]
+
+    token = str(secret("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    chat_id = str(secret("TELEGRAM_CHAT_ID", "") or "").strip()
+    if token and chat_id:
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "disable_web_page_preview": "true",
+                },
+                timeout=8,
+            )
+            result["telegram"] = bool(response.ok)
+        except Exception:
+            result["telegram"] = False
+
+    webhook_url = str(secret("SMART_ALERT_WEBHOOK_URL", "") or "").strip()
+    if webhook_url:
+        try:
+            response = requests.post(
+                webhook_url,
+                json={
+                    "event_key": event_key,
+                    "title": title,
+                    "body": body,
+                    "timestamp": now_riyadh().isoformat(),
+                    "payload": payload or {},
+                },
+                timeout=8,
+            )
+            result["webhook"] = bool(response.ok)
+        except Exception:
+            result["webhook"] = False
+
+    return result
 
 
 @dataclass(frozen=True)
@@ -450,6 +529,9 @@ def init_state() -> None:
         "last_auto_live_candle": {},
         "last_alert_candle": {},
         "last_near_entry_alert": None,
+        "smart_alert_keys": [],
+        "smart_alert_log": [],
+        "last_reversal_alert": {},
         "paper_day": now_riyadh().date().isoformat(),
         "paper_day_start_balance": 100_000.0,
         "paper_trades_today": 0,
@@ -2058,7 +2140,22 @@ def open_paper(
         "order_key": order_key,
     }
     st.session_state.paper_trades_today += 1
-    return persist_paper_state()
+    saved = persist_paper_state()
+    if saved:
+        side_ar = "شراء" if plan["side"] == "BUY" else "بيع"
+        emit_smart_alert(
+            f"paper-open:{st.session_state.paper_position['id']}",
+            f"✅ Paper — دخول {side_ar}",
+            (
+                f"{instrument.symbol} عند {fmt(plan['entry_reference'], 4)} • "
+                f"وقف {fmt(plan['stop_loss'], 4)} • "
+                f"هدف1 {fmt(plan['take_profit_1'], 4)} • "
+                f"هدف2 {fmt(plan['take_profit_2'], 4)}"
+            ),
+            icon="⚡",
+            payload={"symbol": instrument.symbol, "side": plan["side"], "type": "PAPER_ENTRY"},
+        )
+    return saved
 
 
 def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_value: float) -> None:
@@ -2088,6 +2185,20 @@ def close_paper(position: dict[str, Any], exit_price: float, reason: str, r_valu
             "order_key": position.get("order_key"),
         },
     )
+    event_id = str(position.get("id"))
+    symbol = str(position.get("symbol"))
+    side_ar = "شراء" if position.get("side") == "BUY" else "بيع"
+    close_title = "🛑 خروج — وقف" if reason == "STOP" else "🎯 خروج — الهدف الثاني"
+    emit_smart_alert(
+        f"paper-close:{event_id}:{reason}",
+        close_title,
+        (
+            f"{symbol} • صفقة {side_ar} • خروج {fmt(exit_price, 4)} • "
+            f"{r_value:+.2f}R • P/L ${pnl:+,.2f}"
+        ),
+        icon="⏰",
+        payload={"symbol": symbol, "side": position.get("side"), "type": "PAPER_EXIT", "reason": reason},
+    )
     st.session_state.paper_position = None
     persist_paper_state()
 
@@ -2112,6 +2223,13 @@ def manage_paper(price: float) -> None:
             p["stop"] = p["entry"]
             if not persist_paper_state():
                 return
+            emit_smart_alert(
+                f"paper-tp1:{p['id']}",
+                "🎯 الهدف الأول تحقق",
+                f"{p['symbol']} • BUY • TP1 {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
+                icon="⏰",
+                payload={"symbol": p["symbol"], "side": "BUY", "type": "TP1"},
+            )
         if p["tp1_hit"] and price >= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["tp2"] - p["entry"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
@@ -2127,6 +2245,13 @@ def manage_paper(price: float) -> None:
             p["stop"] = p["entry"]
             if not persist_paper_state():
                 return
+            emit_smart_alert(
+                f"paper-tp1:{p['id']}",
+                "🎯 الهدف الأول تحقق",
+                f"{p['symbol']} • SELL • TP1 {fmt(p['tp1'], 4)} • تم نقل الوقف إلى نقطة الدخول",
+                icon="⏰",
+                payload={"symbol": p["symbol"], "side": "SELL", "type": "TP1"},
+            )
         if p["tp1_hit"] and price <= p["tp2"]:
             r = p["realized_r"] + 0.5 * ((p["entry"] - p["tp2"]) / d)
             close_paper(p, p["tp2"], "TP2", r)
@@ -4631,7 +4756,29 @@ def render_option_intelligence(symbol, budget):
     if st.session_state.get('option_review_last') != key:
         st.session_state.option_review_last = key
         if review['state'] in alert_states:
-            st.toast(labels[review['state']], icon='🔔')
+            option_titles = {
+                'REVIEW_ENTRY': '🚨 عقد جاهز للمراجعة — دخول',
+                'REVIEW_EXIT': '🛑 عقد — راجع الخروج',
+                'REVIEW_PROFIT': '🎯 عقد — راجع جني الربح',
+                'REVIEW_EXPIRY': '⏰ عقد قريب من الانتهاء',
+                'REVIEW_REVERSAL': '⚠️ انعكاس اتجاه الأصل — راجع الخروج',
+            }
+            emit_smart_alert(
+                f"option-watch:{watch['id']}:{review['state']}",
+                option_titles.get(review['state'], labels[review['state']]),
+                (
+                    f"{watch['symbol']} {watch['kind']} • Strike {watch['strike']:g} • "
+                    f"انتهاء {watch['expiry']} • " + "، ".join(review['reasons'][:3])
+                ),
+                icon='⏰',
+                payload={
+                    "symbol": watch["symbol"],
+                    "contract_type": watch["kind"],
+                    "strike": watch["strike"],
+                    "expiry": watch["expiry"],
+                    "type": review["state"],
+                },
+            )
     if st.session_state.get('option_review_audit_key') != key:
         st.session_state.option_review_audit_key = key
         watch['reviews'] = (watch.get('reviews', []) + [dict(
@@ -5018,6 +5165,26 @@ def render_all_option_opportunities(symbol: str, budget: float = 0.0) -> None:
             )
 
         compact_cols = ["العقد", "النوع", "الانتهاء", "DTE", "Strike", "Ask", "Spread %", "Volume", "OI", "Delta", "الحالة"]
+        focus_contract = str(focus.get("العقد") or "")
+        if focus_contract:
+            emit_smart_alert(
+                f"option-chain-ready:{symbol}:{focus_contract}:{direction.get('bias', 'WAIT')}",
+                f"🚨 فرصة عقد مكتملة — {symbol}",
+                (
+                    f"{focus.get('النوع')} • Strike {fmt(focus.get('Strike'), 2)} • "
+                    f"انتهاء {focus.get('الانتهاء')} • Ask {fmt(focus.get('Ask'), 3)} • "
+                    f"يوجد {len(opportunities)} عقد/عقود اجتازت الفلاتر"
+                ),
+                icon="⏰",
+                payload={
+                    "symbol": symbol,
+                    "contract": focus_contract,
+                    "contract_type": focus.get("النوع"),
+                    "type": "OPTION_CHAIN_READY",
+                    "opportunity_count": len(opportunities),
+                },
+            )
+
         compact_df = pd.DataFrame(opportunities[:8])
         st.dataframe(
             compact_df[[x for x in compact_cols if x in compact_df.columns]],
@@ -5195,6 +5362,12 @@ if not engine_ok:
 
 st.sidebar.markdown("## ⚡ X10 SMART TERMINAL")
 st.sidebar.caption(f"v{VERSION} • Gold • Smart Stocks • Futures")
+_alert_channels = smart_alert_channels()
+st.sidebar.caption(
+    "⏰ التنبيهات: داخل التطبيق ✅"
+    + (" • Telegram ✅" if _alert_channels["telegram"] else " • Telegram غير مربوط")
+    + (" • Webhook ✅" if _alert_channels["webhook"] else "")
+)
 
 # Scanner buttons set a pending preset and rerun; consume it before widgets exist.
 pending_market = st.session_state.get("pending_market_preset")
@@ -5655,10 +5828,58 @@ if st.session_state.last_signal_candle.get(instrument.symbol) != candle_id:
         alert_key = f"{instrument.symbol}:{candle_id}:{execution_analysis['signal']}"
         if st.session_state.last_alert_candle.get(instrument.symbol) != alert_key:
             st.session_state.last_alert_candle[instrument.symbol] = alert_key
-            st.toast(
-                f"{instrument.symbol} • {execution_analysis['signal']} • قوة {execution_analysis['strength']}%",
+            side_ar = "شراء" if execution_analysis["signal"] == "BUY" else "بيع"
+            asset_label = "الذهب" if instrument.asset_class == "GOLD" else instrument.symbol
+            emit_smart_alert(
+                f"entry-signal:{alert_key}",
+                f"🚨 إشارة دخول {side_ar} — {asset_label}",
+                (
+                    f"السعر {fmt(reference_price, 4)} • قوة الإشارة {execution_analysis['strength']}% • "
+                    f"{execution_analysis.get('reason', '')}"
+                ),
                 icon="⚡",
+                payload={
+                    "symbol": instrument.symbol,
+                    "asset_class": instrument.asset_class,
+                    "side": execution_analysis["signal"],
+                    "price": reference_price,
+                    "strength": execution_analysis["strength"],
+                    "type": "ENTRY_SIGNAL",
+                },
             )
+
+
+# Fresh opposite signal against an open Paper position => exit-review alert.
+_current_paper = st.session_state.get("paper_position")
+if (
+    _current_paper
+    and str(_current_paper.get("symbol")) == instrument.symbol
+    and execution_analysis.get("signal") in {"BUY", "SELL"}
+    and execution_analysis.get("signal") != _current_paper.get("side")
+):
+    _rev_key = (
+        f"{instrument.symbol}:{candle_id}:{_current_paper.get('id')}:"
+        f"{execution_analysis.get('signal')}"
+    )
+    _last_rev = dict(st.session_state.get("last_reversal_alert", {}) or {})
+    if _last_rev.get(instrument.symbol) != _rev_key:
+        _last_rev[instrument.symbol] = _rev_key
+        st.session_state.last_reversal_alert = _last_rev
+        emit_smart_alert(
+            f"reversal:{_rev_key}",
+            "⚠️ انعكاس — راجع الخروج",
+            (
+                f"{instrument.symbol} • الصفقة الحالية {_current_paper.get('side')} "
+                f"والإشارة الجديدة {execution_analysis.get('signal')} عند {fmt(reference_price, 4)}"
+            ),
+            icon="⏰",
+            payload={
+                "symbol": instrument.symbol,
+                "type": "REVERSAL_EXIT_REVIEW",
+                "current_side": _current_paper.get("side"),
+                "new_signal": execution_analysis.get("signal"),
+            },
+        )
 
 stock_market_closed = bool(
     instrument.asset_class == "STOCK"
