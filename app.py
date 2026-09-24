@@ -29,7 +29,7 @@ import streamlit as st
 # Analysis • Paper • normalized/capped audit • broker-authoritative Live
 # ============================================================
 
-VERSION = "6.1.1-stock-stability"
+VERSION = "6.1.2-readiness-guards"
 TZ = ZoneInfo("Asia/Riyadh")
 DATA_URL = "https://api.twelvedata.com/time_series"
 QUOTE_URL = "https://api.twelvedata.com/quote"
@@ -233,10 +233,10 @@ def render_readiness_panel() -> None:
     with st.expander("مركز الجاهزية", expanded=not market_ready):
         mini_grid(
             [
-                ("بيانات السوق", "متصلة" if market_ready else "تحتاج مفتاح", "ok" if market_ready else "wait"),
-                ("Paper", "جاهز", "ok"),
+                ("مفتاح البيانات", "موجود — يلزم فحص الاتصال" if market_ready else "تحتاج مفتاح", "wait"),
+                ("Paper", "تجريبي — يخضع لفحص البيانات", "wait"),
                 ("الفحص الشرعي", "مربوط" if sharia_ready else "اختياري", "ok" if sharia_ready else "wait"),
-                ("Live", "مفعّل" if live_ready else "مقفول للحماية", "ok" if live_ready else "wait"),
+                ("Live", "إعدادات موجودة — يلزم فحص التنفيذ" if live_ready else "مقفول للحماية", "wait"),
             ]
         )
         if not market_ready:
@@ -2230,12 +2230,17 @@ def broker_quote_state(payload: dict[str, Any] | None) -> dict[str, Any]:
     bid = payload.get("bid")
     ask = payload.get("ask")
     last = payload.get("last", payload.get("price"))
-    if finite(bid) and finite(ask) and float(ask) >= float(bid):
+    if bid is not None or ask is not None:
+        if not (finite(bid) and finite(ask) and 0 < float(bid) <= float(ask)):
+            return {"ok": False, "reason": "أسعار Bid/Ask للوسيط غير صالحة"}
         execution_price = (float(bid) + float(ask)) / 2.0
     elif finite(last):
         execution_price = float(last)
     else:
         return {"ok": False, "reason": "Broker Quote لا يحتوي سعر صالح"}
+
+    if not finite(execution_price) or execution_price <= 0:
+        return {"ok": False, "reason": "سعر الوسيط يجب أن يكون موجبًا ومحدودًا"}
 
     ts = None
     for key in ("timestamp", "last_update_at", "datetime"):
@@ -2246,7 +2251,9 @@ def broker_quote_state(payload: dict[str, Any] | None) -> dict[str, Any]:
     if ts is None:
         return {"ok": False, "reason": "Broker Quote بلا timestamp موثوق", "price": execution_price}
 
-    age_min = max(0.0, (now_utc() - ts).total_seconds() / 60.0)
+    age_min = (now_utc() - ts).total_seconds() / 60.0
+    if age_min < -1:
+        return {"ok": False, "reason": "توقيت سعر الوسيط في المستقبل"}
     if age_min > 2:
         return {
             "ok": False,
@@ -4673,7 +4680,7 @@ st.markdown(
 )
 
 st.caption(
-    "X10 v6.1.1 STOCK STABILITY • Gold + U.S. Stocks • Paper Smart AutoPilot • "
+    f"X10 v{VERSION} • Gold + U.S. Stocks • Paper Smart AutoPilot • "
     "market-specific engines • automatic risk control"
 )
 
@@ -4704,6 +4711,16 @@ elif data_status != "OK":
 quality = data_quality(raw)
 quote = fetch_quote(instrument.symbol)
 feed = feed_integrity(raw, quote)
+with st.expander("فحص اتصال الأسعار والتنفيذ", expanded=not feed.get("execution_ok", False)):
+    if feed.get("execution_ok", False):
+        st.success("اجتازت بيانات السوق فحص الحداثة والسلامة لهذه الدورة. هذا لا يفعّل التداول الحقيقي.")
+    else:
+        for reason in feed.get("execution_reasons", []):
+            st.warning(reason)
+    quote_time, _ = quote_timestamp(quote)
+    if quote_time is not None:
+        st.caption(f"وقت سعر المصدر: {quote_time.tz_convert(TZ).isoformat()}")
+    st.caption("فحص البيانات مستقل عن وجود المفتاح وعن شروط وسيط التنفيذ.")
 reference_price = (
     float(quote["last"])
     if quote.get("connected") and finite(quote.get("last"))
