@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# redeploy-marker: no-deps-stable-2026-09-25-0400
+
 import math
 import json
 import os
