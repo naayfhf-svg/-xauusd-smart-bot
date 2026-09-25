@@ -1,4 +1,4 @@
-import ast, math, time, threading, json, csv, io
+import ast, math, time, threading, json, csv, io, hashlib
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone, timedelta
@@ -10,12 +10,26 @@ if not app_path.exists():
     app_path = Path(__file__).resolve().parents[1] / 'app.py'
 source = app_path.read_text()
 tree = ast.parse(source)
-ns = dict(Any=Any, math=math, time=time, threading=threading, json=json, csv=csv, io=io,
+ns = dict(Any=Any, math=math, time=time, threading=threading, json=json, csv=csv, io=io, hashlib=hashlib,
           datetime=datetime, timezone=timezone, ZoneInfo=ZoneInfo)
 body = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and not n.decorator_list]
 exec(compile(ast.Module(body=body, type_ignores=[]), 'app', 'exec'), ns)
 clock = datetime(2026, 9, 25, 17, 0, tzinfo=timezone.utc).timestamp()
 ns['now_ts'] = lambda: clock
+settings = dict(ALPACA_API_KEY='test', ALPACA_SECRET_KEY='secret', ALPACA_DATA_FEED='iex')
+ns['secret'] = lambda key, default='': settings.get(key, default)
+identity = ns['alpaca_cache_identity']()
+settings['ALPACA_DATA_FEED'] = 'sip'
+assert ns['alpaca_cache_identity']() != identity
+identity = ns['alpaca_cache_identity']()
+settings['ALPACA_SECRET_KEY'] = 'rotated'
+assert ns['alpaca_cache_identity']() != identity
+closed = ns['gld_readiness_issues'](dict(feed='sip', market_verified=True, market_open=False), [], clock)
+unknown = ns['gld_readiness_issues'](dict(feed='sip', market_verified=False), [], clock)
+assert any('النظامية مغلقة' in x for x in closed)
+assert not any('تعذر التحقق من ساعة' in x for x in closed)
+assert any('تعذر التحقق من ساعة' in x for x in unknown)
+assert any('0/120' in x for x in unknown)
 q = dict(T='q', S='GLD', bp=400, ap=400.02,
          t=datetime.fromtimestamp(clock - 1, timezone.utc).isoformat())
 normalize = ns['normalize_gld_quote']
@@ -91,4 +105,9 @@ with patch('urllib.request.urlopen', side_effect=reply), patch('websockets.sync.
     assert not app.exception, app.exception
     assert any('SIP غير مفعل' in m.value for m in app.markdown)
     assert not any('فرصة شراء تجريبية' in m.value for m in app.markdown)
+    app.secrets['ALPACA_DATA_FEED'] = 'sip'
+    app.run(timeout=20)
+    assert not app.exception, app.exception
+    assert not any('SIP غير مفعل' in m.value for m in app.markdown)
 print('GLD UI with Alpaca only (no Twelve Data or GoldAPI), IEX blocked and GET-only requests passed')
+print('Credential/feed cache isolation, missing history and closed/unknown market diagnostics passed')
