@@ -22,7 +22,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.4.0-live-gold-paper"
+VERSION = "7.4.1-data-diagnostics"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -63,6 +63,8 @@ def parse_time(value: Any) -> float | None:
     try:
         if isinstance(value, (int, float)) or str(value).replace('.', '', 1).isdigit():
             value = float(value)
+            if value >= 100_000_000_000:
+                value /= 1000.0
             return value if finite(value) else None
         dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
         return dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp()
@@ -589,7 +591,12 @@ class GoldStream:
                     with self.lock:
                         self.status = 'متصل — ننتظر تحديث الذهب من المصدر'
                     beat = time.monotonic()
+                    last_price_received = time.monotonic()
                     while time.monotonic() - self.touched < 90:
+                        if time.monotonic() - last_price_received >= 30:
+                            with self.lock:
+                                self.status = 'لا توجد تحديثات ذهب منذ 30 ثانية — نحاول إعادة الاتصال'
+                            break
                         if time.monotonic() - beat >= 10:
                             ws.send(json.dumps({'action': 'heartbeat'}))
                             beat = time.monotonic()
@@ -604,6 +611,8 @@ class GoldStream:
                             time.sleep(30)
                             break
                         self.accept(event)
+                        if isinstance(event, dict) and event.get('event') == 'price' and event.get('symbol') == 'XAU/USD':
+                            last_price_received = time.monotonic()
                         delay = 2
             except Exception:
                 # Never expose exception text: a URL can contain the API key.
@@ -629,6 +638,8 @@ def live_gold_panel():
     st.caption('بث XAU/USD من Twelve Data — سعر مرجعي، وليس سعر تنفيذ وسيطك')
     if tick:
         age = now_ts() - tick['timestamp']
+        received_age = now_ts() - tick['received']
+        st.caption(f'حالة البث: {status} • عمر سعر المصدر {age:.1f} ث • منذ وصول الرسالة {received_age:.1f} ث')
         st.metric('آخر سعر ذهب من البث — دولار / أونصة', fmt(tick['price']))
         if 0 <= age <= 5:
             st.caption(f'عمر تحديث المصدر {age:.1f} ثانية • {status}')
@@ -711,7 +722,10 @@ else:
                 confirmed = False
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
-            if confirmed and signal == "BUY":
+            data_ready = fresh and source_check.get('ok') and ACTIVE_KIND == 'spot_gold'
+            if not data_ready:
+                decision, state = "البيانات غير جاهزة", "bad"
+            elif confirmed and signal == "BUY":
                 decision, state = "فرصة شراء تجريبية", "ok"
             elif confirmed and signal == "SELL":
                 decision, state = "فرصة بيع تجريبية", "ok"
@@ -724,6 +738,8 @@ else:
                 watch = "فوق " + fmt(analysis.get("buy_trigger"))
             else:
                 watch = "تحت " + fmt(analysis.get("sell_trigger"))
+            if not data_ready:
+                watch = "موقوف حتى اكتمال البيانات"
 
             price = fmt(quote.get("last"))
             tp1 = fmt(plan.get("tp1")) if plan else "—"
@@ -734,7 +750,7 @@ else:
                 f"""
                 <div class='grid'>
                   <div class='box'><div class='l'>وش أسوي؟</div><div class='v {state}'>{decision}</div></div>
-                  <div class='box'><div class='l'>السعر الآن</div><div class='v'>{price}</div></div>
+                  <div class='box'><div class='l'>آخر سعر REST — راجع حداثته</div><div class='v'>{price}</div></div>
                   <div class='box'><div class='l'>الدخول / المراقبة</div><div class='v'>{watch}</div></div>
                   <div class='box'><div class='l'>خذ الربح عند</div><div class='v ok'>{tp1}</div></div>
                   <div class='box'><div class='l'>وقف الخسارة</div><div class='v bad'>{stop}</div></div>
@@ -753,6 +769,42 @@ else:
                 st.caption(
                     f"GLD • مصدر السعر الحالي Twelve Data • عمر السعر {age_text} • مراقبة فقط حتى نربط مصدرًا ثانيًا أو سعر الوسيط"
                 )
+            if not data_ready:
+                st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
+            with st.expander('تشخيص البيانات — سبب توقف الإشارات'):
+                issues = []
+                if not quote.get('ok'):
+                    issues.append('تعذر جلب السعر من المصدر الرئيسي')
+                if age is None:
+                    issues.append('المصدر الرئيسي لم يوفر توقيت تحديث سعر قابلًا للتحقق')
+                elif age < 0 or age > 5:
+                    issues.append(f'عمر سعر المصدر الرئيسي {age:.1f} ثانية؛ الحد 5 ثوانٍ')
+                if not finite(quote.get('bid')) or not finite(quote.get('ask')):
+                    issues.append('المصدر الرئيسي لا يوفر حاليًا Bid/Ask؛ البث المرجعي وحده لا يعوض سعر التنفيذ')
+                if not quote.get('market_open'):
+                    issues.append('حالة فتح السوق غير مؤكدة من المزود')
+                if ACTIVE_KIND == 'spot_gold' and not secondary.get('configured'):
+                    issues.append('GOLDAPI_KEY غير مضبوط؛ لا يوجد تأكيد من مصدر ثانٍ')
+                elif ACTIVE_KIND == 'spot_gold' and not source_check.get('ok'):
+                    issues.append('تأكيد المصدر الثاني غير صالح: قد يكون متأخرًا أو مختلفًا أو غير متاح')
+                if not history:
+                    issues.append('بيانات الشموع غير متاحة')
+                for issue in issues:
+                    st.write('• ' + issue)
+                if not issues:
+                    st.write(gate_reason)
+                st.caption('تغيير سرعة العرض لا يسرّع المزود. لا نعتبر وقت وصول الرد بديلًا عن وقت السعر، ولا نختلق Bid/Ask.')
+                report = dict(version=VERSION, instrument=ACTIVE_SYMBOL,
+                              checked_at=datetime.now(timezone.utc).isoformat(),
+                              rest_ok=bool(quote.get('ok')), rest_source_age_seconds=age,
+                              bid_available=finite(quote.get('bid')), ask_available=finite(quote.get('ask')),
+                              market_open=quote.get('market_open'), history_count=len(history),
+                              second_source_configured=bool(secondary.get('configured')),
+                              source_confirmation=bool(source_check.get('ok')), entry_gate=gate_reason,
+                              issues=issues)
+                st.download_button('تنزيل تقرير التشخيص بدون مفاتيح',
+                                   json.dumps(report, ensure_ascii=False, indent=2),
+                                   'gold-diagnostics.json', 'application/json')
             st.caption(gate_reason)
             st.caption(str(analysis.get("reason") or ""))
             st.caption("تحديث اللوحة كل 3 ثوانٍ؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.")
