@@ -1,7 +1,0 @@
-streamlit==1.64.0
-altair==6.3.0
-pandas==2.2.3
-numpy==2.3.5
-requests==2.34.2
-# force-clean-rebuild-2026-09-25-0156
-protobuf>=5.26.1,<6
