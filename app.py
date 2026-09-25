@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-import pandas as pd
-import requests
 import streamlit as st
 
 st.set_page_config(
@@ -14,11 +16,11 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.0.0-gold-lite-stable"
-TZ = "Asia/Riyadh"
+VERSION = "7.1.0-no-deps-stable"
 SYMBOL = "XAU/USD"
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
+GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
 
 
 def secret(name: str, default: Any = None) -> Any:
@@ -28,35 +30,36 @@ def secret(name: str, default: Any = None) -> Any:
         return os.getenv(name, default)
 
 
+def now_ts() -> float:
+    return time.time()
+
+
 def finite(value: Any) -> bool:
     try:
-        return pd.notna(value) and float(value) > 0
+        x = float(value)
+        return x > 0 and x != float("inf") and x != float("-inf")
     except Exception:
         return False
 
 
-def now_utc() -> pd.Timestamp:
-    return pd.Timestamp.now(tz="UTC")
-
-
-def parse_ts(value: Any) -> pd.Timestamp | None:
-    try:
-        ts = pd.to_datetime(value, utc=True, errors="coerce")
-        return None if pd.isna(ts) else pd.Timestamp(ts)
-    except Exception:
-        return None
-
-
 def fmt(value: Any, decimals: int = 3) -> str:
     try:
-        if value is None or pd.isna(value):
-            return "—"
         return f"{float(value):,.{decimals}f}"
     except Exception:
         return "—"
 
 
-@st.cache_data(ttl=9, show_spinner=False)
+def http_json(url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, timeout: int = 5) -> tuple[int, dict[str, Any]]:
+    full = url
+    if params:
+        full += ("&" if "?" in full else "?") + urlencode(params)
+    req = Request(full, headers=headers or {})
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        return int(getattr(resp, "status", 200)), json.loads(body)
+
+
+@st.cache_data(ttl=8, show_spinner=False)
 def fetch_quote() -> dict[str, Any]:
     key = str(secret("TWELVE_DATA_API_KEY", "") or "").strip()
     if not key:
@@ -64,9 +67,9 @@ def fetch_quote() -> dict[str, Any]:
 
     started = time.perf_counter()
     try:
-        r = requests.get(
+        status, payload = http_json(
             QUOTE_URL,
-            params={
+            {
                 "symbol": SYMBOL,
                 "interval": "1min",
                 "timezone": "UTC",
@@ -74,32 +77,24 @@ def fetch_quote() -> dict[str, Any]:
             },
             timeout=4,
         )
-        received = now_utc()
-        payload = r.json()
+        received = now_ts()
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    if r.status_code >= 400 or not isinstance(payload, dict):
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
+    if status >= 400 or not isinstance(payload, dict):
+        return {"ok": False, "error": f"HTTP {status}"}
 
     last = payload.get("close")
-    bid = payload.get("bid")
-    ask = payload.get("ask")
-    ts = parse_ts(
-        payload.get("last_update_at")
-        or payload.get("last_quote_at")
-        or payload.get("timestamp")
-        or payload.get("datetime")
-    )
     if not finite(last):
         return {"ok": False, "error": str(payload.get("message") or "سعر غير صالح")}
 
+    bid = payload.get("bid")
+    ask = payload.get("ask")
     return {
         "ok": True,
         "last": float(last),
         "bid": float(bid) if finite(bid) else None,
         "ask": float(ask) if finite(ask) else None,
-        "timestamp": ts,
         "received_at": received,
         "latency_ms": (time.perf_counter() - started) * 1000.0,
         "source": "Twelve Data",
@@ -107,15 +102,15 @@ def fetch_quote() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=55, show_spinner=False)
-def fetch_history() -> pd.DataFrame:
+def fetch_history() -> list[dict[str, Any]]:
     key = str(secret("TWELVE_DATA_API_KEY", "") or "").strip()
     if not key:
-        return pd.DataFrame()
+        return []
 
     try:
-        r = requests.get(
+        status, payload = http_json(
             HISTORY_URL,
-            params={
+            {
                 "symbol": SYMBOL,
                 "interval": "5min",
                 "outputsize": 1200,
@@ -124,138 +119,194 @@ def fetch_history() -> pd.DataFrame:
             },
             timeout=6,
         )
-        payload = r.json()
     except Exception:
-        return pd.DataFrame()
+        return []
 
-    values = payload.get("values") if isinstance(payload, dict) else None
-    if not isinstance(values, list) or not values:
-        return pd.DataFrame()
+    if status >= 400 or not isinstance(payload, dict):
+        return []
+    values = payload.get("values")
+    if not isinstance(values, list):
+        return []
 
-    df = pd.DataFrame(values)
-    needed = {"datetime", "open", "high", "low", "close"}
-    if not needed.issubset(df.columns):
-        return pd.DataFrame()
+    out: list[dict[str, Any]] = []
+    for row in values:
+        try:
+            dt = datetime.fromisoformat(str(row["datetime"]).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            item = {
+                "ts": dt.timestamp(),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            if min(item["open"], item["high"], item["low"], item["close"]) <= 0:
+                continue
+            out.append(item)
+        except Exception:
+            continue
 
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-    for col in ("open", "high", "low", "close"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
-    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
-    return df.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
+    out.sort(key=lambda x: x["ts"])
+    dedup: dict[float, dict[str, Any]] = {x["ts"]: x for x in out}
+    return list(dedup.values())
 
 
-@st.cache_data(ttl=9, show_spinner=False)
+@st.cache_data(ttl=8, show_spinner=False)
 def fetch_goldapi() -> dict[str, Any]:
     key = str(secret("GOLDAPI_KEY", "") or "").strip()
     if not key:
         return {"ok": False, "configured": False}
 
     try:
-        r = requests.get(
-            "https://www.goldapi.io/api/price/XAU/USD",
+        status, payload = http_json(
+            GOLDAPI_URL,
             headers={"x-access-token": key, "Content-Type": "application/json"},
             timeout=4,
         )
-        payload = r.json()
     except Exception as exc:
-        return {"ok": False, "configured": True, "error": str(exc)}
+        return {"ok": False, "configured": True, "error": f"{type(exc).__name__}: {exc}"}
 
     price = payload.get("price") if isinstance(payload, dict) else None
     return {
-        "ok": bool(r.status_code < 400 and finite(price)),
+        "ok": bool(status < 400 and finite(price)),
         "configured": True,
         "price": float(price) if finite(price) else None,
-        "timestamp": parse_ts(payload.get("timestamp") if isinstance(payload, dict) else None),
     }
 
 
-def indicators(frame: pd.DataFrame) -> pd.DataFrame:
-    x = frame.copy()
-    x["ema20"] = x["close"].ewm(span=20, adjust=False).mean()
-    x["ema50"] = x["close"].ewm(span=50, adjust=False).mean()
-
-    delta = x["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    x["rsi"] = 100 - (100 / (1 + rs))
-
-    tr = pd.concat(
-        [
-            (x["high"] - x["low"]).abs(),
-            (x["high"] - x["close"].shift()).abs(),
-            (x["low"] - x["close"].shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    x["atr"] = tr.rolling(14).mean()
-    return x
+def ema(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for value in values[1:]:
+        out.append(alpha * value + (1.0 - alpha) * out[-1])
+    return out
 
 
-def resample(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
-    x = frame.set_index("datetime")
-    out = (
-        x.resample(rule, label="right", closed="right")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-        .reset_index()
-    )
-    return indicators(out)
+def rolling_rsi(values: list[float], period: int = 14) -> float | None:
+    if len(values) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(len(values) - period, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
 
 
-def analyze(frame: pd.DataFrame) -> dict[str, Any]:
-    if len(frame) < 120:
-        return {"signal": "WAIT", "reason": "بيانات غير كافية", "strength": 0}
+def atr(rows: list[dict[str, Any]], period: int = 14) -> float | None:
+    if len(rows) < period + 1:
+        return None
+    trs = []
+    for i in range(len(rows) - period, len(rows)):
+        cur = rows[i]
+        prev = rows[i - 1]
+        trs.append(
+            max(
+                cur["high"] - cur["low"],
+                abs(cur["high"] - prev["close"]),
+                abs(cur["low"] - prev["close"]),
+            )
+        )
+    return sum(trs) / len(trs)
 
-    m5 = indicators(frame)
-    m15 = resample(frame, "15min")
-    h1 = resample(frame, "1h")
+
+def resample(rows: list[dict[str, Any]], seconds: int) -> list[dict[str, Any]]:
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = int(row["ts"] // seconds) * seconds
+        buckets.setdefault(key, []).append(row)
+    out = []
+    for key in sorted(buckets):
+        group = buckets[key]
+        out.append(
+            {
+                "ts": float(key),
+                "open": group[0]["open"],
+                "high": max(x["high"] for x in group),
+                "low": min(x["low"] for x in group),
+                "close": group[-1]["close"],
+            }
+        )
+    return out
+
+
+def trend(rows: list[dict[str, Any]]) -> str:
+    closes = [x["close"] for x in rows]
+    if len(closes) < 55:
+        return "FLAT"
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    close = closes[-1]
+    if close > e20 > e50:
+        return "UP"
+    if close < e20 < e50:
+        return "DOWN"
+    return "FLAT"
+
+
+def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(rows) < 120:
+        return {"signal": "WAIT", "strength": 0, "reason": "بيانات M5 غير كافية"}
+
+    m15 = resample(rows, 15 * 60)
+    h1 = resample(rows, 60 * 60)
     if len(m15) < 55 or len(h1) < 55:
-        return {"signal": "WAIT", "reason": "انتظر اكتمال الفريمات", "strength": 0}
+        return {"signal": "WAIT", "strength": 0, "reason": "انتظر اكتمال M15 و H1"}
 
-    a = m5.iloc[-1]
-    b = m15.iloc[-1]
-    c = h1.iloc[-1]
-    prior = m5.iloc[-7:-1]
+    closes = [x["close"] for x in rows]
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    rsi = rolling_rsi(closes, 14)
+    current = rows[-1]
+    prior = rows[-7:-1]
+    buy_trigger = max(x["high"] for x in prior)
+    sell_trigger = min(x["low"] for x in prior)
 
     buy_checks = [
-        c["close"] > c["ema20"] > c["ema50"],
-        b["close"] > b["ema20"] > b["ema50"],
-        a["close"] > a["ema20"] > a["ema50"],
-        50 <= float(a["rsi"]) <= 68 if pd.notna(a["rsi"]) else False,
-        a["close"] > float(prior["high"].max()),
+        trend(h1) == "UP",
+        trend(m15) == "UP",
+        current["close"] > e20 > e50,
+        rsi is not None and 50 <= rsi <= 68,
+        current["close"] > buy_trigger,
     ]
     sell_checks = [
-        c["close"] < c["ema20"] < c["ema50"],
-        b["close"] < b["ema20"] < b["ema50"],
-        a["close"] < a["ema20"] < a["ema50"],
-        32 <= float(a["rsi"]) <= 50 if pd.notna(a["rsi"]) else False,
-        a["close"] < float(prior["low"].min()),
+        trend(h1) == "DOWN",
+        trend(m15) == "DOWN",
+        current["close"] < e20 < e50,
+        rsi is not None and 32 <= rsi <= 50,
+        current["close"] < sell_trigger,
     ]
 
-    buy_score = round(sum(bool(x) for x in buy_checks) / len(buy_checks) * 100)
-    sell_score = round(sum(bool(x) for x in sell_checks) / len(sell_checks) * 100)
+    buy_score = round(sum(1 for x in buy_checks if x) / len(buy_checks) * 100)
+    sell_score = round(sum(1 for x in sell_checks if x) / len(sell_checks) * 100)
 
     if all(buy_checks):
-        signal = "BUY"
-        reason = "اتجاه صاعد واختراق مؤكد"
+        signal, reason = "BUY", "اتجاه صاعد واختراق مؤكد"
     elif all(sell_checks):
-        signal = "SELL"
-        reason = "اتجاه هابط وكسر مؤكد"
+        signal, reason = "SELL", "اتجاه هابط وكسر مؤكد"
     else:
-        signal = "WAIT"
-        reason = "الشروط غير مكتملة"
+        signal, reason = "WAIT", "الشروط لم تكتمل"
 
     return {
         "signal": signal,
-        "reason": reason,
         "strength": max(buy_score, sell_score),
         "buy_score": buy_score,
         "sell_score": sell_score,
-        "atr": float(a["atr"]) if finite(a["atr"]) else None,
-        "buy_trigger": float(prior["high"].max()),
-        "sell_trigger": float(prior["low"].min()),
+        "reason": reason,
+        "atr": atr(rows, 14),
+        "buy_trigger": buy_trigger,
+        "sell_trigger": sell_trigger,
     }
 
 
@@ -268,71 +319,60 @@ def consensus(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, A
         prices.append(float(secondary["price"]))
 
     if len(prices) < 2:
-        return {"ok": False, "count": 1, "reason": "يلزم مصدر ثانٍ لتأكيد الدخول"}
+        return {"ok": False, "count": 1, "reason": "يلزم مصدر ثانٍ"}
 
     mid = sum(prices) / len(prices)
-    spread_pct = (max(prices) - min(prices)) / mid * 100 if mid else 999
+    spread_pct = (max(prices) - min(prices)) / mid * 100 if mid else 999.0
     return {
         "ok": spread_pct <= 0.20,
-        "count": len(prices),
+        "count": 2,
         "spread_pct": spread_pct,
         "reason": "المصادر متفقة" if spread_pct <= 0.20 else "اختلاف المصادر مرتفع",
     }
 
 
-def quote_age(quote: dict[str, Any]) -> float | None:
-    ts = quote.get("received_at")
-    if ts is None:
+def trade_plan(signal: str, quote: dict[str, Any], analysis: dict[str, Any]) -> dict[str, float] | None:
+    a = analysis.get("atr")
+    if signal not in {"BUY", "SELL"} or not finite(a):
         return None
-    try:
-        return max(0.0, (now_utc() - pd.Timestamp(ts)).total_seconds())
-    except Exception:
-        return None
-
-
-def trade_plan(signal: str, quote: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any] | None:
-    atr = analysis.get("atr")
-    if signal not in {"BUY", "SELL"} or not finite(atr):
-        return None
-
     last = float(quote["last"])
+    risk_distance = float(a) * 1.25
+
     if signal == "BUY":
         entry = float(quote["ask"]) if finite(quote.get("ask")) else last
-        stop = entry - float(atr) * 1.25
-        risk = entry - stop
-        return {"entry": entry, "stop": stop, "tp1": entry + risk, "tp2": entry + 2 * risk}
+        stop = entry - risk_distance
+        return {"entry": entry, "stop": stop, "tp1": entry + risk_distance, "tp2": entry + 2 * risk_distance}
 
     entry = float(quote["bid"]) if finite(quote.get("bid")) else last
-    stop = entry + float(atr) * 1.25
-    risk = stop - entry
-    return {"entry": entry, "stop": stop, "tp1": entry - risk, "tp2": entry - 2 * risk}
+    stop = entry + risk_distance
+    return {"entry": entry, "stop": stop, "tp1": entry - risk_distance, "tp2": entry - 2 * risk_distance}
 
 
 st.markdown(
     """
     <style>
-    .block-container{max-width:760px;padding-top:1rem}
-    .hero{padding:20px;border:1px solid #3a4658;border-radius:20px;background:#0d1521;margin-bottom:14px}
-    .hero h1{margin:0;color:#d4af37;font-size:2.2rem}
+    .block-container{max-width:760px;padding-top:.8rem}
+    .hero{padding:18px;border:1px solid #3a4658;border-radius:20px;background:#0d1521;margin-bottom:12px}
+    .hero h1{margin:0;color:#d4af37;font-size:2.05rem}
     .hero p{margin:.35rem 0 0;color:#a9b4c5}
-    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-    .box{background:#0e1622;border:1px solid #34445b;border-radius:16px;padding:14px}
-    .box .l{color:#97a5b7;font-size:.82rem}
-    .box .v{font-size:1.35rem;font-weight:800;margin-top:5px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+    .box{background:#0e1622;border:1px solid #34445b;border-radius:16px;padding:13px}
+    .box .l{color:#97a5b7;font-size:.78rem}
+    .box .v{font-size:1.25rem;font-weight:800;margin-top:5px}
     .ok{color:#55d68a}.wait{color:#f2c15d}.bad{color:#ff7c7c}
-    @media(max-width:600px){.block-container{padding:.6rem}.box{padding:12px}.box .v{font-size:1.12rem}}
+    @media(max-width:600px){.block-container{padding:.55rem}.box{padding:11px}.box .v{font-size:1.08rem}}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.markdown(
-    f"<div class='hero'><h1>🟡 XAU/USD</h1><p>مضاربة الذهب — قرار مختصر وواضح • v{VERSION}</p></div>",
+    f"<div class='hero'><h1>🟡 XAU/USD</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
     unsafe_allow_html=True,
 )
 
 if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
-    st.error("أضف TWELVE_DATA_API_KEY في Streamlit Secrets لتشغيل الأسعار.")
+    st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
 else:
     history = fetch_history()
 
@@ -340,73 +380,69 @@ else:
     def quick_panel() -> None:
         try:
             quote = fetch_quote()
-            second = fetch_goldapi()
-            check = consensus(quote, second)
-            age = quote_age(quote)
+            secondary = fetch_goldapi()
+            source_check = consensus(quote, secondary)
+            analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
-            if history.empty or not quote.get("ok"):
-                decision = "انتظر"
-                state = "wait"
-                analysis = {"strength": 0, "reason": quote.get("error") or "البيانات غير جاهزة"}
-                plan = None
-                watch = "—"
+            age = None
+            if quote.get("received_at"):
+                age = max(0.0, now_ts() - float(quote["received_at"]))
+
+            signal = analysis.get("signal", "WAIT")
+            fresh = age is not None and age <= 12.0
+            confirmed = bool(
+                quote.get("ok")
+                and signal in {"BUY", "SELL"}
+                and fresh
+                and source_check.get("ok")
+            )
+            plan = trade_plan(signal, quote, analysis) if confirmed else None
+
+            if confirmed and signal == "BUY":
+                decision, state = "شراء الآن", "ok"
+            elif confirmed and signal == "SELL":
+                decision, state = "بيع الآن", "ok"
             else:
-                analysis = analyze(history)
-                signal = analysis.get("signal", "WAIT")
-                fresh = age is not None and age <= 12
+                decision, state = "لا تدخل الآن", "wait"
 
-                confirmed = bool(
-                    signal in {"BUY", "SELL"}
-                    and fresh
-                    and check.get("ok")
-                )
-                if confirmed:
-                    decision = "شراء الآن" if signal == "BUY" else "بيع الآن"
-                    state = "ok"
-                    plan = trade_plan(signal, quote, analysis)
-                    watch = fmt(plan.get("entry") if plan else None)
-                else:
-                    decision = "لا تدخل الآن"
-                    state = "wait"
-                    plan = None
-                    if analysis.get("buy_score", 0) >= analysis.get("sell_score", 0):
-                        watch = "فوق " + fmt(analysis.get("buy_trigger"))
-                    else:
-                        watch = "تحت " + fmt(analysis.get("sell_trigger"))
+            if plan:
+                watch = fmt(plan["entry"])
+            elif analysis.get("buy_score", 0) >= analysis.get("sell_score", 0):
+                watch = "فوق " + fmt(analysis.get("buy_trigger"))
+            else:
+                watch = "تحت " + fmt(analysis.get("sell_trigger"))
 
-            entry = fmt(plan.get("entry")) if plan else watch
+            price = fmt(quote.get("last"))
             tp1 = fmt(plan.get("tp1")) if plan else "—"
             stop = fmt(plan.get("stop")) if plan else "—"
             strength = f"{int(analysis.get('strength', 0))}%"
-            price = fmt(quote.get("last"))
-            age_text = "—" if age is None else f"{age:.1f} ث"
 
-            html = f"""
-            <div class='grid'>
-              <div class='box'><div class='l'>وش أسوي؟</div><div class='v {state}'>{decision}</div></div>
-              <div class='box'><div class='l'>السعر الآن</div><div class='v'>{price}</div></div>
-              <div class='box'><div class='l'>الدخول / المراقبة</div><div class='v'>{entry}</div></div>
-              <div class='box'><div class='l'>خذ الربح عند</div><div class='v ok'>{tp1}</div></div>
-              <div class='box'><div class='l'>وقف الخسارة</div><div class='v bad'>{stop}</div></div>
-              <div class='box'><div class='l'>الجاهزية</div><div class='v'>{strength}</div></div>
-            </div>
-            """
-            st.markdown(html, unsafe_allow_html=True)
-
-            source_text = (
-                f"المصادر {check.get('count', 0)}/2 • {check.get('reason', '')}"
-                + f" • عمر آخر سعر {age_text}"
+            st.markdown(
+                f"""
+                <div class='grid'>
+                  <div class='box'><div class='l'>وش أسوي؟</div><div class='v {state}'>{decision}</div></div>
+                  <div class='box'><div class='l'>السعر الآن</div><div class='v'>{price}</div></div>
+                  <div class='box'><div class='l'>الدخول / المراقبة</div><div class='v'>{watch}</div></div>
+                  <div class='box'><div class='l'>خذ الربح عند</div><div class='v ok'>{tp1}</div></div>
+                  <div class='box'><div class='l'>وقف الخسارة</div><div class='v bad'>{stop}</div></div>
+                  <div class='box'><div class='l'>الجاهزية</div><div class='v'>{strength}</div></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            st.caption(source_text)
+
+            age_text = "—" if age is None else f"{age:.1f} ث"
+            st.caption(
+                f"المصادر {source_check.get('count', 0)}/2 • {source_check.get('reason', '')} • عمر السعر {age_text}"
+            )
             st.caption(str(analysis.get("reason") or ""))
 
             if plan:
-                st.caption(f"الهدف الثاني: {fmt(plan.get('tp2'))}")
-
-            if not second.get("configured", False):
-                st.info("لرفع دقة التأكيد أضف GOLDAPI_KEY كمصدر سعر ثانٍ.")
+                st.caption(f"الهدف الثاني: {fmt(plan['tp2'])}")
+            elif not secondary.get("configured", False):
+                st.info("أضف GOLDAPI_KEY لتفعيل تأكيد السعر من مصدرين.")
         except Exception as exc:
             st.error(f"تعذر تحديث القرار: {type(exc).__name__}")
-            st.caption("تم منع الخطأ من إسقاط التطبيق. سيحاول التحديث تلقائيًا.")
+            st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
