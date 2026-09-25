@@ -2,6 +2,9 @@ from __future__ import annotations
 
 # redeploy-marker: no-deps-stable-2026-09-25-0400
 
+import csv
+import io
+import threading
 import math
 import json
 import os
@@ -19,7 +22,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.3.0-sahm-gld"
+VERSION = "7.4.0-live-gold-paper"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -97,6 +100,130 @@ def position_status(position: dict, quote: dict, clock: float) -> str:
     if (position['side'] == 'شراء' and price >= position['target']) or (position['side'] == 'بيع' and price <= position['target']):
         return 'تنبيه خروج: السعر وصل الهدف أو تجاوزه'
     return 'متابعة: لم يصل السعر المرصود إلى الوقف أو الهدف'
+
+
+# Simulation assumptions, not broker lot specifications or a live FX conversion.
+PAPER_SAR_PER_USD = 3.75
+PAPER_SLIPPAGE_USD = 0.10
+
+
+def new_wallet() -> dict:
+    return dict(initial=5000.0, balance=5000.0, position=None, trades=[], next_id=1)
+
+
+def paper_quote_ready(q: dict, clock: float) -> bool:
+    stamp = q.get('updated_at')
+    return bool(q.get('ok') and stamp is not None and 0 <= clock - stamp <= 5
+                and q.get('market_open') and finite(q.get('bid'))
+                and finite(q.get('ask')) and q['ask'] >= q['bid'])
+
+
+def paper_daily_loss(wallet: dict, clock: float) -> float:
+    day = datetime.fromtimestamp(clock, timezone.utc).date().isoformat()
+    return sum(max(0.0, -t['pnl_sar']) for t in wallet['trades'] if t['day'] == day)
+
+
+def paper_open(wallet: dict, signal: str, plan: dict | None, quote: dict, clock: float) -> bool:
+    if wallet['position'] or not plan or signal not in ('BUY', 'SELL'):
+        return False
+    if not paper_quote_ready(quote, clock) or paper_daily_loss(wallet, clock) >= 75:
+        return False
+    entry = quote['ask'] + PAPER_SLIPPAGE_USD if signal == 'BUY' else quote['bid'] - PAPER_SLIPPAGE_USD
+    stop, target = plan['stop'], plan['tp1']
+    if not all(finite(v) for v in (entry, stop, target)):
+        return False
+    if not (stop < entry < target if signal == 'BUY' else target < entry < stop):
+        return False
+    risk = min(25.0, 75.0 - paper_daily_loss(wallet, clock), max(0.0, wallet['balance']) * 0.005)
+    # Fractional virtual ounces; no leverage and no claim of broker-executable size.
+    ounces = min(risk / ((abs(entry - stop) + PAPER_SLIPPAGE_USD) * PAPER_SAR_PER_USD),
+                 max(0.0, wallet['balance']) / (entry * PAPER_SAR_PER_USD))
+    if not finite(ounces):
+        return False
+    wallet['position'] = dict(id=wallet['next_id'], side=signal, entry=entry, stop=stop,
+                              target=target, ounces=ounces, opened_at=clock,
+                              risk_sar=ounces * (abs(entry-stop)+PAPER_SLIPPAGE_USD) * PAPER_SAR_PER_USD)
+    wallet['next_id'] += 1
+    return True
+
+
+def paper_exit_price(position: dict, q: dict) -> float:
+    return q['bid'] - PAPER_SLIPPAGE_USD if position['side'] == 'BUY' else q['ask'] + PAPER_SLIPPAGE_USD
+
+
+def paper_pnl(position: dict, price: float) -> float:
+    direction = 1 if position['side'] == 'BUY' else -1
+    return (price - position['entry']) * direction * position['ounces'] * PAPER_SAR_PER_USD
+
+
+def paper_close(wallet: dict, q: dict, clock: float, manual: bool = False) -> str | None:
+    position = wallet['position']
+    if not position or not paper_quote_ready(q, clock):
+        return None
+    observed = q['bid'] if position['side'] == 'BUY' else q['ask']
+    stop_hit = observed <= position['stop'] if position['side'] == 'BUY' else observed >= position['stop']
+    target_hit = observed >= position['target'] if position['side'] == 'BUY' else observed <= position['target']
+    if not (manual or stop_hit or target_hit):
+        return None
+    reason = 'وقف' if stop_hit else 'هدف' if target_hit else 'إغلاق يدوي'
+    price = paper_exit_price(position, q)
+    pnl = paper_pnl(position, price)
+    wallet['balance'] += pnl
+    wallet['trades'].append(dict(position, exit=price, pnl_sar=pnl, reason=reason,
+                                  closed_at=clock, day=datetime.fromtimestamp(clock, timezone.utc).date().isoformat()))
+    wallet['position'] = None
+    return reason
+
+
+def render_wallet(quote: dict, signal: str, plan: dict | None) -> None:
+    if 'paper_wallet' not in st.session_state:
+        st.session_state['paper_wallet'] = new_wallet()
+    wallet = st.session_state['paper_wallet']
+    clock = now_ts()
+    closed = paper_close(wallet, quote, clock)
+    st.subheader('محفظتي التجريبية — بدون أموال حقيقية')
+    if closed:
+        st.info(f'أُغلقت الصفقة الافتراضية: {closed}')
+    position = wallet['position']
+    unrealized = paper_pnl(position, paper_exit_price(position, quote)) if position and paper_quote_ready(quote, clock) else None
+    a, b, c = st.columns(3)
+    a.metric('الرصيد الافتراضي', f"{wallet['balance']:,.2f} ر.س")
+    b.metric('النتيجة المحققة', f"{wallet['balance'] - wallet['initial']:+,.2f} ر.س")
+    c.metric('صفقات مغلقة', len(wallet['trades']))
+    if position:
+        side = 'شراء' if position['side'] == 'BUY' else 'بيع'
+        st.write(f"{side} • الدخول {fmt(position['entry'])} • الوقف {fmt(position['stop'])} • الهدف {fmt(position['target'])}")
+        st.caption(f"الكمية {position['ounces']:.4f} أونصة افتراضية • الخسارة المخططة {position['risk_sar']:.2f} ريال؛ قد تتجاوزها القفزات")
+        if unrealized is None:
+            st.warning('تقييم الصفقة متوقف: ننتظر سعر شراء وبيع حديثًا. لا نستخدم سعرًا قديمًا للإغلاق.')
+        else:
+            st.metric('النتيجة العائمة التقديرية', f'{unrealized:+,.2f} ر.س')
+        if st.button('إغلاق صفقتي الافتراضية', disabled=not paper_quote_ready(quote, clock)):
+            paper_close(wallet, quote, now_ts(), manual=True)
+            st.rerun()
+    else:
+        blocked = paper_daily_loss(wallet, clock) >= 75
+        if blocked:
+            st.warning('توقف التجربة لبقية اليوم UTC: بلغت الخسائر المحققة 75 ريالًا أو أكثر.')
+        if st.button('جرّب الإشارة بمحفظتي الافتراضية', disabled=not plan or blocked):
+            if paper_open(wallet, signal, plan, quote, now_ts()):
+                st.rerun()
+            else:
+                st.warning('لم تُفتح الصفقة: الإشارة أو السعر لم يعد صالحًا.')
+        if not plan:
+            st.caption('انتظار إشارة مستوفية للشروط؛ ما تحتاج تكتب سعرًا أو تحول فلوس.')
+    with st.expander('سجل التجربة وطريقة الحساب'):
+        st.caption('رصيد البداية 5,000 ريال افتراضي. حد المخاطرة المخططة 25 ريالًا للصفقة، وتوقف بعد 75 ريالًا من خسائر اليوم. ليست توصية بإيداع حقيقي.')
+        st.caption('محاكاة كسور أونصة دون رافعة: 3.75 ريال للدولار كافتراض حسابي، مع فرق الشراء والبيع وانزلاق افتراضي 0.10 دولار للأونصة لكل تنفيذ. لا تشمل عمولة أو تمويل وسيطك، وليست اختبار ربحية تاريخيًا.')
+        st.caption('المتابعة أثناء فتح الجلسة فقط، وقد تفوت حركة بين تحديثين. الرصيد والسجل مؤقتان وقد يضيعان عند إعادة تحميل الصفحة أو انقطاع الجلسة. نزّل السجل قبل المغادرة.')
+        if wallet['trades']:
+            rows = [{'رقم': t['id'], 'الاتجاه': t['side'], 'الدخول': t['entry'], 'الخروج': t['exit'], 'النتيجة بالريال': round(t['pnl_sar'],2), 'السبب': t['reason'], 'التاريخ UTC': t['day']} for t in wallet['trades']]
+            st.dataframe(rows, hide_index=True)
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+            st.download_button('تنزيل سجل الصفقات CSV', buffer.getvalue().encode('utf-8-sig'), 'gold-paper-trades.csv', 'text/csv')
 
 
 def fmt(value: Any, decimals: int = 3) -> str:
@@ -289,6 +416,9 @@ def resample(rows: list[dict[str, Any]], seconds: int) -> list[dict[str, Any]]:
     out = []
     for key in sorted(buckets):
         group = buckets[key]
+        expected = seconds // 300
+        if len(group) != expected or any(r["ts"] != key + i * 300 for i, r in enumerate(group)):
+            continue
         out.append(
             {
                 "ts": float(key),
@@ -333,16 +463,17 @@ def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
     buy_trigger = max(x["high"] for x in prior)
     sell_trigger = min(x["low"] for x in prior)
 
+    h1_trend, m15_trend = trend(h1), trend(m15)
     buy_checks = [
-        trend(h1) == "UP",
-        trend(m15) == "UP",
+        h1_trend == "UP",
+        m15_trend == "UP",
         current["close"] > e20 > e50,
         rsi is not None and 50 <= rsi <= 68,
         current["close"] > buy_trigger,
     ]
     sell_checks = [
-        trend(h1) == "DOWN",
-        trend(m15) == "DOWN",
+        h1_trend == "DOWN",
+        m15_trend == "DOWN",
         current["close"] < e20 < e50,
         rsi is not None and 32 <= rsi <= 50,
         current["close"] < sell_trigger,
@@ -410,6 +541,104 @@ def trade_plan(signal: str, quote: dict[str, Any], analysis: dict[str, Any]) -> 
     return {"entry": entry, "stop": stop, "tp1": entry - risk_distance, "tp2": entry - 2 * risk_distance}
 
 
+class GoldStream:
+    """One shared stream per API credential; idle leases stop unused connections."""
+    def __init__(self, key: str):
+        self.key = key
+        self.lock = threading.Lock()
+        self.worker = None
+        self.touched = time.monotonic()
+        self.latest = None
+        self.status = 'بانتظار الاتصال'
+
+    def snapshot(self):
+        with self.lock:
+            self.touched = time.monotonic()
+            if self.worker is None or not self.worker.is_alive():
+                self.worker = threading.Thread(target=self.run, daemon=True)
+                self.worker.start()
+            return dict(self.latest) if self.latest else None, self.status
+
+    def accept(self, event):
+        if not isinstance(event, dict):
+            return
+        if event.get('event') != 'price' or event.get('symbol') != 'XAU/USD':
+            return
+        stamp = parse_time(event.get('timestamp'))
+        if stamp is None or not finite(event.get('price')) or stamp > now_ts() + 1:
+            return
+        with self.lock:
+            if self.latest and stamp < self.latest['timestamp']:
+                return
+            self.latest = dict(price=float(event['price']), timestamp=stamp, received=now_ts())
+            self.status = 'متصل'
+
+    def run(self):
+        try:
+            from websockets.sync.client import connect
+        except ImportError:
+            with self.lock:
+                self.status = 'مكتبة البث غير متاحة في بيئة التشغيل'
+            return
+        delay = 2
+        while time.monotonic() - self.touched < 90:
+            try:
+                with connect('wss://ws.twelvedata.com/v1/quotes/price?' + urlencode({'apikey': self.key}),
+                             open_timeout=8, close_timeout=2, max_size=65536) as ws:
+                    ws.send(json.dumps({'action': 'subscribe', 'params': {'symbols': 'XAU/USD'}}))
+                    with self.lock:
+                        self.status = 'متصل — ننتظر تحديث الذهب من المصدر'
+                    beat = time.monotonic()
+                    while time.monotonic() - self.touched < 90:
+                        if time.monotonic() - beat >= 10:
+                            ws.send(json.dumps({'action': 'heartbeat'}))
+                            beat = time.monotonic()
+                        try:
+                            event = json.loads(ws.recv(timeout=2))
+                        except TimeoutError:
+                            continue
+                        if isinstance(event, dict) and (event.get('event') == 'error' or
+                            (event.get('event') == 'subscribe-status' and event.get('status') != 'ok')):
+                            with self.lock:
+                                self.status = 'لم يقبل المصدر الاشتراك؛ تحقق من صلاحية بث XAU/USD'
+                            time.sleep(30)
+                            break
+                        self.accept(event)
+                        delay = 2
+            except Exception:
+                # Never expose exception text: a URL can contain the API key.
+                with self.lock:
+                    self.status = 'انقطع البث — إعادة اتصال تدريجية'
+            time.sleep(delay)
+            delay = min(30, delay * 2)
+        with self.lock:
+            self.status = 'متوقف لعدم وجود متابعة'
+
+
+@st.cache_resource(show_spinner=False)
+def gold_stream(key: str):
+    return GoldStream(key)
+
+
+@st.fragment(run_every=0.5)
+def live_gold_panel():
+    key = str(secret('TWELVE_DATA_API_KEY', '') or '').strip()
+    if not key:
+        return
+    tick, status = gold_stream(key).snapshot()
+    st.caption('بث XAU/USD من Twelve Data — سعر مرجعي، وليس سعر تنفيذ وسيطك')
+    if tick:
+        age = now_ts() - tick['timestamp']
+        st.metric('آخر سعر ذهب من البث — دولار / أونصة', fmt(tick['price']))
+        if 0 <= age <= 5:
+            st.caption(f'عمر تحديث المصدر {age:.1f} ثانية • {status}')
+        else:
+            st.warning('السعر المعروض قديم — لا تعتمد عليه للدخول')
+    else:
+        st.info(status)
+    st.caption('فحص العرض كل نصف ثانية؛ وصول حركة جديدة يعتمد على المصدر والاشتراك والشبكة. لا نضمن تأخيرًا أقل من ثانية.')
+
+
 st.markdown(
     """
     <style>
@@ -451,6 +680,9 @@ if ACTIVE_KIND == "gold_etf":
 if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
     st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
 else:
+    if ACTIVE_KIND == "spot_gold":
+        live_gold_panel()
+
     @st.fragment(run_every=3)
     def quick_panel() -> None:
         try:
@@ -459,8 +691,10 @@ else:
             quote = fetch_quote(ACTIVE_SYMBOL)
             secondary = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
             source_check = consensus(quote, secondary)
+            analysis_started = time.perf_counter()
             analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
+            analysis_ms = (time.perf_counter() - analysis_started) * 1000
             age = None
             if quote.get("updated_at"):
                 age = now_ts() - float(quote["updated_at"])
@@ -522,21 +756,25 @@ else:
             st.caption(gate_reason)
             st.caption(str(analysis.get("reason") or ""))
             st.caption("تحديث اللوحة كل 3 ثوانٍ؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.")
-            position = st.session_state.get('manual_position')
+            st.caption(f'زمن الحساب المحلي {analysis_ms:.1f} مللي ثانية — لا يشمل وصول بيانات السوق')
+            if ACTIVE_KIND == 'spot_gold':
+                render_wallet(quote, signal, plan)
+            position_key = 'manual_position_' + ACTIVE_SYMBOL
+            position = st.session_state.get(position_key)
             if position:
                 st.subheader('صفقتي المسجلة')
                 st.write(f"{position['side']} • الدخول {fmt(position['entry'])} • الوقف {fmt(position['stop'])} • الهدف {fmt(position['target'])}")
                 st.warning(position_status(position, quote, now_ts()))
                 if st.button('إنهاء المتابعة — أغلقت الصفقة عند الوسيط'):
-                    st.session_state.pop('manual_position', None)
+                    st.session_state.pop(position_key, None)
                     st.rerun()
             else:
-                with st.expander('تسجيل صفقة نفذتها يدويًا'):
+                with st.expander('متقدم: متابعة صفقة موجودة عند الوسيط'):
                     unit_text = "للأونصة" if ACTIVE_KIND == "spot_gold" else "للسهم"
                     st.caption(f'تسجيل ومتابعة فقط، لا يرسل أمرًا للوسيط. القيم بالدولار {unit_text}.')
                     with st.form('manual_trade'):
                         side = st.selectbox('الاتجاه', ['شراء', 'بيع'])
-                        entry = st.number_input('سعر التنفيذ الفعلي', min_value=0.0, value=0.0)
+                        entry = st.number_input('سعر التنفيذ بالدولار — ليس رأس المال', min_value=0.0, value=0.0)
                         stop_value = st.number_input('وقف الخسارة عند الوسيط', min_value=0.0, value=0.0)
                         target = st.number_input('هدف الربح', min_value=0.0, value=0.0)
                         if st.form_submit_button('بدء المتابعة'):
@@ -545,7 +783,7 @@ else:
                             if not valid:
                                 st.error('تحقق من الأسعار وترتيب الوقف والدخول والهدف وفق الاتجاه.')
                             else:
-                                st.session_state['manual_position'] = dict(side=side, entry=entry, stop=stop_value, target=target)
+                                st.session_state[position_key] = dict(side=side, entry=entry, stop=stop_value, target=target)
                                 st.rerun()
             st.caption('المتابعة أثناء فتح هذه الجلسة فقط؛ لا توجد تنبيهات خلفية. القفزات بين التحديثات قد تفوتنا، والوقف يجب وضعه لدى الوسيط.')
 
@@ -560,4 +798,5 @@ else:
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
+
 
