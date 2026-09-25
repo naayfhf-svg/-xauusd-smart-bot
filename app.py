@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import json
 import os
 import time
@@ -16,7 +17,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.1.0-no-deps-stable"
+VERSION = "7.2.0-manual-monitor"
 SYMBOL = "XAU/USD"
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
@@ -37,9 +38,52 @@ def now_ts() -> float:
 def finite(value: Any) -> bool:
     try:
         x = float(value)
-        return x > 0 and x != float("inf") and x != float("-inf")
+        return x > 0 and math.isfinite(x)
     except Exception:
         return False
+
+
+def parse_time(value: Any) -> float | None:
+    try:
+        if isinstance(value, (int, float)) or str(value).replace('.', '', 1).isdigit():
+            value = float(value)
+            return value if finite(value) else None
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def entry_gate(quote: dict, rows: list, clock: float) -> tuple[bool, str]:
+    if not quote.get('ok'):
+        return False, 'تعذر جلب السعر'
+    stamp = quote.get('updated_at')
+    if stamp is None or not 0 <= clock - stamp <= 5:
+        return False, 'توقيت السعر غير مؤكد أو تجاوز 5 ثوانٍ'
+    if not quote.get('market_open'):
+        return False, 'فتح السوق غير مؤكد'
+    if not rows or not 0 <= clock - (rows[-1]['ts'] + 300) <= 360:
+        return False, 'الشموع غير حديثة'
+    bid, ask = quote.get('bid'), quote.get('ask')
+    if not finite(bid) or not finite(ask) or ask < bid:
+        return False, 'سعر الشراء والبيع غير متاح أو غير صالح'
+    if (ask - bid) / quote['last'] > 0.0005:
+        return False, 'السبريد يتجاوز فلتر الدخول'
+    return True, 'اجتازت البيانات فحوص الدخول'
+
+
+def position_status(position: dict, quote: dict, clock: float) -> str:
+    stamp = quote.get('updated_at')
+    if not quote.get('ok') or stamp is None or not 0 <= clock - stamp <= 5:
+        return 'المتابعة متوقفة: تحقق من السعر والصفقة لدى وسيطك'
+    price = quote.get('bid') if position['side'] == 'شراء' else quote.get('ask')
+    if not finite(price):
+        return 'سعر الخروج غير متاح: راجع وسيطك'
+    if (position['side'] == 'شراء' and price <= position['stop']) or (position['side'] == 'بيع' and price >= position['stop']):
+        return 'تنبيه خروج: السعر وصل وقف الخسارة أو تجاوزه'
+    if (position['side'] == 'شراء' and price >= position['target']) or (position['side'] == 'بيع' and price <= position['target']):
+        return 'تنبيه خروج: السعر وصل الهدف أو تجاوزه'
+    return 'متابعة: لم يصل السعر المرصود إلى الوقف أو الهدف'
 
 
 def fmt(value: Any, decimals: int = 3) -> str:
@@ -96,6 +140,8 @@ def fetch_quote() -> dict[str, Any]:
         "bid": float(bid) if finite(bid) else None,
         "ask": float(ask) if finite(ask) else None,
         "received_at": received,
+        "updated_at": parse_time(payload.get("last_update_at")),
+        "market_open": payload.get("is_market_open") is True,
         "latency_ms": (time.perf_counter() - started) * 1000.0,
         "source": "Twelve Data",
     }
@@ -143,7 +189,7 @@ def fetch_history() -> list[dict[str, Any]]:
                 "low": float(row["low"]),
                 "close": float(row["close"]),
             }
-            if min(item["open"], item["high"], item["low"], item["close"]) <= 0:
+            if not all(finite(item[k]) for k in ("open", "high", "low", "close")):
                 continue
             out.append(item)
         except Exception:
@@ -173,6 +219,7 @@ def fetch_goldapi() -> dict[str, Any]:
     return {
         "ok": bool(status < 400 and finite(price)),
         "configured": True,
+        "updated_at": parse_time(payload.get("timestamp")) if isinstance(payload, dict) else None,
         "price": float(price) if finite(price) else None,
     }
 
@@ -315,7 +362,9 @@ def consensus(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, A
         return {"ok": False, "count": 0, "reason": "المصدر الرئيسي غير جاهز"}
 
     prices = [float(primary["last"])]
-    if secondary.get("ok") and finite(secondary.get("price")):
+    if (secondary.get("ok") and finite(secondary.get("price"))
+            and secondary.get("updated_at") is not None
+            and 0 <= now_ts() - secondary["updated_at"] <= 5):
         prices.append(float(secondary["price"]))
 
     if len(prices) < 2:
@@ -374,22 +423,22 @@ st.markdown(
 if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
     st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
 else:
-    history = fetch_history()
-
     @st.fragment(run_every=3)
     def quick_panel() -> None:
         try:
+            clock = now_ts()
+            history = [r for r in fetch_history() if r["ts"] + 300 <= clock]
             quote = fetch_quote()
             secondary = fetch_goldapi()
             source_check = consensus(quote, secondary)
             analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
             age = None
-            if quote.get("received_at"):
-                age = max(0.0, now_ts() - float(quote["received_at"]))
+            if quote.get("updated_at"):
+                age = now_ts() - float(quote["updated_at"])
 
             signal = analysis.get("signal", "WAIT")
-            fresh = age is not None and age <= 12.0
+            fresh, gate_reason = entry_gate(quote, history, now_ts())
             confirmed = bool(
                 quote.get("ok")
                 and signal in {"BUY", "SELL"}
@@ -399,9 +448,9 @@ else:
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
             if confirmed and signal == "BUY":
-                decision, state = "شراء الآن", "ok"
+                decision, state = "فرصة شراء تجريبية", "ok"
             elif confirmed and signal == "SELL":
-                decision, state = "بيع الآن", "ok"
+                decision, state = "فرصة بيع تجريبية", "ok"
             else:
                 decision, state = "لا تدخل الآن", "wait"
 
@@ -425,7 +474,7 @@ else:
                   <div class='box'><div class='l'>الدخول / المراقبة</div><div class='v'>{watch}</div></div>
                   <div class='box'><div class='l'>خذ الربح عند</div><div class='v ok'>{tp1}</div></div>
                   <div class='box'><div class='l'>وقف الخسارة</div><div class='v bad'>{stop}</div></div>
-                  <div class='box'><div class='l'>الجاهزية</div><div class='v'>{strength}</div></div>
+                  <div class='box'><div class='l'>اكتمال الشروط — ليس احتمال ربح</div><div class='v'>{strength}</div></div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -435,7 +484,34 @@ else:
             st.caption(
                 f"المصادر {source_check.get('count', 0)}/2 • {source_check.get('reason', '')} • عمر السعر {age_text}"
             )
+            st.caption(gate_reason)
             st.caption(str(analysis.get("reason") or ""))
+            st.caption("تحديث اللوحة كل 3 ثوانٍ؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.")
+            position = st.session_state.get('manual_position')
+            if position:
+                st.subheader('صفقتي المسجلة')
+                st.write(f"{position['side']} • الدخول {fmt(position['entry'])} • الوقف {fmt(position['stop'])} • الهدف {fmt(position['target'])}")
+                st.warning(position_status(position, quote, now_ts()))
+                if st.button('إنهاء المتابعة — أغلقت الصفقة عند الوسيط'):
+                    st.session_state.pop('manual_position', None)
+                    st.rerun()
+            else:
+                with st.expander('تسجيل صفقة نفذتها يدويًا'):
+                    st.caption('تسجيل ومتابعة فقط، لا يرسل أمرًا للوسيط. القيم بالدولار للأونصة.')
+                    with st.form('manual_trade'):
+                        side = st.selectbox('الاتجاه', ['شراء', 'بيع'])
+                        entry = st.number_input('سعر التنفيذ الفعلي', min_value=0.0, value=0.0)
+                        stop_value = st.number_input('وقف الخسارة عند الوسيط', min_value=0.0, value=0.0)
+                        target = st.number_input('هدف الربح', min_value=0.0, value=0.0)
+                        if st.form_submit_button('بدء المتابعة'):
+                            valid = all(finite(v) for v in (entry, stop_value, target))
+                            valid = valid and (stop_value < entry < target if side == 'شراء' else target < entry < stop_value)
+                            if not valid:
+                                st.error('تحقق من الأسعار وترتيب الوقف والدخول والهدف وفق الاتجاه.')
+                            else:
+                                st.session_state['manual_position'] = dict(side=side, entry=entry, stop=stop_value, target=target)
+                                st.rerun()
+            st.caption('المتابعة أثناء فتح هذه الجلسة فقط؛ لا توجد تنبيهات خلفية. القفزات بين التحديثات قد تفوتنا، والوقف يجب وضعه لدى الوسيط.')
 
             if plan:
                 st.caption(f"الهدف الثاني: {fmt(plan['tp2'])}")
@@ -446,3 +522,4 @@ else:
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
+
