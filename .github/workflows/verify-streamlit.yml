@@ -16,8 +16,8 @@ jobs:
           python-version: '3.12'
       - name: Compile app
         run: python -m py_compile app.py
-      - name: Install requirements
-        run: pip install --disable-pip-version-check -r requirements.txt
+      - name: Install production runtime
+        run: pip install --disable-pip-version-check "streamlit>=1.50,<2"
       - name: Import dependencies
         run: |
           python -c "import streamlit, altair, pandas, numpy, requests; print('imports-ok')"
