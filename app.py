@@ -22,7 +22,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.4.1-data-diagnostics"
+VERSION = "7.4.2-gold-provider"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -37,7 +37,7 @@ INSTRUMENTS = {
 }
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
-GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
+GOLDAPI_URL = "https://www.goldapi.io/api/XAU/USD"
 
 
 def secret(name: str, default: Any = None) -> Any:
@@ -357,13 +357,33 @@ def fetch_goldapi() -> dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "configured": True, "error": f"{type(exc).__name__}: {exc}"}
 
-    price = payload.get("price") if isinstance(payload, dict) else None
-    return {
-        "ok": bool(status < 400 and finite(price)),
-        "configured": True,
-        "updated_at": parse_time(payload.get("timestamp")) if isinstance(payload, dict) else None,
-        "price": float(price) if finite(price) else None,
-    }
+    return normalize_goldapi(payload, status)
+
+
+def normalize_goldapi(payload: Any, status: int) -> dict:
+    payload = payload if isinstance(payload, dict) else {}
+    price, bid, ask = (payload.get(k) for k in ('price', 'bid', 'ask'))
+    valid_pair = payload.get('metal') == 'XAU' and payload.get('currency') == 'USD'
+    return dict(ok=bool(status < 400 and valid_pair and finite(price)), configured=True,
+                updated_at=parse_time(payload.get('timestamp')),
+                price=float(price) if finite(price) else None,
+                bid=float(bid) if finite(bid) else None,
+                ask=float(ask) if finite(ask) else None, source='GoldAPI')
+
+
+def select_gold_sources(rest: dict, gold: dict, tick: dict | None, clock: float) -> tuple[dict, dict]:
+    # Each price retains its own source timestamp. Never synthesize bid/ask.
+    if not gold.get('configured'):
+        return rest, gold
+    primary = dict(gold, last=gold.get('price'), market_open=rest.get('market_open') is True,
+                   market_status_source='Twelve Data')
+    secondary = dict(ok=rest.get('ok', False), configured=True, price=rest.get('last'),
+                     updated_at=rest.get('updated_at'), source='Twelve Data REST')
+    if tick and finite(tick.get('price')) and tick.get('timestamp') is not None:
+        if 0 <= clock - tick['timestamp'] <= 5:
+            secondary = dict(ok=True, configured=True, price=tick['price'],
+                             updated_at=tick['timestamp'], source='Twelve Data stream')
+    return primary, secondary
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -688,6 +708,14 @@ if ACTIVE_KIND == "gold_etf":
         "GLD صندوق أمريكي يتتبع الذهب. تأكد من ظهوره وقابليته للتداول داخل حسابك في سهم قبل أي تنفيذ."
     )
 
+with st.expander('ربط مصدر الذهب — الإعداد مرة واحدة'):
+    st.write('جهّزنا GoldAPI لسعر الشراء والبيع وتوقيت التحديث، وTwelve Data للشموع والتحقق المستقل. لا يربط هذا حساب تداول ولا يرسل أوامر.')
+    st.link_button('فتح حساب GoldAPI', 'https://www.goldapi.io/')
+    st.write('في Streamlit افتح Manage app ثم Settings ثم Secrets. أضف السطر التالي مع الاحتفاظ بالمفاتيح الموجودة:')
+    st.code('GOLDAPI_KEY = "ضع مفتاح حسابك هنا"', language='toml')
+    st.caption('لا تضع المفتاح في GitHub أو المحادثة. تُستخدم الطلبات أثناء فتح التطبيق وفق الحصة؛ تحقق من حد الخطة قبل تفعيلها. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
+    st.write('حالة المفتاح: ' + ('موجود — يُختبر مع كل تحديث' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
+
 if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
     st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
 else:
@@ -700,7 +728,11 @@ else:
             clock = now_ts()
             history = [r for r in fetch_history(ACTIVE_SYMBOL) if r["ts"] + 300 <= clock]
             quote = fetch_quote(ACTIVE_SYMBOL)
-            secondary = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
+            gold = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
+            secondary = gold
+            if ACTIVE_KIND == "spot_gold":
+                tick, _ = gold_stream(str(secret('TWELVE_DATA_API_KEY', '') or '').strip()).snapshot()
+                quote, secondary = select_gold_sources(quote, gold, tick, now_ts())
             source_check = consensus(quote, secondary)
             analysis_started = time.perf_counter()
             analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
@@ -750,7 +782,7 @@ else:
                 f"""
                 <div class='grid'>
                   <div class='box'><div class='l'>وش أسوي؟</div><div class='v {state}'>{decision}</div></div>
-                  <div class='box'><div class='l'>آخر سعر REST — راجع حداثته</div><div class='v'>{price}</div></div>
+                  <div class='box'><div class='l'>آخر سعر التحليل — راجع حداثته</div><div class='v'>{price}</div></div>
                   <div class='box'><div class='l'>الدخول / المراقبة</div><div class='v'>{watch}</div></div>
                   <div class='box'><div class='l'>خذ الربح عند</div><div class='v ok'>{tp1}</div></div>
                   <div class='box'><div class='l'>وقف الخسارة</div><div class='v bad'>{stop}</div></div>
@@ -769,10 +801,13 @@ else:
                 st.caption(
                     f"GLD • مصدر السعر الحالي Twelve Data • عمر السعر {age_text} • مراقبة فقط حتى نربط مصدرًا ثانيًا أو سعر الوسيط"
                 )
+            st.caption(f"مصدر التحليل: {quote.get('source', 'غير متاح')} • أسعار مرجعية للمحاكاة، وليست عرض تنفيذ من وسيطك")
             if not data_ready:
                 st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
             with st.expander('تشخيص البيانات — سبب توقف الإشارات'):
                 issues = []
+                if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
+                    issues.append('GoldAPI لم يرجع سعر XAU/USD صالحًا؛ تحقق من المفتاح وصلاحية الاشتراك والحصة')
                 if not quote.get('ok'):
                     issues.append('تعذر جلب السعر من المصدر الرئيسي')
                 if age is None:
@@ -783,7 +818,7 @@ else:
                     issues.append('المصدر الرئيسي لا يوفر حاليًا Bid/Ask؛ البث المرجعي وحده لا يعوض سعر التنفيذ')
                 if not quote.get('market_open'):
                     issues.append('حالة فتح السوق غير مؤكدة من المزود')
-                if ACTIVE_KIND == 'spot_gold' and not secondary.get('configured'):
+                if ACTIVE_KIND == 'spot_gold' and not gold.get('configured'):
                     issues.append('GOLDAPI_KEY غير مضبوط؛ لا يوجد تأكيد من مصدر ثانٍ')
                 elif ACTIVE_KIND == 'spot_gold' and not source_check.get('ok'):
                     issues.append('تأكيد المصدر الثاني غير صالح: قد يكون متأخرًا أو مختلفًا أو غير متاح')
@@ -799,7 +834,7 @@ else:
                               rest_ok=bool(quote.get('ok')), rest_source_age_seconds=age,
                               bid_available=finite(quote.get('bid')), ask_available=finite(quote.get('ask')),
                               market_open=quote.get('market_open'), history_count=len(history),
-                              second_source_configured=bool(secondary.get('configured')),
+                              second_source_configured=bool(gold.get('configured')),
                               source_confirmation=bool(source_check.get('ok')), entry_gate=gate_reason,
                               issues=issues)
                 st.download_button('تنزيل تقرير التشخيص بدون مفاتيح',
@@ -841,8 +876,8 @@ else:
 
             if plan:
                 st.caption(f"الهدف الثاني: {fmt(plan['tp2'])}")
-            elif ACTIVE_KIND == "spot_gold" and not secondary.get("configured", False):
-                st.info("أضف GOLDAPI_KEY لتفعيل تأكيد السعر من مصدرين.")
+            elif ACTIVE_KIND == "spot_gold" and not gold.get("configured", False):
+                st.info("بقي تفعيل GoldAPI من إعدادات التطبيق للحصول على Bid/Ask وتوقيت المصدر. لا ترسل المفتاح في المحادثة.")
             elif ACTIVE_KIND == "gold_etf":
                 st.info("تم إدراج GLD للتحليل والمراقبة. لن يظهر دخول مؤكد حتى نربط مصدر سعر مستقل أو سعر وسيط.")
         except Exception as exc:
