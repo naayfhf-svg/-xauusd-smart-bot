@@ -7,6 +7,7 @@ import io
 import threading
 import math
 import json
+import hashlib
 import os
 import time
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.5.0-gld-stream"
+VERSION = "7.5.1-gld-readiness"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -652,6 +653,11 @@ def alpaca_config() -> tuple[str, str, str]:
     return key, token, feed if feed in ('iex', 'sip') else 'iex'
 
 
+def alpaca_cache_identity() -> str:
+    # Include credentials and feed in cache identity without displaying secrets.
+    return hashlib.sha256(json.dumps(alpaca_config()).encode()).hexdigest()
+
+
 def alpaca_get(path: str, params: dict | None = None, clock: bool = False) -> dict:
     key, token, feed = alpaca_config()
     if not key or not token:
@@ -679,17 +685,18 @@ def normalize_gld_quote(event: dict, feed: str) -> dict:
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def gld_rest_quote() -> dict:
+def gld_rest_quote(config_identity: str) -> dict:
     feed = alpaca_config()[2]
     data = alpaca_get('/v2/stocks/GLD/quotes/latest', {'feed': feed})
     return dict(normalize_gld_quote(data.get('quote') or {}, feed), error=data.get('error'))
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def gld_market_clock() -> dict:
+def gld_market_clock(config_identity: str) -> dict:
     data = alpaca_get('/v2/clock', clock=True)
     stamp = parse_time(data.get('timestamp'))
-    return dict(open=data.get('is_open') is True, timestamp=stamp, error=data.get('error'))
+    return dict(open=data.get('is_open') is True, timestamp=stamp, error=data.get('error'),
+                verified=isinstance(data.get('is_open'), bool), next_open=data.get('next_open'))
 
 
 def normalize_gld_bars(values: list) -> list:
@@ -715,7 +722,7 @@ def normalize_gld_bars(values: list) -> list:
 
 
 @st.cache_data(ttl=55, show_spinner=False)
-def gld_history() -> list:
+def gld_history(config_identity: str) -> list:
     start = datetime.fromtimestamp(now_ts() - 35 * 86400, timezone.utc).isoformat()
     data = alpaca_get('/v2/stocks/GLD/bars', dict(timeframe='5Min', start=start,
                        limit=3000, sort='desc', adjustment='raw', feed=alpaca_config()[2]))
@@ -822,11 +829,32 @@ def get_gld_quote() -> dict:
     if not key or not token:
         return dict(ok=False, error='أضف مفاتيح Alpaca من قسم ربط GLD', source='Alpaca غير مربوط')
     tick, status = gld_stream(key, token, feed).snapshot()
-    quote = tick if tick and 0 <= now_ts() - tick['updated_at'] <= 5 else gld_rest_quote()
-    market = gld_market_clock()
+    identity = alpaca_cache_identity()
+    quote = tick if tick and 0 <= now_ts() - tick['updated_at'] <= 5 else gld_rest_quote(identity)
+    market = gld_market_clock(identity)
     stamp = market.get('timestamp')
+    verified = bool(market.get('verified') and stamp is not None and 0 <= now_ts() - stamp <= 20)
     return dict(quote, stream_status=status,
-                market_open=bool(market['open'] and stamp is not None and 0 <= now_ts() - stamp <= 20))
+                market_open=bool(market['open'] and verified), market_verified=verified,
+                market_error=market.get('error'), next_open=market.get('next_open'))
+
+
+def gld_readiness_issues(quote: dict, history: list, clock: float) -> list[str]:
+    issues = []
+    if quote.get('error'):
+        issues.append(quote['error'])
+    if quote.get('feed') != 'sip':
+        issues.append('SIP غير مفعل؛ IEX مصدر محدود للمراقبة وليس مدخل إشارات هذا الإصدار')
+    if not quote.get('market_verified'):
+        issues.append('تعذر التحقق من ساعة السوق؛ تحقق من مفاتيح Paper وصلاحيتها')
+    elif not quote.get('market_open'):
+        issues.append('جلسة GLD النظامية مغلقة؛ الإشارات موقوفة حتى فتح السوق')
+    if len(history) < 120:
+        issues.append(f'الشموع المغلقة {len(history)}/120؛ لا يكفي السجل للتحليل')
+    ready, reason = entry_gate(quote, history, clock)
+    if not ready and reason not in issues:
+        issues.append(reason)
+    return issues
 
 
 @st.fragment(run_every=0.5)
@@ -936,7 +964,7 @@ else:
         try:
             clock = now_ts()
             history = ([r for r in fetch_history(ACTIVE_SYMBOL) if r["ts"] + 300 <= clock]
-                       if ACTIVE_KIND == 'spot_gold' else gld_history() if all(alpaca_config()[:2]) else [])
+                       if ACTIVE_KIND == 'spot_gold' else gld_history(alpaca_cache_identity()) if all(alpaca_config()[:2]) else [])
             quote = fetch_quote(ACTIVE_SYMBOL) if ACTIVE_KIND == 'spot_gold' else get_gld_quote()
             gold = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
             secondary = gold
@@ -1025,13 +1053,17 @@ else:
             st.caption(f"مصدر التحليل: {quote.get('source', 'غير متاح')} • أسعار مرجعية للمحاكاة، وليست عرض تنفيذ من وسيطك")
             if not data_ready:
                 st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
+                if ACTIVE_KIND == 'gold_etf':
+                    for problem in gld_readiness_issues(quote, history, now_ts()):
+                        st.write('• ' + problem)
+            if ACTIVE_KIND == 'gold_etf' and quote.get('market_verified') and not quote.get('market_open'):
+                opens = parse_time(quote.get('next_open'))
+                if opens is not None:
+                    st.caption('الافتتاح القادم بحسب المزود — الرياض: ' + datetime.fromtimestamp(opens, ZoneInfo('Asia/Riyadh')).strftime('%Y-%m-%d %H:%M'))
             with st.expander('تشخيص البيانات — سبب توقف الإشارات'):
                 issues = []
                 if ACTIVE_KIND == 'gold_etf':
-                    if quote.get('error'):
-                        issues.append(quote['error'])
-                    if quote.get('feed') != 'sip':
-                        issues.append('SIP غير مفعل؛ IEX مصدر محدود للمراقبة وليس مدخل إشارات هذا الإصدار')
+                    issues.extend(gld_readiness_issues(quote, history, now_ts()))
                 if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
                     issues.append('GoldAPI لم يرجع سعر XAU/USD صالحًا؛ تحقق من المفتاح وصلاحية الاشتراك والحصة')
                 if not quote.get('ok'):
@@ -1042,7 +1074,7 @@ else:
                     issues.append(f'عمر سعر المصدر الرئيسي {age:.1f} ثانية؛ الحد 5 ثوانٍ')
                 if not finite(quote.get('bid')) or not finite(quote.get('ask')):
                     issues.append('المصدر الرئيسي لا يوفر حاليًا Bid/Ask؛ البث المرجعي وحده لا يعوض سعر التنفيذ')
-                if not quote.get('market_open'):
+                if not quote.get('market_open') and ACTIVE_KIND == 'spot_gold':
                     issues.append('حالة فتح السوق غير مؤكدة من المزود')
                 if ACTIVE_KIND == 'spot_gold' and not gold.get('configured'):
                     issues.append('GOLDAPI_KEY غير مضبوط؛ لا يوجد تأكيد من مصدر ثانٍ')
