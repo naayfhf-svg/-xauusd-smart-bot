@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import streamlit as st
+from zoneinfo import ZoneInfo
 
 st.set_page_config(
     page_title="GOLD AI — مضاربة الذهب",
@@ -22,7 +23,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.4.2-gold-provider"
+VERSION = "7.5.0-gld-stream"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -644,6 +645,204 @@ class GoldStream:
             self.status = 'متوقف لعدم وجود متابعة'
 
 
+def alpaca_config() -> tuple[str, str, str]:
+    key = str(secret('ALPACA_API_KEY', '') or '').strip()
+    token = str(secret('ALPACA_SECRET_KEY', '') or '').strip()
+    feed = str(secret('ALPACA_DATA_FEED', 'iex')).lower().strip()
+    return key, token, feed if feed in ('iex', 'sip') else 'iex'
+
+
+def alpaca_get(path: str, params: dict | None = None, clock: bool = False) -> dict:
+    key, token, feed = alpaca_config()
+    if not key or not token:
+        return {'error': 'مفاتيح Alpaca غير مضبوطة'}
+    base = 'https://paper-api.alpaca.markets' if clock else 'https://data.alpaca.markets'
+    try:
+        status, data = http_json(base + path, params,
+                                headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': token}, timeout=4)
+        if status >= 400 or not isinstance(data, dict) or data.get('code'):
+            return {'error': 'رفض المزود الطلب؛ تحقق من مفاتيح Paper وصلاحية البيانات والحصة'}
+        return data
+    except Exception:
+        return {'error': 'تعذر الاتصال بالمزود؛ تحقق من مفاتيح Paper وصلاحية البيانات والحصة'}
+
+
+def normalize_gld_quote(event: dict, feed: str) -> dict:
+    stamp = parse_time(event.get('t'))
+    bid, ask = event.get('bp'), event.get('ap')
+    valid = (stamp is not None and finite(bid) and finite(ask)
+             and float(ask) >= float(bid) and stamp <= now_ts())
+    return dict(ok=bool(valid), last=(float(bid) + float(ask)) / 2 if valid else None,
+                bid=float(bid) if finite(bid) else None, ask=float(ask) if finite(ask) else None,
+                updated_at=stamp, timestamp=stamp, received=now_ts(),
+                source='Alpaca ' + feed.upper(), feed=feed)
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def gld_rest_quote() -> dict:
+    feed = alpaca_config()[2]
+    data = alpaca_get('/v2/stocks/GLD/quotes/latest', {'feed': feed})
+    return dict(normalize_gld_quote(data.get('quote') or {}, feed), error=data.get('error'))
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def gld_market_clock() -> dict:
+    data = alpaca_get('/v2/clock', clock=True)
+    stamp = parse_time(data.get('timestamp'))
+    return dict(open=data.get('is_open') is True, timestamp=stamp, error=data.get('error'))
+
+
+def normalize_gld_bars(values: list) -> list:
+    rows = {}
+    for bar in values:
+        try:
+            stamp = parse_time(bar['t'])
+            local = datetime.fromtimestamp(stamp, ZoneInfo('America/New_York'))
+            minute = local.hour * 60 + local.minute
+            if local.weekday() >= 5 or not 570 <= minute < 960 or stamp + 300 > now_ts():
+                continue
+            row = dict(ts=stamp, open=float(bar['o']), high=float(bar['h']),
+                       low=float(bar['l']), close=float(bar['c']), volume=float(bar['v']))
+            if not all(finite(row[k]) for k in ('open', 'high', 'low', 'close', 'volume')):
+                continue
+            if not row['low'] <= min(row['open'], row['close']) <= max(row['open'], row['close']) <= row['high']:
+                continue
+            row['vwap'] = float(bar['vw']) if finite(bar.get('vw')) else (row['high'] + row['low'] + row['close']) / 3
+            rows[stamp] = row
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return [rows[t] for t in sorted(rows)]
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def gld_history() -> list:
+    start = datetime.fromtimestamp(now_ts() - 35 * 86400, timezone.utc).isoformat()
+    data = alpaca_get('/v2/stocks/GLD/bars', dict(timeframe='5Min', start=start,
+                       limit=3000, sort='desc', adjustment='raw', feed=alpaca_config()[2]))
+    return normalize_gld_bars(data.get('bars') or [])
+
+
+def analyze_gld(rows: list) -> dict:
+    result = dict(signal='WAIT', strength=0, reason='شموع GLD غير كافية', checks={})
+    if len(rows) < 120:
+        return result
+    current = rows[-1]
+    today = datetime.fromtimestamp(current['ts'], ZoneInfo('America/New_York')).date()
+    session = [r for r in rows if datetime.fromtimestamp(r['ts'], ZoneInfo('America/New_York')).date() == today]
+    if len(session) < 7 or any(b['ts'] - a['ts'] != 300 for a, b in zip(session, session[1:])):
+        return dict(result, reason='ننتظر 7 شموع مغلقة متصلة على الأقل من جلسة GLD')
+    closes = [r['close'] for r in rows]
+    e20, e50 = ema(closes, 20)[-1], ema(closes, 50)[-1]
+    rsi, volatility = rolling_rsi(closes, 14), atr(rows, 14)
+    volume = sum(r['volume'] for r in session)
+    vwap = sum(r['vwap'] * r['volume'] for r in session) / volume
+    relative = current['volume'] / (sum(r['volume'] for r in rows[-21:-1]) / 20)
+    trigger = max(r['high'] for r in session[-7:-1])
+    checks = {'اتجاه 15 دقيقة': trend(resample(rows, 900)) == 'UP',
+              'اتجاه 5 دقائق': current['close'] > e20 > e50,
+              'زخم متوازن': rsi is not None and 50 <= rsi <= 68,
+              'فوق متوسط الجلسة المرجح بالحجم': current['close'] > vwap,
+              'حجم أعلى من المتوسط': relative >= 1.2,
+              'اختراق شمعة مغلقة': current['close'] > trigger}
+    passed = all(checks.values())
+    weak = current['close'] < vwap and current['close'] < e20
+    return dict(signal='BUY' if passed else 'WAIT', strength=round(sum(checks.values()) / 6 * 100),
+                reason='اختراق صاعد مستوفٍ للقواعد التجريبية' if passed else 'ضعف اتجاه؛ راجع صفقتك القائمة — ليست إشارة بيع على المكشوف' if weak else 'الشروط لم تكتمل',
+                atr=volatility, buy_trigger=trigger, buy_score=sum(checks.values()), sell_score=0,
+                checks=checks, vwap=vwap, relative_volume=relative)
+
+
+class GLDStream(GoldStream):
+    def __init__(self, key: str, token: str, feed: str):
+        super().__init__(key)
+        self.token, self.feed = token, feed
+
+    def accept(self, event):
+        if not isinstance(event, dict) or event.get('T') != 'q' or event.get('S') != 'GLD':
+            return
+        quote = normalize_gld_quote(event, self.feed)
+        if not quote['ok']:
+            return
+        with self.lock:
+            if self.latest and quote['timestamp'] <= self.latest['timestamp']:
+                return
+            self.latest = quote
+            self.status = 'متصل — ' + self.feed.upper()
+
+    def run(self):
+        try:
+            from websockets.sync.client import connect
+        except ImportError:
+            with self.lock:
+                self.status = 'البث غير متاح؛ نستخدم REST مع فحص حداثته'
+            return
+        delay = 2
+        while time.monotonic() - self.touched < 90:
+            try:
+                with connect('wss://stream.data.alpaca.markets/v2/' + self.feed,
+                             open_timeout=8, close_timeout=2, max_size=1048576) as ws:
+                    ws.send(json.dumps(dict(action='auth', key=self.key, secret=self.token)))
+                    subscribed = False
+                    started = last_event = time.monotonic()
+                    while time.monotonic() - self.touched < 90:
+                        if time.monotonic() - last_event > 45 or (not subscribed and time.monotonic() - started > 10):
+                            break
+                        try:
+                            events = json.loads(ws.recv(timeout=2))
+                        except TimeoutError:
+                            continue
+                        for event in events if isinstance(events, list) else []:
+                            if event.get('T') == 'error':
+                                with self.lock:
+                                    self.status = 'رفض البث؛ تحقق من صلاحية IEX/SIP ومفاتيح Alpaca'
+                                time.sleep(30)
+                                raise ValueError('provider rejected')
+                            if event.get('T') == 'success' and event.get('msg') == 'authenticated':
+                                ws.send(json.dumps(dict(action='subscribe', quotes=['GLD'])))
+                                subscribed = True
+                            self.accept(event)
+                            if event.get('T') == 'q' and event.get('S') == 'GLD':
+                                last_event = time.monotonic()
+                                delay = 2
+            except Exception:
+                with self.lock:
+                    if not self.status.startswith('رفض'):
+                        self.status = 'إعادة اتصال ببث GLD'
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+
+@st.cache_resource(show_spinner=False)
+def gld_stream(key: str, token: str, feed: str):
+    return GLDStream(key, token, feed)
+
+
+def get_gld_quote() -> dict:
+    key, token, feed = alpaca_config()
+    if not key or not token:
+        return dict(ok=False, error='أضف مفاتيح Alpaca من قسم ربط GLD', source='Alpaca غير مربوط')
+    tick, status = gld_stream(key, token, feed).snapshot()
+    quote = tick if tick and 0 <= now_ts() - tick['updated_at'] <= 5 else gld_rest_quote()
+    market = gld_market_clock()
+    stamp = market.get('timestamp')
+    return dict(quote, stream_status=status,
+                market_open=bool(market['open'] and stamp is not None and 0 <= now_ts() - stamp <= 20))
+
+
+@st.fragment(run_every=0.5)
+def live_gld_panel():
+    key, token, feed = alpaca_config()
+    if not key or not token:
+        return
+    tick, status = gld_stream(key, token, feed).snapshot()
+    st.caption('بث GLD • ' + status + ' • لا يرسل أوامر للوسيط')
+    if tick:
+        age = now_ts() - tick['updated_at']
+        st.write(f"Bid {fmt(tick['bid'])} • Ask {fmt(tick['ask'])} • عمر المصدر {age:.1f} ث")
+        if not 0 <= age <= 5:
+            st.warning('عرض قديم — الإشارات موقوفة حتى وصول سعر حديث')
+
+
 @st.cache_resource(show_spinner=False)
 def gold_stream(key: str):
     return GoldStream(key)
@@ -708,7 +907,7 @@ if ACTIVE_KIND == "gold_etf":
         "GLD صندوق أمريكي يتتبع الذهب. تأكد من ظهوره وقابليته للتداول داخل حسابك في سهم قبل أي تنفيذ."
     )
 
-with st.expander('ربط مصدر الذهب — الإعداد مرة واحدة'):
+with st.expander('ربط الذهب الفوري فقط — GoldAPI'):
     st.write('جهّزنا GoldAPI لسعر الشراء والبيع وتوقيت التحديث، وTwelve Data للشموع والتحقق المستقل. لا يربط هذا حساب تداول ولا يرسل أوامر.')
     st.link_button('فتح حساب GoldAPI', 'https://www.goldapi.io/')
     st.write('في Streamlit افتح Manage app ثم Settings ثم Secrets. أضف السطر التالي مع الاحتفاظ بالمفاتيح الموجودة:')
@@ -716,26 +915,40 @@ with st.expander('ربط مصدر الذهب — الإعداد مرة واحد�
     st.caption('لا تضع المفتاح في GitHub أو المحادثة. تُستخدم الطلبات أثناء فتح التطبيق وفق الحصة؛ تحقق من حد الخطة قبل تفعيلها. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
     st.write('حالة المفتاح: ' + ('موجود — يُختبر مع كل تحديث' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
 
-if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
+if ACTIVE_KIND == 'gold_etf':
+    with st.expander('ربط GLD — أسعار Alpaca', expanded=not all(alpaca_config()[:2])):
+        st.write('مصدر GLD مستقل عن الذهب الفوري. لا تحتاج GoldAPI لهذا القسم.')
+        st.link_button('حساب بيانات Alpaca', 'https://app.alpaca.markets/')
+        st.code('ALPACA_API_KEY = "مفتاح Paper"\nALPACA_SECRET_KEY = "المفتاح السري"\nALPACA_DATA_FEED = "iex"', language='toml')
+        st.caption('ضع القيم في Streamlit Secrets فقط. IEX للمراقبة المحدودة؛ SIP للإشارات التجريبية بعد تفعيل صلاحية البيانات في حسابك وتغيير iex إلى sip. لا نشتري اشتراكًا ولا نرسل أي أوامر تداول.')
+        st.caption('المحلل قواعد فنية قابلة للفحص، وليس نموذجًا مثبت الربحية. تحديث العرض نصف ثانية والقرار ثانية؛ زمن وصول المصدر غير مضمون. مفاتيح Paper مطلوبة أيضًا للتحقق من ساعة السوق.')
+
+if ACTIVE_KIND == 'spot_gold' and not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
     st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
 else:
     if ACTIVE_KIND == "spot_gold":
         live_gold_panel()
+    else:
+        live_gld_panel()
 
-    @st.fragment(run_every=3)
+    @st.fragment(run_every=1 if ACTIVE_KIND == 'gold_etf' else 3)
     def quick_panel() -> None:
         try:
             clock = now_ts()
-            history = [r for r in fetch_history(ACTIVE_SYMBOL) if r["ts"] + 300 <= clock]
-            quote = fetch_quote(ACTIVE_SYMBOL)
+            history = ([r for r in fetch_history(ACTIVE_SYMBOL) if r["ts"] + 300 <= clock]
+                       if ACTIVE_KIND == 'spot_gold' else gld_history() if all(alpaca_config()[:2]) else [])
+            quote = fetch_quote(ACTIVE_SYMBOL) if ACTIVE_KIND == 'spot_gold' else get_gld_quote()
             gold = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
             secondary = gold
             if ACTIVE_KIND == "spot_gold":
                 tick, _ = gold_stream(str(secret('TWELVE_DATA_API_KEY', '') or '').strip()).snapshot()
                 quote, secondary = select_gold_sources(quote, gold, tick, now_ts())
             source_check = consensus(quote, secondary)
+            if ACTIVE_KIND == 'gold_etf':
+                source_check = dict(ok=quote.get('ok') and quote.get('feed') == 'sip', count=1,
+                                    reason='SIP مجمع عبر مزود واحد؛ ليس تحققًا من مزودين مستقلين')
             analysis_started = time.perf_counter()
-            analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
+            analysis = (analyze_gld(history) if ACTIVE_KIND == 'gold_etf' else analyze(history)) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
             analysis_ms = (time.perf_counter() - analysis_started) * 1000
             age = None
@@ -751,10 +964,14 @@ else:
                 and source_check.get("ok")
             )
             if ACTIVE_KIND == "gold_etf":
-                confirmed = False
+                confirmed = confirmed and signal == 'BUY'
+                if confirmed and (not finite(analysis.get('atr')) or
+                                  quote['ask'] > history[-1]['close'] + 0.5 * analysis['atr']):
+                    confirmed = False
+                    analysis['reason'] = 'تحرك السعر بعيدًا عن شمعة الإشارة؛ لا نطارد الدخول'
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
-            data_ready = fresh and source_check.get('ok') and ACTIVE_KIND == 'spot_gold'
+            data_ready = fresh and source_check.get('ok')
             if not data_ready:
                 decision, state = "البيانات غير جاهزة", "bad"
             elif confirmed and signal == "BUY":
@@ -799,13 +1016,22 @@ else:
                 )
             else:
                 st.caption(
-                    f"GLD • مصدر السعر الحالي Twelve Data • عمر السعر {age_text} • مراقبة فقط حتى نربط مصدرًا ثانيًا أو سعر الوسيط"
+                    f"GLD • {quote.get('source', 'Alpaca')} • عمر السعر {age_text} • {source_check['reason']} • IEX للمراقبة فقط"
                 )
+                with st.expander('لماذا هذه القراءة؟ — محلل GLD'):
+                    for label, passed in analysis.get('checks', {}).items():
+                        st.write(('✓ ' if passed else '— ') + label)
+                    st.caption('شراء فقط؛ الضعف ليس أمر بيع على المكشوف. VWAP محسوب من شموع الجلسة المغلقة المتاحة، والحجم النسبي مقارنة بآخر 20 شمعة؛ ليست نسبة نجاح متوقعة.')
             st.caption(f"مصدر التحليل: {quote.get('source', 'غير متاح')} • أسعار مرجعية للمحاكاة، وليست عرض تنفيذ من وسيطك")
             if not data_ready:
                 st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
             with st.expander('تشخيص البيانات — سبب توقف الإشارات'):
                 issues = []
+                if ACTIVE_KIND == 'gold_etf':
+                    if quote.get('error'):
+                        issues.append(quote['error'])
+                    if quote.get('feed') != 'sip':
+                        issues.append('SIP غير مفعل؛ IEX مصدر محدود للمراقبة وليس مدخل إشارات هذا الإصدار')
                 if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
                     issues.append('GoldAPI لم يرجع سعر XAU/USD صالحًا؛ تحقق من المفتاح وصلاحية الاشتراك والحصة')
                 if not quote.get('ok'):
@@ -842,7 +1068,7 @@ else:
                                    'gold-diagnostics.json', 'application/json')
             st.caption(gate_reason)
             st.caption(str(analysis.get("reason") or ""))
-            st.caption("تحديث اللوحة كل 3 ثوانٍ؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.")
+            st.caption(('تحديث قرار GLD كل ثانية' if ACTIVE_KIND == 'gold_etf' else 'تحديث القرار كل 3 ثوانٍ') + '؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.')
             st.caption(f'زمن الحساب المحلي {analysis_ms:.1f} مللي ثانية — لا يشمل وصول بيانات السوق')
             if ACTIVE_KIND == 'spot_gold':
                 render_wallet(quote, signal, plan)
@@ -879,11 +1105,9 @@ else:
             elif ACTIVE_KIND == "spot_gold" and not gold.get("configured", False):
                 st.info("بقي تفعيل GoldAPI من إعدادات التطبيق للحصول على Bid/Ask وتوقيت المصدر. لا ترسل المفتاح في المحادثة.")
             elif ACTIVE_KIND == "gold_etf":
-                st.info("تم إدراج GLD للتحليل والمراقبة. لن يظهر دخول مؤكد حتى نربط مصدر سعر مستقل أو سعر وسيط.")
+                st.info("GLD: بيانات Alpaca، وإشارات شراء تجريبية فقط عند صلاحية SIP واكتمال فحص البيانات والقواعد. ليس مربوطًا بتنفيذ سهم.")
         except Exception as exc:
             st.error(f"تعذر تحديث القرار: {type(exc).__name__}")
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
-
-
