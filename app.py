@@ -19,8 +19,19 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.2.0-manual-monitor"
-SYMBOL = "XAU/USD"
+VERSION = "7.3.0-sahm-gld"
+INSTRUMENTS = {
+    "الذهب الفوري — XAU/USD": {
+        "symbol": "XAU/USD",
+        "label": "XAU/USD",
+        "kind": "spot_gold",
+    },
+    "GLD — صندوق ذهب أمريكي (للبحث في سهم)": {
+        "symbol": "GLD",
+        "label": "GLD",
+        "kind": "gold_etf",
+    },
+}
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
 GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
@@ -106,7 +117,7 @@ def http_json(url: str, params: dict[str, Any] | None = None, headers: dict[str,
 
 
 @st.cache_data(ttl=8, show_spinner=False)
-def fetch_quote() -> dict[str, Any]:
+def fetch_quote(symbol: str) -> dict[str, Any]:
     key = str(secret("TWELVE_DATA_API_KEY", "") or "").strip()
     if not key:
         return {"ok": False, "error": "TWELVE_DATA_API_KEY غير موجود"}
@@ -116,7 +127,7 @@ def fetch_quote() -> dict[str, Any]:
         status, payload = http_json(
             QUOTE_URL,
             {
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "interval": "1min",
                 "timezone": "UTC",
                 "apikey": key,
@@ -150,7 +161,7 @@ def fetch_quote() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=55, show_spinner=False)
-def fetch_history() -> list[dict[str, Any]]:
+def fetch_history(symbol: str) -> list[dict[str, Any]]:
     key = str(secret("TWELVE_DATA_API_KEY", "") or "").strip()
     if not key:
         return []
@@ -159,7 +170,7 @@ def fetch_history() -> list[dict[str, Any]]:
         status, payload = http_json(
             HISTORY_URL,
             {
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "interval": "5min",
                 "outputsize": 1200,
                 "timezone": "UTC",
@@ -417,10 +428,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+selected_name = st.selectbox(
+    "الأداة",
+    list(INSTRUMENTS.keys()),
+    index=0,
+)
+instrument = INSTRUMENTS[selected_name]
+ACTIVE_SYMBOL = instrument["symbol"]
+ACTIVE_LABEL = instrument["label"]
+ACTIVE_KIND = instrument["kind"]
+
 st.markdown(
-    f"<div class='hero'><h1>🟡 XAU/USD</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
+    f"<div class='hero'><h1>🟡 {ACTIVE_LABEL}</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
     unsafe_allow_html=True,
 )
+
+if ACTIVE_KIND == "gold_etf":
+    st.caption(
+        "GLD صندوق أمريكي يتتبع الذهب. تأكد من ظهوره وقابليته للتداول داخل حسابك في سهم قبل أي تنفيذ."
+    )
 
 if not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
     st.error("أضف TWELVE_DATA_API_KEY في Secrets لتشغيل الأسعار.")
@@ -429,9 +455,9 @@ else:
     def quick_panel() -> None:
         try:
             clock = now_ts()
-            history = [r for r in fetch_history() if r["ts"] + 300 <= clock]
-            quote = fetch_quote()
-            secondary = fetch_goldapi()
+            history = [r for r in fetch_history(ACTIVE_SYMBOL) if r["ts"] + 300 <= clock]
+            quote = fetch_quote(ACTIVE_SYMBOL)
+            secondary = fetch_goldapi() if ACTIVE_KIND == "spot_gold" else {"ok": False, "configured": False}
             source_check = consensus(quote, secondary)
             analysis = analyze(history) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
@@ -447,6 +473,8 @@ else:
                 and fresh
                 and source_check.get("ok")
             )
+            if ACTIVE_KIND == "gold_etf":
+                confirmed = False
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
             if confirmed and signal == "BUY":
@@ -483,9 +511,14 @@ else:
             )
 
             age_text = "—" if age is None else f"{age:.1f} ث"
-            st.caption(
-                f"المصادر {source_check.get('count', 0)}/2 • {source_check.get('reason', '')} • عمر السعر {age_text}"
-            )
+            if ACTIVE_KIND == "spot_gold":
+                st.caption(
+                    f"المصادر {source_check.get('count', 0)}/2 • {source_check.get('reason', '')} • عمر السعر {age_text}"
+                )
+            else:
+                st.caption(
+                    f"GLD • مصدر السعر الحالي Twelve Data • عمر السعر {age_text} • مراقبة فقط حتى نربط مصدرًا ثانيًا أو سعر الوسيط"
+                )
             st.caption(gate_reason)
             st.caption(str(analysis.get("reason") or ""))
             st.caption("تحديث اللوحة كل 3 ثوانٍ؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.")
@@ -499,7 +532,8 @@ else:
                     st.rerun()
             else:
                 with st.expander('تسجيل صفقة نفذتها يدويًا'):
-                    st.caption('تسجيل ومتابعة فقط، لا يرسل أمرًا للوسيط. القيم بالدولار للأونصة.')
+                    unit_text = "للأونصة" if ACTIVE_KIND == "spot_gold" else "للسهم"
+                    st.caption(f'تسجيل ومتابعة فقط، لا يرسل أمرًا للوسيط. القيم بالدولار {unit_text}.')
                     with st.form('manual_trade'):
                         side = st.selectbox('الاتجاه', ['شراء', 'بيع'])
                         entry = st.number_input('سعر التنفيذ الفعلي', min_value=0.0, value=0.0)
@@ -517,8 +551,10 @@ else:
 
             if plan:
                 st.caption(f"الهدف الثاني: {fmt(plan['tp2'])}")
-            elif not secondary.get("configured", False):
+            elif ACTIVE_KIND == "spot_gold" and not secondary.get("configured", False):
                 st.info("أضف GOLDAPI_KEY لتفعيل تأكيد السعر من مصدرين.")
+            elif ACTIVE_KIND == "gold_etf":
+                st.info("تم إدراج GLD للتحليل والمراقبة. لن يظهر دخول مؤكد حتى نربط مصدر سعر مستقل أو سعر وسيط.")
         except Exception as exc:
             st.error(f"تعذر تحديث القرار: {type(exc).__name__}")
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
