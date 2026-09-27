@@ -103,11 +103,14 @@ with patch('urllib.request.urlopen', side_effect=reply), patch('websockets.sync.
     app.run(timeout=20)
     app.selectbox[0].select_index(1).run(timeout=20)
     assert not app.exception, app.exception
-    assert any('SIP غير مفعل' in m.value for m in app.markdown)
+    assert app.selectbox[0].value.startswith('GLD')
+    assert any('IEX مجاني' in m.value for m in app.caption)
+    assert not any('ربط الذهب الفوري' in e.label for e in app.expander)
     assert not any('فرصة شراء تجريبية' in m.value for m in app.markdown)
     app.secrets['ALPACA_DATA_FEED'] = 'sip'
     app.run(timeout=20)
     assert not app.exception, app.exception
     assert not any('SIP غير مفعل' in m.value for m in app.markdown)
-print('GLD UI with Alpaca only (no Twelve Data or GoldAPI), IEX blocked and GET-only requests passed')
+print('GLD UI with Alpaca only (no Twelve Data or GoldAPI), free IEX labelled, stale data blocked and GET-only requests passed')
 print('Credential/feed cache isolation, missing history and closed/unknown market diagnostics passed')
+
