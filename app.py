@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.5.1-gld-readiness"
+VERSION = "7.6.0-free-iex-paper"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -839,12 +839,28 @@ def get_gld_quote() -> dict:
                 market_error=market.get('error'), next_open=market.get('next_open'))
 
 
+def gld_source_check(quote: dict) -> dict:
+    feed = quote.get('feed')
+    reason = ('IEX مجاني • تجربة على بورصة واحدة؛ السعر والحجم لا يمثلان السوق كاملًا'
+              if feed == 'iex' else 'SIP مجمع عبر مزود واحد؛ ليس تحققًا من مزودين مستقلين'
+              if feed == 'sip' else 'مصدر GLD غير معروف')
+    return dict(ok=bool(quote.get('ok') and feed in ('iex', 'sip')), count=1, reason=reason)
+
+
+def gld_entry_ready(quote: dict, history: list, analysis: dict, clock: float) -> bool:
+    # IEX is allowed only for explicitly labelled paper analysis. Keep all quality gates.
+    return bool(gld_source_check(quote)['ok'] and quote.get('market_verified')
+                and len(history) >= 120 and entry_gate(quote, history, clock)[0]
+                and analysis.get('signal') == 'BUY' and finite(analysis.get('atr'))
+                and quote['ask'] <= history[-1]['close'] + 0.5 * analysis['atr'])
+
+
 def gld_readiness_issues(quote: dict, history: list, clock: float) -> list[str]:
     issues = []
     if quote.get('error'):
         issues.append(quote['error'])
-    if quote.get('feed') != 'sip':
-        issues.append('SIP غير مفعل؛ IEX مصدر محدود للمراقبة وليس مدخل إشارات هذا الإصدار')
+    if quote.get('feed') not in ('iex', 'sip'):
+        issues.append('مصدر GLD غير معروف؛ نحتاج IEX أو SIP')
     if not quote.get('market_verified'):
         issues.append('تعذر التحقق من ساعة السوق؛ تحقق من مفاتيح Paper وصلاحيتها')
     elif not quote.get('market_open'):
@@ -918,7 +934,7 @@ st.markdown(
 selected_name = st.selectbox(
     "الأداة",
     list(INSTRUMENTS.keys()),
-    index=0,
+    index=1 if all(alpaca_config()[:2]) else 0,
 )
 instrument = INSTRUMENTS[selected_name]
 ACTIVE_SYMBOL = instrument["symbol"]
@@ -935,20 +951,21 @@ if ACTIVE_KIND == "gold_etf":
         "GLD صندوق أمريكي يتتبع الذهب. تأكد من ظهوره وقابليته للتداول داخل حسابك في سهم قبل أي تنفيذ."
     )
 
-with st.expander('ربط الذهب الفوري فقط — GoldAPI'):
-    st.write('جهّزنا GoldAPI لسعر الشراء والبيع وتوقيت التحديث، وTwelve Data للشموع والتحقق المستقل. لا يربط هذا حساب تداول ولا يرسل أوامر.')
-    st.link_button('فتح حساب GoldAPI', 'https://www.goldapi.io/')
-    st.write('في Streamlit افتح Manage app ثم Settings ثم Secrets. أضف السطر التالي مع الاحتفاظ بالمفاتيح الموجودة:')
-    st.code('GOLDAPI_KEY = "ضع مفتاح حسابك هنا"', language='toml')
-    st.caption('لا تضع المفتاح في GitHub أو المحادثة. تُستخدم الطلبات أثناء فتح التطبيق وفق الحصة؛ تحقق من حد الخطة قبل تفعيلها. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
-    st.write('حالة المفتاح: ' + ('موجود — يُختبر مع كل تحديث' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
+if ACTIVE_KIND == 'spot_gold':
+    with st.expander('ربط الذهب الفوري فقط — GoldAPI'):
+        st.write('جهّزنا GoldAPI لسعر الشراء والبيع وتوقيت التحديث، وTwelve Data للشموع والتحقق المستقل. لا يربط هذا حساب تداول ولا يرسل أوامر.')
+        st.link_button('فتح حساب GoldAPI', 'https://www.goldapi.io/')
+        st.write('في Streamlit افتح Manage app ثم Settings ثم Secrets. أضف السطر التالي مع الاحتفاظ بالمفاتيح الموجودة:')
+        st.code('GOLDAPI_KEY = "ضع مفتاح حسابك هنا"', language='toml')
+        st.caption('لا تضع المفتاح في GitHub أو المحادثة. تُستخدم الطلبات أثناء فتح التطبيق وفق الحصة؛ تحقق من حد الخطة قبل تفعيلها. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
+        st.write('حالة المفتاح: ' + ('موجود — يُختبر مع كل تحديث' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
 
 if ACTIVE_KIND == 'gold_etf':
     with st.expander('ربط GLD — أسعار Alpaca', expanded=not all(alpaca_config()[:2])):
         st.write('مصدر GLD مستقل عن الذهب الفوري. لا تحتاج GoldAPI لهذا القسم.')
         st.link_button('حساب بيانات Alpaca', 'https://app.alpaca.markets/')
         st.code('ALPACA_API_KEY = "مفتاح Paper"\nALPACA_SECRET_KEY = "المفتاح السري"\nALPACA_DATA_FEED = "iex"', language='toml')
-        st.caption('ضع القيم في Streamlit Secrets فقط. IEX للمراقبة المحدودة؛ SIP للإشارات التجريبية بعد تفعيل صلاحية البيانات في حسابك وتغيير iex إلى sip. لا نشتري اشتراكًا ولا نرسل أي أوامر تداول.')
+        st.caption('مفاتيح Alpaca الحالية تكفي للتجربة المجانية على IEX؛ لا تحتاج GoldAPI أو اشتراكًا جديدًا. البيانات من بورصة واحدة وقد تختلف عن سعر وسيطك. لا نرسل أي أوامر تداول.')
         st.caption('المحلل قواعد فنية قابلة للفحص، وليس نموذجًا مثبت الربحية. تحديث العرض نصف ثانية والقرار ثانية؛ زمن وصول المصدر غير مضمون. مفاتيح Paper مطلوبة أيضًا للتحقق من ساعة السوق.')
 
 if ACTIVE_KIND == 'spot_gold' and not str(secret("TWELVE_DATA_API_KEY", "") or "").strip():
@@ -973,8 +990,7 @@ else:
                 quote, secondary = select_gold_sources(quote, gold, tick, now_ts())
             source_check = consensus(quote, secondary)
             if ACTIVE_KIND == 'gold_etf':
-                source_check = dict(ok=quote.get('ok') and quote.get('feed') == 'sip', count=1,
-                                    reason='SIP مجمع عبر مزود واحد؛ ليس تحققًا من مزودين مستقلين')
+                source_check = gld_source_check(quote)
             analysis_started = time.perf_counter()
             analysis = (analyze_gld(history) if ACTIVE_KIND == 'gold_etf' else analyze(history)) if history else {"signal": "WAIT", "strength": 0, "reason": "البيانات غير جاهزة"}
 
@@ -992,18 +1008,20 @@ else:
                 and source_check.get("ok")
             )
             if ACTIVE_KIND == "gold_etf":
-                confirmed = confirmed and signal == 'BUY'
-                if confirmed and (not finite(analysis.get('atr')) or
-                                  quote['ask'] > history[-1]['close'] + 0.5 * analysis['atr']):
-                    confirmed = False
+                confirmed = gld_entry_ready(quote, history, analysis, now_ts())
+                if (signal == 'BUY' and fresh and finite(analysis.get('atr')) and history
+                        and quote['ask'] > history[-1]['close'] + 0.5 * analysis['atr']):
                     analysis['reason'] = 'تحرك السعر بعيدًا عن شمعة الإشارة؛ لا نطارد الدخول'
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
             data_ready = fresh and source_check.get('ok')
+            if ACTIVE_KIND == 'gold_etf':
+                data_ready = data_ready and quote.get('market_verified') and len(history) >= 120
             if not data_ready:
                 decision, state = "البيانات غير جاهزة", "bad"
             elif confirmed and signal == "BUY":
-                decision, state = "فرصة شراء تجريبية", "ok"
+                decision, state = ("شراء تجريبي — IEX محدود" if ACTIVE_KIND == 'gold_etf' and quote.get('feed') == 'iex'
+                                   else "فرصة شراء تجريبية"), "ok"
             elif confirmed and signal == "SELL":
                 decision, state = "فرصة بيع تجريبية", "ok"
             else:
@@ -1044,12 +1062,12 @@ else:
                 )
             else:
                 st.caption(
-                    f"GLD • {quote.get('source', 'Alpaca')} • عمر السعر {age_text} • {source_check['reason']} • IEX للمراقبة فقط"
+                    f"GLD • {quote.get('source', 'Alpaca')} • عمر السعر {age_text} • {source_check['reason']}"
                 )
                 with st.expander('لماذا هذه القراءة؟ — محلل GLD'):
                     for label, passed in analysis.get('checks', {}).items():
                         st.write(('✓ ' if passed else '— ') + label)
-                    st.caption('شراء فقط؛ الضعف ليس أمر بيع على المكشوف. VWAP محسوب من شموع الجلسة المغلقة المتاحة، والحجم النسبي مقارنة بآخر 20 شمعة؛ ليست نسبة نجاح متوقعة.')
+                    st.caption('شراء تجريبي فقط. VWAP والحجم النسبي محسوبان من المصدر المختار؛ مع IEX يمثلان بورصة واحدة ولا يعبران عن سيولة السوق كاملًا. اكتمال الشروط ليس نسبة نجاح.')
             st.caption(f"مصدر التحليل: {quote.get('source', 'غير متاح')} • أسعار مرجعية للمحاكاة، وليست عرض تنفيذ من وسيطك")
             if not data_ready:
                 st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
@@ -1137,7 +1155,7 @@ else:
             elif ACTIVE_KIND == "spot_gold" and not gold.get("configured", False):
                 st.info("بقي تفعيل GoldAPI من إعدادات التطبيق للحصول على Bid/Ask وتوقيت المصدر. لا ترسل المفتاح في المحادثة.")
             elif ACTIVE_KIND == "gold_etf":
-                st.info("GLD: بيانات Alpaca، وإشارات شراء تجريبية فقط عند صلاحية SIP واكتمال فحص البيانات والقواعد. ليس مربوطًا بتنفيذ سهم.")
+                st.info("GLD: التحليل التجريبي يدعم IEX المجاني بمفاتيحك الحالية. تظهر الإشارة فقط عند اكتمال البيانات والشروط؛ لا يرسل أوامر تداول ولا يحتاج اشتراك SIP للتجربة.")
         except Exception as exc:
             st.error(f"تعذر تحديث القرار: {type(exc).__name__}")
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
