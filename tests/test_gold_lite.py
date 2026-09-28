@@ -1,12 +1,45 @@
 from pathlib import Path
 from unittest.mock import patch
 import json
+import pytest
 
 import pandas as pd
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 APP = Path(__file__).resolve().parents[1] / "app.py"
+
+
+@pytest.mark.parametrize('verified', [True, False])
+def test_gld_closed_market_is_distinct_from_unknown_market(verified):
+    def reply(request, **kwargs):
+        assert request.get_method() == 'GET'
+        if '/v2/clock' in request.full_url and verified:
+            return Response(dict(is_open=False, timestamp=pd.Timestamp.now(tz='UTC').isoformat(),
+                                 next_open='2026-09-28T13:30:00Z'))
+        return Response({})
+
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    with patch('urllib.request.urlopen', side_effect=reply), patch(
+        'websockets.sync.client.connect', side_effect=OSError('offline test')
+    ):
+        app = AppTest.from_file(str(APP))
+        app.secrets['ALPACA_API_KEY'] = 'test-market-state'
+        app.secrets['ALPACA_SECRET_KEY'] = 'test-market-state'
+        app.secrets['ALPACA_DATA_FEED'] = 'iex'
+        app.run(timeout=20)
+    assert not app.exception
+    cards = next(m.value for m in app.markdown if "class='grid'" in m.value)
+    assert '%' not in cards
+    assert 'شراء تجريبي' not in cards
+    if verified:
+        assert 'السوق مغلق — انتظار الافتتاح' in cards
+        assert not app.error
+        assert any('2026-09-28 16:30' in c.value for c in app.caption)
+    else:
+        assert 'البيانات غير جاهزة' in cards
+        assert app.error
 
 
 class Response:

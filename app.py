@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.6.0-free-iex-paper"
+VERSION = "7.6.1-market-state"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -1015,9 +1015,13 @@ else:
             plan = trade_plan(signal, quote, analysis) if confirmed else None
 
             data_ready = fresh and source_check.get('ok')
+            market_closed = (ACTIVE_KIND == 'gold_etf' and quote.get('market_verified')
+                             and not quote.get('market_open'))
             if ACTIVE_KIND == 'gold_etf':
                 data_ready = data_ready and quote.get('market_verified') and len(history) >= 120
-            if not data_ready:
+            if market_closed:
+                decision, state = "السوق مغلق — انتظار الافتتاح", "wait"
+            elif not data_ready:
                 decision, state = "البيانات غير جاهزة", "bad"
             elif confirmed and signal == "BUY":
                 decision, state = ("شراء تجريبي — IEX محدود" if ACTIVE_KIND == 'gold_etf' and quote.get('feed') == 'iex'
@@ -1034,12 +1038,12 @@ else:
             else:
                 watch = "تحت " + fmt(analysis.get("sell_trigger"))
             if not data_ready:
-                watch = "موقوف حتى اكتمال البيانات"
+                watch = "ننتظر بيانات الجلسة الجديدة" if market_closed else "موقوف حتى اكتمال البيانات"
 
             price = fmt(quote.get("last"))
             tp1 = fmt(plan.get("tp1")) if plan else "—"
             stop = fmt(plan.get("stop")) if plan else "—"
-            strength = f"{int(analysis.get('strength', 0))}%"
+            strength = f"{int(analysis.get('strength', 0))}%" if data_ready else "—"
 
             st.markdown(
                 f"""
@@ -1065,11 +1069,15 @@ else:
                     f"GLD • {quote.get('source', 'Alpaca')} • عمر السعر {age_text} • {source_check['reason']}"
                 )
                 with st.expander('لماذا هذه القراءة؟ — محلل GLD'):
+                    if not data_ready:
+                        st.caption('الشروط أدناه تخص آخر شموع متاحة؛ ليست قراءة دخول حالية.')
                     for label, passed in analysis.get('checks', {}).items():
                         st.write(('✓ ' if passed else '— ') + label)
                     st.caption('شراء تجريبي فقط. VWAP والحجم النسبي محسوبان من المصدر المختار؛ مع IEX يمثلان بورصة واحدة ولا يعبران عن سيولة السوق كاملًا. اكتمال الشروط ليس نسبة نجاح.')
             st.caption(f"مصدر التحليل: {quote.get('source', 'غير متاح')} • أسعار مرجعية للمحاكاة، وليست عرض تنفيذ من وسيطك")
-            if not data_ready:
+            if market_closed:
+                st.info('الجلسة النظامية مغلقة. ننتظر الافتتاح وبيانات حديثة قبل تقييم الدخول؛ لا تحتاج تغيير المفاتيح أو شراء اشتراك بسبب إغلاق السوق.')
+            elif not data_ready:
                 st.error('تعذر تقييم الدخول حاليًا بسبب البيانات؛ هذه ليست حالة انتظار فرصة سوقية.')
                 if ACTIVE_KIND == 'gold_etf':
                     for problem in gld_readiness_issues(quote, history, now_ts()):
@@ -1116,8 +1124,9 @@ else:
                 st.download_button('تنزيل تقرير التشخيص بدون مفاتيح',
                                    json.dumps(report, ensure_ascii=False, indent=2),
                                    'gold-diagnostics.json', 'application/json')
-            st.caption(gate_reason)
-            st.caption(str(analysis.get("reason") or ""))
+            if not market_closed:
+                st.caption(gate_reason)
+                st.caption(str(analysis.get("reason") or ""))
             st.caption(('تحديث قرار GLD كل ثانية' if ACTIVE_KIND == 'gold_etf' else 'تحديث القرار كل 3 ثوانٍ') + '؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.')
             st.caption(f'زمن الحساب المحلي {analysis_ms:.1f} مللي ثانية — لا يشمل وصول بيانات السوق')
             if ACTIVE_KIND == 'spot_gold':
