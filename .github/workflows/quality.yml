@@ -25,8 +25,8 @@ jobs:
       - name: Dependency integrity
         run: python -m pip check
       - name: Compile all Python
-        run: python -m compileall -q app.py tests
+        run: python -m compileall -q app.py spx_lab.py tests
       - name: Critical static analysis
-        run: ruff check app.py tests --select E9,F63,F7,F82
+        run: ruff check app.py spx_lab.py tests --select E9,F63,F7,F82
       - name: Run regression and UI tests
         run: pytest -q

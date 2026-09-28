@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.6.1-market-state"
+VERSION = "7.7.0-spx-research"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -37,6 +37,7 @@ INSTRUMENTS = {
         "kind": "gold_etf",
     },
 }
+INSTRUMENTS["SPX — بحث وخيارات إرشادية"] = {"symbol": "SPX", "label": "SPX", "kind": "spx_research"}
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
 GOLDAPI_URL = "https://www.goldapi.io/api/XAU/USD"
@@ -945,6 +946,11 @@ st.markdown(
     f"<div class='hero'><h1>🟡 {ACTIVE_LABEL}</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
     unsafe_allow_html=True,
 )
+
+if ACTIVE_KIND == "spx_research":
+    from spx_lab import render_spx
+    render_spx(http_json, tuple(alpaca_config()[:2]))
+    st.stop()
 
 if ACTIVE_KIND == "gold_etf":
     st.caption(
