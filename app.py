@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.7.0-spx-research"
+VERSION = "7.8.0-paper-journal"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -112,8 +112,30 @@ PAPER_SAR_PER_USD = 3.75
 PAPER_SLIPPAGE_USD = 0.10
 
 
-def new_wallet() -> dict:
-    return dict(initial=5000.0, balance=5000.0, position=None, trades=[], next_id=1)
+def new_wallet(instrument: str = 'XAU/USD') -> dict:
+    return dict(initial=5000.0, balance=5000.0, position=None, trades=[], next_id=1,
+                instrument=instrument, last_signal_id=None)
+
+
+def paper_statistics(wallet: dict) -> dict:
+    trades = wallet['trades']
+    wins = [t['pnl_sar'] for t in trades if t['pnl_sar'] > 0]
+    losses = [-t['pnl_sar'] for t in trades if t['pnl_sar'] < 0]
+    equity = peak = wallet['initial']
+    drawdown = 0.0
+    for trade in trades:
+        equity += trade['pnl_sar']
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    return dict(count=len(trades), win_rate=100 * len(wins) / len(trades) if trades else None,
+                average_win=sum(wins) / len(wins) if wins else None,
+                average_loss=sum(losses) / len(losses) if losses else None,
+                profit_factor=sum(wins) / sum(losses) if losses else None,
+                net=sum(t['pnl_sar'] for t in trades), realized_drawdown=drawdown)
+
+
+def paper_slippage(wallet: dict) -> float:
+    return 0.01 if wallet.get('instrument') == 'GLD' else PAPER_SLIPPAGE_USD
 
 
 def paper_quote_ready(q: dict, clock: float) -> bool:
@@ -128,12 +150,17 @@ def paper_daily_loss(wallet: dict, clock: float) -> float:
     return sum(max(0.0, -t['pnl_sar']) for t in wallet['trades'] if t['day'] == day)
 
 
-def paper_open(wallet: dict, signal: str, plan: dict | None, quote: dict, clock: float) -> bool:
+def paper_open(wallet: dict, signal: str, plan: dict | None, quote: dict, clock: float, signal_id: str | None = None) -> bool:
+    if signal_id is not None and signal_id == wallet.get("last_signal_id"):
+        return False
+    if wallet.get("instrument") == "GLD" and signal != "BUY":
+        return False
     if wallet['position'] or not plan or signal not in ('BUY', 'SELL'):
         return False
     if not paper_quote_ready(quote, clock) or paper_daily_loss(wallet, clock) >= 75:
         return False
-    entry = quote['ask'] + PAPER_SLIPPAGE_USD if signal == 'BUY' else quote['bid'] - PAPER_SLIPPAGE_USD
+    slippage = paper_slippage(wallet)
+    entry = quote['ask'] + slippage if signal == 'BUY' else quote['bid'] - slippage
     stop, target = plan['stop'], plan['tp1']
     if not all(finite(v) for v in (entry, stop, target)):
         return False
@@ -141,19 +168,24 @@ def paper_open(wallet: dict, signal: str, plan: dict | None, quote: dict, clock:
         return False
     risk = min(25.0, 75.0 - paper_daily_loss(wallet, clock), max(0.0, wallet['balance']) * 0.005)
     # Fractional virtual ounces; no leverage and no claim of broker-executable size.
-    ounces = min(risk / ((abs(entry - stop) + PAPER_SLIPPAGE_USD) * PAPER_SAR_PER_USD),
+    ounces = min(risk / ((abs(entry - stop) + slippage) * PAPER_SAR_PER_USD),
                  max(0.0, wallet['balance']) / (entry * PAPER_SAR_PER_USD))
+    if wallet.get('instrument') == 'GLD':
+        ounces = math.floor(ounces)
     if not finite(ounces):
         return False
     wallet['position'] = dict(id=wallet['next_id'], side=signal, entry=entry, stop=stop,
                               target=target, ounces=ounces, opened_at=clock,
-                              risk_sar=ounces * (abs(entry-stop)+PAPER_SLIPPAGE_USD) * PAPER_SAR_PER_USD)
+                              risk_sar=ounces * (abs(entry-stop)+slippage) * PAPER_SAR_PER_USD,
+                              instrument=wallet.get("instrument", "XAU/USD"), slippage=slippage, signal_id=signal_id)
+    wallet["last_signal_id"] = signal_id
     wallet['next_id'] += 1
     return True
 
 
 def paper_exit_price(position: dict, q: dict) -> float:
-    return q['bid'] - PAPER_SLIPPAGE_USD if position['side'] == 'BUY' else q['ask'] + PAPER_SLIPPAGE_USD
+    slippage = position.get('slippage', PAPER_SLIPPAGE_USD)
+    return q['bid'] - slippage if position['side'] == 'BUY' else q['ask'] + slippage
 
 
 def paper_pnl(position: dict, price: float) -> float:
@@ -180,13 +212,16 @@ def paper_close(wallet: dict, q: dict, clock: float, manual: bool = False) -> st
     return reason
 
 
-def render_wallet(quote: dict, signal: str, plan: dict | None) -> None:
-    if 'paper_wallet' not in st.session_state:
-        st.session_state['paper_wallet'] = new_wallet()
-    wallet = st.session_state['paper_wallet']
+def render_wallet(quote: dict, signal: str, plan: dict | None,
+                  instrument: str = 'XAU/USD', signal_id: str | None = None) -> None:
+    wallet_key = 'paper_wallet' if instrument == 'XAU/USD' else 'paper_wallet_GLD'
+    if wallet_key not in st.session_state:
+        st.session_state[wallet_key] = new_wallet(instrument)
+    wallet = st.session_state[wallet_key]
     clock = now_ts()
     closed = paper_close(wallet, quote, clock)
-    st.subheader('محفظتي التجريبية — بدون أموال حقيقية')
+    st.subheader(f'محفظتي التجريبية — {instrument}')
+    st.caption('محاكاة فقط؛ لا يرسل هذا الزر أمرًا إلى حسابك.')
     if closed:
         st.info(f'أُغلقت الصفقة الافتراضية: {closed}')
     position = wallet['position']
@@ -198,7 +233,8 @@ def render_wallet(quote: dict, signal: str, plan: dict | None) -> None:
     if position:
         side = 'شراء' if position['side'] == 'BUY' else 'بيع'
         st.write(f"{side} • الدخول {fmt(position['entry'])} • الوقف {fmt(position['stop'])} • الهدف {fmt(position['target'])}")
-        st.caption(f"الكمية {position['ounces']:.4f} أونصة افتراضية • الخسارة المخططة {position['risk_sar']:.2f} ريال؛ قد تتجاوزها القفزات")
+        unit = "سهم افتراضي" if instrument == "GLD" else "أونصة افتراضية"
+        st.caption(f"الكمية {position['ounces']:.4f} {unit} • الخسارة المخططة {position['risk_sar']:.2f} ريال؛ قد تتجاوزها القفزات")
         if unrealized is None:
             st.warning('تقييم الصفقة متوقف: ننتظر سعر شراء وبيع حديثًا. لا نستخدم سعرًا قديمًا للإغلاق.')
         else:
@@ -210,16 +246,33 @@ def render_wallet(quote: dict, signal: str, plan: dict | None) -> None:
         blocked = paper_daily_loss(wallet, clock) >= 75
         if blocked:
             st.warning('توقف التجربة لبقية اليوم UTC: بلغت الخسائر المحققة 75 ريالًا أو أكثر.')
-        if st.button('جرّب الإشارة بمحفظتي الافتراضية', disabled=not plan or blocked):
-            if paper_open(wallet, signal, plan, quote, now_ts()):
+        duplicate = signal_id is not None and signal_id == wallet.get('last_signal_id')
+        if duplicate:
+            st.caption('سُجلت هذه الإشارة بالفعل؛ ننتظر شمعة إشارة جديدة قبل تكرار التجربة.')
+        if st.button('جرّب الإشارة بمحفظتي الافتراضية', disabled=not plan or blocked or duplicate):
+            if paper_open(wallet, signal, plan, quote, now_ts(), signal_id):
                 st.rerun()
             else:
                 st.warning('لم تُفتح الصفقة: الإشارة أو السعر لم يعد صالحًا.')
         if not plan:
             st.caption('انتظار إشارة مستوفية للشروط؛ ما تحتاج تكتب سعرًا أو تحول فلوس.')
+    stats = paper_statistics(wallet)
+    with st.expander('نتائج التجربة — من الصفقات المسجلة فقط'):
+        if not stats['count']:
+            st.info('لا توجد صفقات مغلقة بعد؛ لا تتوفر نسبة نجاح.')
+        else:
+            st.write(f"عدد الصفقات: {stats['count']} • الصفقات الرابحة: {stats['win_rate']:.1f}%")
+            st.write(f"صافي النتيجة: {stats['net']:+.2f} ريال • أكبر تراجع للرصيد المحقق: {stats['realized_drawdown']:.2f} ريال")
+            avg_win = '—' if stats['average_win'] is None else f"{stats['average_win']:.2f}"
+            avg_loss = '—' if stats['average_loss'] is None else f"{stats['average_loss']:.2f}"
+            st.write(f'متوسط الربح: {avg_win} ريال • متوسط الخسارة: {avg_loss} ريال')
+            st.caption('نتائج محاكاة هذه الجلسة؛ لا تثبت ربحية الاستراتيجية. التراجع هنا للصفقات المغلقة ولا يشمل الخسائر العائمة.')
     with st.expander('سجل التجربة وطريقة الحساب'):
         st.caption('رصيد البداية 5,000 ريال افتراضي. حد المخاطرة المخططة 25 ريالًا للصفقة، وتوقف بعد 75 ريالًا من خسائر اليوم. ليست توصية بإيداع حقيقي.')
-        st.caption('محاكاة كسور أونصة دون رافعة: 3.75 ريال للدولار كافتراض حسابي، مع فرق الشراء والبيع وانزلاق افتراضي 0.10 دولار للأونصة لكل تنفيذ. لا تشمل عمولة أو تمويل وسيطك، وليست اختبار ربحية تاريخيًا.')
+        if instrument == 'GLD':
+            st.caption('محاكاة أسهم كاملة دون رافعة، بتحويل حسابي 3.75 ريال للدولار وانزلاق 0.01 دولار للسهم لكل تنفيذ، مع السبريد. لا تشمل العمولات. السعر من المصدر المختار وقد يختلف عن وسيطك.')
+        else:
+            st.caption('محاكاة كسور أونصة دون رافعة: 3.75 ريال للدولار كافتراض حسابي، مع فرق الشراء والبيع وانزلاق افتراضي 0.10 دولار للأونصة لكل تنفيذ. لا تشمل عمولة أو تمويل وسيطك، وليست اختبار ربحية تاريخيًا.')
         st.caption('المتابعة أثناء فتح الجلسة فقط، وقد تفوت حركة بين تحديثين. الرصيد والسجل مؤقتان وقد يضيعان عند إعادة تحميل الصفحة أو انقطاع الجلسة. نزّل السجل قبل المغادرة.')
         if wallet['trades']:
             rows = [{'رقم': t['id'], 'الاتجاه': t['side'], 'الدخول': t['entry'], 'الخروج': t['exit'], 'النتيجة بالريال': round(t['pnl_sar'],2), 'السبب': t['reason'], 'التاريخ UTC': t['day']} for t in wallet['trades']]
@@ -228,7 +281,7 @@ def render_wallet(quote: dict, signal: str, plan: dict | None) -> None:
             writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-            st.download_button('تنزيل سجل الصفقات CSV', buffer.getvalue().encode('utf-8-sig'), 'gold-paper-trades.csv', 'text/csv')
+            st.download_button('تنزيل سجل الصفقات CSV', buffer.getvalue().encode('utf-8-sig'), 'gld-paper-trades.csv' if instrument == 'GLD' else 'gold-paper-trades.csv', 'text/csv')
 
 
 def fmt(value: Any, decimals: int = 3) -> str:
@@ -520,6 +573,9 @@ def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "buy_score": buy_score,
         "sell_score": sell_score,
         "reason": reason,
+        "checks": dict(zip(['اتجاه الساعة', 'اتجاه 15 دقيقة', 'اتجاه 5 دقائق', 'زخم متوازن', 'اختراق أو كسر بشمعة مغلقة'],
+                           buy_checks if buy_score >= sell_score else sell_checks)),
+        "bias": 'شراء' if buy_score >= sell_score else 'بيع',
         "atr": atr(rows, 14),
         "buy_trigger": buy_trigger,
         "sell_trigger": sell_trigger,
@@ -1065,6 +1121,27 @@ else:
                 unsafe_allow_html=True,
             )
 
+            if history and analysis.get('checks'):
+                candle_time = datetime.fromtimestamp(history[-1]['ts'] + 300, ZoneInfo('Asia/Riyadh')).strftime('%Y-%m-%d %H:%M')
+                candle_fresh = 0 <= now_ts() - (history[-1]['ts'] + 300) <= 360
+                with st.expander('قراءة الشموع — الاتجاه وشروط المراقبة', expanded=True):
+                    st.caption(f'إغلاق آخر شمعة — الرياض: {candle_time}' + (' • حديثة' if candle_fresh else ' • تاريخية؛ ليست قراءة حالية'))
+                    bias = analysis.get('bias', 'شراء GLD فقط')
+                    st.write('مسار القواعد الأقرب للاكتمال: ' + bias + ' — ليس أمر دخول')
+                    if ACTIVE_KIND == 'spot_gold':
+                        st.write(f"حد الاختراق للمراقبة: {fmt(analysis.get('buy_trigger'))} • حد الكسر: {fmt(analysis.get('sell_trigger'))}")
+                    for label, passed in analysis['checks'].items():
+                        st.write(('✓ ' if passed else '○ ') + label)
+                    if not data_ready:
+                        st.caption('هذه قراءة للشموع فقط؛ أسعار الدخول والخروج معلقة حتى اجتياز فحوص البيانات.')
+            if data_ready and not confirmed:
+                missing = [label for label, passed in analysis.get('checks', {}).items() if not passed]
+                detail = '، '.join(missing) if missing else str(analysis.get('reason', 'ننتظر اكتمال الشروط'))
+                st.info('سبب الانتظار: ' + detail)
+            elif not data_ready and not market_closed:
+                st.info('سبب توقف التقييم: ' + (gate_reason if not fresh else source_check.get('reason', 'البيانات غير مكتملة')))
+            if plan:
+                st.caption(f"الخسارة السعرية المخططة للوحدة: {abs(plan['entry'] - plan['stop']):.3f} دولار • الهدف الأول 1:1 والثاني 2:1 قبل تكاليف التنفيذ")
             age_text = "—" if age is None else f"{age:.1f} ث"
             if ACTIVE_KIND == "spot_gold":
                 st.caption(
@@ -1135,8 +1212,8 @@ else:
                 st.caption(str(analysis.get("reason") or ""))
             st.caption(('تحديث قرار GLD كل ثانية' if ACTIVE_KIND == 'gold_etf' else 'تحديث القرار كل 3 ثوانٍ') + '؛ سرعة المصدر والخطة تحددان وصول السعر. لا تنفيذ آلي ولا ضمان ربح.')
             st.caption(f'زمن الحساب المحلي {analysis_ms:.1f} مللي ثانية — لا يشمل وصول بيانات السوق')
-            if ACTIVE_KIND == 'spot_gold':
-                render_wallet(quote, signal, plan)
+            signal_id = f"{ACTIVE_SYMBOL}:{history[-1]['ts']}:{signal}" if history else None
+            render_wallet(quote, signal, plan, ACTIVE_SYMBOL, signal_id)
             position_key = 'manual_position_' + ACTIVE_SYMBOL
             position = st.session_state.get(position_key)
             if position:
