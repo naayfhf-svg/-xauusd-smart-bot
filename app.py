@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.0-paper-journal"
+VERSION = "7.8.1-xau-stream"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -321,7 +321,7 @@ def fetch_quote(symbol: str) -> dict[str, Any]:
         )
         received = now_ts()
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "error": f"تعذر الاتصال بالمصدر ({type(exc).__name__})"}
 
     if status >= 400 or not isinstance(payload, dict):
         return {"ok": False, "error": f"HTTP {status}"}
@@ -411,7 +411,7 @@ def fetch_goldapi() -> dict[str, Any]:
             timeout=4,
         )
     except Exception as exc:
-        return {"ok": False, "configured": True, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "configured": True, "error": f"تعذر الاتصال بالمصدر ({type(exc).__name__})"}
 
     return normalize_goldapi(payload, status)
 
@@ -430,6 +430,15 @@ def normalize_goldapi(payload: Any, status: int) -> dict:
 def select_gold_sources(rest: dict, gold: dict, tick: dict | None, clock: float) -> tuple[dict, dict]:
     # Each price retains its own source timestamp. Never synthesize bid/ask.
     if not gold.get('configured'):
+        # Price-only stream is useful for analysis, but must never inherit REST bid/ask.
+        if tick and finite(tick.get('price')) and tick.get('timestamp') is not None:
+            stamp = tick['timestamp']
+            rest_stamp = rest.get('updated_at')
+            if 0 <= clock - stamp <= 5 and (not rest.get('ok') or rest_stamp is None or stamp > rest_stamp):
+                return dict(ok=True, last=float(tick['price']), updated_at=stamp,
+                            received_at=tick.get('received'), bid=None, ask=None,
+                            market_open=rest.get('market_open') is True,
+                            source='Twelve Data stream', price_only=True), gold
         return rest, gold
     primary = dict(gold, last=gold.get('price'), market_open=rest.get('market_open') is True,
                    market_status_source='Twelve Data')
@@ -440,6 +449,28 @@ def select_gold_sources(rest: dict, gold: dict, tick: dict | None, clock: float)
             secondary = dict(ok=True, configured=True, price=tick['price'],
                              updated_at=tick['timestamp'], source='Twelve Data stream')
     return primary, secondary
+
+
+def xau_readiness_issues(quote: dict, history: list, confirmation: dict, clock: float) -> list[str]:
+    issues = []
+    if not quote.get('ok'):
+        issues.append('تعذر جلب سعر الذهب')
+    stamp = quote.get('updated_at')
+    if stamp is None or not 0 <= clock - stamp <= 5:
+        issues.append('توقيت السعر غير مؤكد أو أقدم من 5 ثوانٍ')
+    if not finite(quote.get('bid')) or not finite(quote.get('ask')):
+        issues.append('سعر مرجعي فقط: Bid/Ask غير متاحين؛ لا يمكن حساب دخول وخروج قابلين للمحاكاة')
+    elif quote['ask'] < quote['bid']:
+        issues.append('سعر الشراء والبيع غير صالح')
+    elif finite(quote.get('last')) and (quote['ask'] - quote['bid']) / quote['last'] > 0.0005:
+        issues.append('فرق الشراء والبيع يتجاوز فلتر الدخول')
+    if not quote.get('market_open'):
+        issues.append('فتح السوق غير مؤكد من المزود')
+    if not history or not 0 <= clock - (history[-1]['ts'] + 300) <= 360:
+        issues.append('شموع التحليل غير حديثة')
+    if not confirmation.get('ok'):
+        issues.append('التأكيد المستقل غير جاهز: ' + confirmation.get('reason', 'يلزم مصدر ثانٍ'))
+    return issues
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -1084,7 +1115,10 @@ else:
             if market_closed:
                 decision, state = "السوق مغلق — انتظار الافتتاح", "wait"
             elif not data_ready:
-                decision, state = "البيانات غير جاهزة", "bad"
+                if ACTIVE_KIND == 'spot_gold' and quote.get('ok') and quote.get('updated_at') is not None and 0 <= now_ts() - quote['updated_at'] <= 5 and history and 0 <= now_ts() - (history[-1]['ts'] + 300) <= 360:
+                    decision, state = "تحليل متاح — الدخول غير جاهز", "wait"
+                else:
+                    decision, state = "البيانات غير جاهزة", "bad"
             elif confirmed and signal == "BUY":
                 decision, state = ("شراء تجريبي — IEX محدود" if ACTIVE_KIND == 'gold_etf' and quote.get('feed') == 'iex'
                                    else "فرصة شراء تجريبية"), "ok"
@@ -1165,12 +1199,15 @@ else:
                 if ACTIVE_KIND == 'gold_etf':
                     for problem in gld_readiness_issues(quote, history, now_ts()):
                         st.write('• ' + problem)
+                else:
+                    for problem in xau_readiness_issues(quote, history, source_check, now_ts()):
+                        st.write('• ' + problem)
             if ACTIVE_KIND == 'gold_etf' and quote.get('market_verified') and not quote.get('market_open'):
                 opens = parse_time(quote.get('next_open'))
                 if opens is not None:
                     st.caption('الافتتاح القادم بحسب المزود — الرياض: ' + datetime.fromtimestamp(opens, ZoneInfo('Asia/Riyadh')).strftime('%Y-%m-%d %H:%M'))
             with st.expander('تشخيص البيانات — سبب توقف الإشارات'):
-                issues = []
+                issues = xau_readiness_issues(quote, history, source_check, now_ts()) if ACTIVE_KIND == 'spot_gold' else []
                 if ACTIVE_KIND == 'gold_etf':
                     issues.extend(gld_readiness_issues(quote, history, now_ts()))
                 if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
