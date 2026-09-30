@@ -5,7 +5,9 @@ from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 from test_paper_journal import ns, source
 
-ns.update(threading=threading, time=time, HTTPError=HTTPError, GOLDAPI_URL='https://www.goldapi.io/api/XAU/USD')
+endpoint = next(n.value for n in ast.parse(source).body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'GOLDAPI_URL' for t in n.targets))
+ns.update(threading=threading, time=time, HTTPError=HTTPError, GOLDAPI_URL=ast.literal_eval(endpoint))
 node = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == 'GoldAPIClient')
 exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py', 'exec'), ns)
 
@@ -17,6 +19,9 @@ def test_rate_limit_backoff_and_safe_error():
         first = client.snapshot('private-key')
         second = client.snapshot('private-key')
     assert call.call_count == 1
+
+    call.assert_called_once_with('https://www.goldapi.io/api/price/XAU/USD',
+                                 headers={'x-access-token': 'private-key', 'Content-Type': 'application/json'}, timeout=4)
     assert first['http_status'] == 429 and second['retry_after_seconds'] == 300
     assert 'private' not in str(first) and 'SECRET' not in str(first)
     assert first['source'] == 'GoldAPI'

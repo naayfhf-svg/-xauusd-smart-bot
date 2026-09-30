@@ -25,7 +25,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.2-goldapi-status"
+VERSION = "7.8.3-goldapi-endpoint"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -41,7 +41,7 @@ INSTRUMENTS = {
 INSTRUMENTS["SPX — بحث وخيارات إرشادية"] = {"symbol": "SPX", "label": "SPX", "kind": "spx_research"}
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
-GOLDAPI_URL = "https://www.goldapi.io/api/XAU/USD"
+GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
 
 
 def secret(name: str, default: Any = None) -> Any:
