@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import streamlit as st
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.1-xau-stream"
+VERSION = "7.8.2-goldapi-status"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -398,22 +399,53 @@ def fetch_history(symbol: str) -> list[dict[str, Any]]:
     return list(dedup.values())
 
 
-@st.cache_data(ttl=8, show_spinner=False)
+def goldapi_failure(status: int | None) -> dict:
+    reason = {401: 'رفض المصادقة؛ تحقق من المفتاح المحفوظ',
+              403: 'رفض الوصول؛ تحقق من صلاحية الحساب والخطة',
+              429: 'تجاوز حد الطلبات؛ توقفت المحاولات مؤقتًا'}.get(status,
+                  'تعذر الاتصال بالمصدر' if status is None else 'لم يعد المصدر بيانات XAU/USD صالحة')
+    return dict(ok=False, configured=True, source='GoldAPI', http_status=status, error=reason)
+
+
+class GoldAPIClient:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next_attempt = 0.0
+        self.result = None
+
+    def snapshot(self, key: str) -> dict:
+        with self.lock:
+            if self.result is not None and time.monotonic() < self.next_attempt:
+                return dict(self.result, retry_after_seconds=max(0, math.ceil(self.next_attempt - time.monotonic())))
+            try:
+                status, payload = http_json(GOLDAPI_URL,
+                    headers={'x-access-token': key, 'Content-Type': 'application/json'}, timeout=4)
+                result = normalize_goldapi(payload, status)
+                if not result['ok']:
+                    result = goldapi_failure(status)
+            except HTTPError as exc:
+                # Only retain the status code, never the body, URL or credentials.
+                result = goldapi_failure(exc.code)
+                exc.close()
+            except Exception:
+                result = goldapi_failure(None)
+            delay = 8 if result['ok'] else 300 if result.get('http_status') in (401, 403, 429) else 60
+            self.next_attempt = time.monotonic() + delay
+            self.result = result
+            return dict(result, retry_after_seconds=delay)
+
+
+@st.cache_resource
+def goldapi_client(identity: str):
+    return GoldAPIClient()
+
+
 def fetch_goldapi() -> dict[str, Any]:
-    key = str(secret("GOLDAPI_KEY", "") or "").strip()
+    key = str(secret('GOLDAPI_KEY', '') or '').strip()
     if not key:
-        return {"ok": False, "configured": False}
-
-    try:
-        status, payload = http_json(
-            GOLDAPI_URL,
-            headers={"x-access-token": key, "Content-Type": "application/json"},
-            timeout=4,
-        )
-    except Exception as exc:
-        return {"ok": False, "configured": True, "error": f"تعذر الاتصال بالمصدر ({type(exc).__name__})"}
-
-    return normalize_goldapi(payload, status)
+        return dict(ok=False, configured=False, source='GoldAPI')
+    identity = hashlib.sha256(key.encode()).hexdigest()
+    return goldapi_client(identity).snapshot(key)
 
 
 def normalize_goldapi(payload: Any, status: int) -> dict:
@@ -1081,6 +1113,10 @@ else:
             if ACTIVE_KIND == "spot_gold":
                 tick, _ = gold_stream(str(secret('TWELVE_DATA_API_KEY', '') or '').strip()).snapshot()
                 quote, secondary = select_gold_sources(quote, gold, tick, now_ts())
+            if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
+                status_text = f"HTTP {gold['http_status']} • " if gold.get('http_status') is not None else ''
+                st.warning('GoldAPI: المفتاح محفوظ • ' + status_text + gold.get('error', 'بيانات غير صالحة'))
+                st.caption(f"إعادة محاولة الاتصال بعد نحو {gold.get('retry_after_seconds', 0)} ثانية. حفظ المفتاح وحده لا يعني نجاح الاتصال.")
             source_check = consensus(quote, secondary)
             if ACTIVE_KIND == 'gold_etf':
                 source_check = gld_source_check(quote)
