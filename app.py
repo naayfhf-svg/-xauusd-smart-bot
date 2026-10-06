@@ -25,7 +25,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.3-goldapi-endpoint"
+VERSION = "7.8.4-goldapi-manual"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -413,8 +413,13 @@ class GoldAPIClient:
         self.next_attempt = 0.0
         self.result = None
 
-    def snapshot(self, key: str) -> dict:
+    def snapshot(self, key: str, request: bool = False) -> dict:
         with self.lock:
+            if not request:
+                if self.result is None:
+                    return dict(ok=False, configured=True, source='GoldAPI', pending=True,
+                                error='لم يتم الفحص بعد؛ اضغط فحص GoldAPI مرة واحدة')
+                return dict(self.result, retry_after_seconds=max(0, math.ceil(self.next_attempt - time.monotonic())))
             if self.result is not None and time.monotonic() < self.next_attempt:
                 return dict(self.result, retry_after_seconds=max(0, math.ceil(self.next_attempt - time.monotonic())))
             try:
@@ -440,19 +445,20 @@ def goldapi_client(identity: str):
     return GoldAPIClient()
 
 
-def fetch_goldapi() -> dict[str, Any]:
+def fetch_goldapi(request: bool = False) -> dict[str, Any]:
     key = str(secret('GOLDAPI_KEY', '') or '').strip()
     if not key:
         return dict(ok=False, configured=False, source='GoldAPI')
     identity = hashlib.sha256(key.encode()).hexdigest()
-    return goldapi_client(identity).snapshot(key)
+    return goldapi_client(identity).snapshot(key, request=request)
 
 
 def normalize_goldapi(payload: Any, status: int) -> dict:
     payload = payload if isinstance(payload, dict) else {}
     price, bid, ask = (payload.get(k) for k in ('price', 'bid', 'ask'))
     valid_pair = payload.get('metal') == 'XAU' and payload.get('currency') == 'USD'
-    return dict(ok=bool(status < 400 and valid_pair and finite(price)), configured=True,
+    return dict(ok=bool(200 <= status < 300 and valid_pair and finite(price)), configured=True,
+                http_status=status,
                 updated_at=parse_time(payload.get('timestamp')),
                 price=float(price) if finite(price) else None,
                 bid=float(bid) if finite(bid) else None,
@@ -1082,8 +1088,35 @@ if ACTIVE_KIND == 'spot_gold':
         st.link_button('فتح حساب GoldAPI', 'https://www.goldapi.io/')
         st.write('في Streamlit افتح Manage app ثم Settings ثم Secrets. أضف السطر التالي مع الاحتفاظ بالمفاتيح الموجودة:')
         st.code('GOLDAPI_KEY = "ضع مفتاح حسابك هنا"', language='toml')
-        st.caption('لا تضع المفتاح في GitHub أو المحادثة. تُستخدم الطلبات أثناء فتح التطبيق وفق الحصة؛ تحقق من حد الخطة قبل تفعيلها. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
-        st.write('حالة المفتاح: ' + ('موجود — يُختبر مع كل تحديث' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
+        st.caption('لا تضع المفتاح في GitHub أو المحادثة. يُرسل الطلب عند الضغط على زر الفحص فقط؛ راقب الحصة في حساب المزود. إضافة المفتاح لا تضمن حداثة أقل من 5 ثوانٍ.')
+        st.write('حالة المفتاح: ' + ('موجود — الفحص يدوي' if str(secret('GOLDAPI_KEY', '') or '').strip() else 'غير مضبوط'))
+
+    @st.fragment(run_every=3)
+    def goldapi_status_panel():
+        st.subheader('حالة GoldAPI — فحص يدوي لحفظ الحصة')
+        configured = bool(str(secret('GOLDAPI_KEY', '') or '').strip())
+        requested = st.button('فحص GoldAPI مرة واحدة', key='goldapi_manual_check', disabled=not configured)
+        result = fetch_goldapi(request=requested)
+        st.caption('التحديث التلقائي للشاشة لا يرسل طلبات GoldAPI. الزر يطلب قراءة واحدة؛ النقر المتكرر أثناء مهلة الانتظار يستخدم النتيجة المحفوظة.')
+        if not configured:
+            st.info('المفتاح غير مضبوط: أضف GOLDAPI_KEY في Secrets.')
+        elif result.get('pending'):
+            st.info('المفتاح موجود؛ لم يُختبر بعد. اضغط زر الفحص أعلاه.')
+        elif not result.get('ok'):
+            status = result.get('http_status')
+            st.warning(f"GoldAPI: HTTP {status} — {result.get('error')}" if status else 'GoldAPI: تعذر الاتصال بالمصدر')
+            st.caption(f"الفحص التالي متاح بعد نحو {result.get('retry_after_seconds', 0)} ثانية؛ لا توجد إعادة محاولة تلقائية.")
+        else:
+            st.success(f"GoldAPI: نجح طلب القراءة — HTTP {result.get('http_status')}")
+            stamp = result.get('updated_at')
+            age = now_ts() - stamp if stamp is not None else None
+            st.write(f"السعر {fmt(result.get('price'))} • Bid {fmt(result.get('bid'))} • Ask {fmt(result.get('ask'))}")
+            st.caption('عمر سعر المصدر: ' + (f'{age:.1f} ثانية' if age is not None else 'غير معروف'))
+            if age is None or not 0 <= age <= 5:
+                st.warning('القراءة قديمة أو توقيتها غير مؤكد؛ نجاح الاتصال لا يعني جاهزية الدخول.')
+            st.caption('قراءة مرجعية للمحاكاة، وليست سعر تنفيذ وسيطك. وضع الفحص اليدوي لا يوفر متابعة لحظية مستمرة.')
+
+    goldapi_status_panel()
 
 if ACTIVE_KIND == 'gold_etf':
     with st.expander('ربط GLD — أسعار Alpaca', expanded=not all(alpaca_config()[:2])):
@@ -1113,10 +1146,10 @@ else:
             if ACTIVE_KIND == "spot_gold":
                 tick, _ = gold_stream(str(secret('TWELVE_DATA_API_KEY', '') or '').strip()).snapshot()
                 quote, secondary = select_gold_sources(quote, gold, tick, now_ts())
-            if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok'):
+            if ACTIVE_KIND == 'spot_gold' and gold.get('configured') and not gold.get('ok') and not gold.get('pending'):
                 status_text = f"HTTP {gold['http_status']} • " if gold.get('http_status') is not None else ''
                 st.warning('GoldAPI: المفتاح محفوظ • ' + status_text + gold.get('error', 'بيانات غير صالحة'))
-                st.caption(f"إعادة محاولة الاتصال بعد نحو {gold.get('retry_after_seconds', 0)} ثانية. حفظ المفتاح وحده لا يعني نجاح الاتصال.")
+                st.caption('الفحص يدوي من زر GoldAPI أعلى الصفحة. حفظ المفتاح وحده لا يعني نجاح الاتصال.')
             source_check = consensus(quote, secondary)
             if ACTIVE_KIND == 'gold_etf':
                 source_check = gld_source_check(quote)

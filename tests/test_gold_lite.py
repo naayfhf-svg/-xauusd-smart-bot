@@ -103,10 +103,17 @@ def test_gold_lite_app_runs(tmp_path, monkeypatch):
     with patch("urllib.request.urlopen", side_effect=_fixture_get), patch(
         "websockets.sync.client.connect", side_effect=OSError('offline test')
     ):
-        at = AppTest.from_file(str(APP), default_timeout=60).run()
-
-    assert not at.exception, [x.message for x in at.exception]
-    assert not at.error, [x.value for x in at.error]
+        with patch("urllib.request.urlopen", side_effect=_fixture_get) as calls:
+            at = AppTest.from_file(str(APP), default_timeout=60).run()
+            assert not at.exception, [x.message for x in at.exception]
+            assert not any("goldapi.io" in c.args[0].full_url for c in calls.call_args_list)
+            assert any("لم يُختبر" in x.value for x in at.info)
+            at.button(key="goldapi_manual_check").click().run()
+            assert not at.exception, [x.message for x in at.exception]
+            assert any("HTTP 200" in x.value for x in at.success)
+            assert sum("goldapi.io" in c.args[0].full_url for c in calls.call_args_list) == 1
+            at.run()
+            assert sum("goldapi.io" in c.args[0].full_url for c in calls.call_args_list) == 1
 
 
 def test_gold_lite_missing_key_does_not_crash(monkeypatch):
