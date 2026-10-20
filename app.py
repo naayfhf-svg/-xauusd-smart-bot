@@ -25,7 +25,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.4-goldapi-manual"
+VERSION = "7.9.0-mt5-demo-preview"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -39,6 +39,7 @@ INSTRUMENTS = {
     },
 }
 INSTRUMENTS["SPX — بحث وخيارات إرشادية"] = {"symbol": "SPX", "label": "SPX", "kind": "spx_research"}
+INSTRUMENTS["XM / MT5 — تجربة الذهب"] = {"symbol": "GOLD", "label": "XM GOLD", "kind": "mt5_demo"}
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
 GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
@@ -1071,6 +1072,11 @@ st.markdown(
     f"<div class='hero'><h1>🟡 {ACTIVE_LABEL}</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
     unsafe_allow_html=True,
 )
+
+if ACTIVE_KIND == "mt5_demo":
+    from mt5_lab import render
+    render(st, secret, analyze, trade_plan)
+    st.stop()
 
 if ACTIVE_KIND == "spx_research":
     from spx_lab import render_spx

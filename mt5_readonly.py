@@ -76,7 +76,7 @@ def read_snapshot(api, expected_login, expected_server, symbol="GOLD", clock=Non
             if info.currency_base != "XAU" or info.currency_profit != "USD":
                 raise ReadError("الرمز ليس ذهباً مقابل الدولار حسب مواصفات الوسيط")
             tick = api.symbol_info_tick(symbol)
-            rates = api.copy_rates_from_pos(symbol, api.TIMEFRAME_M5, 1, 200)
+            rates = api.copy_rates_from_pos(symbol, api.TIMEFRAME_M5, 1, 1200)
             check_time = time.time() if clock is None else clock
             quote = normalize_tick(tick, check_time)
             bars = normalize_bars(rates, check_time)
