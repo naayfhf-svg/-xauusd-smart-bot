@@ -1359,3 +1359,9 @@ else:
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
+
+
+# Optional Windows-local diagnostic; never used by the trading decision path.
+with st.expander("اختبار ربط XM / MT5 — قراءة فقط"):
+    from mt5_readonly import render_mt5_panel
+    render_mt5_panel(st, secret)
