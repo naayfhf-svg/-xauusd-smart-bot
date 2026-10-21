@@ -95,7 +95,7 @@ def test_stale_bars():
 
 def test_actual_app_analysis_gets_enough_history():
     # Exercise actual strategy functions without starting Streamlit or any network.
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
     names = {"finite", "ema", "rolling_rsi", "atr", "resample", "trend", "analyze", "trade_plan"}
     tree = ast.parse(source)
     body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
