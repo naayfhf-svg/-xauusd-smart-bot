@@ -111,6 +111,7 @@ def test_actual_app_analysis_gets_enough_history():
     assert result["analysis"]["reason"] == "الشروط لم تكتمل"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Non-Windows UI fallback")
 def test_new_mode_does_not_fall_through_to_external_feeds():
     from unittest.mock import patch
     from streamlit.testing.v1 import AppTest
@@ -120,3 +121,17 @@ def test_new_mode_does_not_fall_through_to_external_feeds():
         at.selectbox[0].select("XM / MT5 — تجربة الذهب").run()
     assert not at.exception
     assert any("ويندوز" in w.value for w in at.warning)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Non-Windows UI fallback")
+def test_launcher_mode_starts_without_external_quote_requests(monkeypatch):
+    from unittest.mock import patch
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv("START_IN_MT5_DEMO", "true")
+    app = Path(__file__).resolve().parents[1] / "app.py"
+    with patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected network")) as network:
+        at = AppTest.from_file(str(app), default_timeout=30).run()
+    assert not at.exception
+    assert at.selectbox[0].value == "XM / MT5 — تجربة الذهب"
+    network.assert_not_called()
+

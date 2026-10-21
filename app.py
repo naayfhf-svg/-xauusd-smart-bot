@@ -1061,7 +1061,9 @@ st.markdown(
 selected_name = st.selectbox(
     "الأداة",
     list(INSTRUMENTS.keys()),
-    index=1 if all(alpaca_config()[:2]) else 0,
+    index=(list(INSTRUMENTS).index("XM / MT5 — تجربة الذهب")
+           if str(secret("START_IN_MT5_DEMO", "")).lower() in ("true", "1")
+           else 1 if all(alpaca_config()[:2]) else 0),
 )
 instrument = INSTRUMENTS[selected_name]
 ACTIVE_SYMBOL = instrument["symbol"]
@@ -1371,3 +1373,4 @@ else:
 with st.expander("اختبار ربط XM / MT5 — قراءة فقط"):
     from mt5_readonly import render_mt5_panel
     render_mt5_panel(st, secret)
+

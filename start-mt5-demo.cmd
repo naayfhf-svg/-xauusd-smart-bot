@@ -18,5 +18,7 @@ if errorlevel 1 (
   exit /b 1
 )
 set MT5_READ_ONLY_ENABLED=true
+set START_IN_MT5_DEMO=true
 ".venv\Scripts\python.exe" -m streamlit run app.py --server.address 127.0.0.1
 pause
+
