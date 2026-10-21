@@ -25,7 +25,7 @@ st.set_page_config(
     layout="centered",
 )
 
-VERSION = "7.8.4-goldapi-manual"
+VERSION = "7.9.0-mt5-demo-preview"
 INSTRUMENTS = {
     "الذهب الفوري — XAU/USD": {
         "symbol": "XAU/USD",
@@ -39,6 +39,7 @@ INSTRUMENTS = {
     },
 }
 INSTRUMENTS["SPX — بحث وخيارات إرشادية"] = {"symbol": "SPX", "label": "SPX", "kind": "spx_research"}
+INSTRUMENTS["XM / MT5 — تجربة الذهب"] = {"symbol": "GOLD", "label": "XM GOLD", "kind": "mt5_demo"}
 QUOTE_URL = "https://api.twelvedata.com/quote"
 HISTORY_URL = "https://api.twelvedata.com/time_series"
 GOLDAPI_URL = "https://www.goldapi.io/api/price/XAU/USD"
@@ -1060,7 +1061,9 @@ st.markdown(
 selected_name = st.selectbox(
     "الأداة",
     list(INSTRUMENTS.keys()),
-    index=1 if all(alpaca_config()[:2]) else 0,
+    index=(list(INSTRUMENTS).index("XM / MT5 — تجربة الذهب")
+           if str(secret("START_IN_MT5_DEMO", "")).lower() in ("true", "1")
+           else 1 if all(alpaca_config()[:2]) else 0),
 )
 instrument = INSTRUMENTS[selected_name]
 ACTIVE_SYMBOL = instrument["symbol"]
@@ -1071,6 +1074,11 @@ st.markdown(
     f"<div class='hero'><h1>🟡 {ACTIVE_LABEL}</h1><p>قرار مضاربة مختصر • v{VERSION}</p></div>",
     unsafe_allow_html=True,
 )
+
+if ACTIVE_KIND == "mt5_demo":
+    from mt5_lab import render
+    render(st, secret, analyze, trade_plan)
+    st.stop()
 
 if ACTIVE_KIND == "spx_research":
     from spx_lab import render_spx
@@ -1359,3 +1367,10 @@ else:
             st.caption("تم منع الخطأ من إسقاط التطبيق وسيحاول التحديث تلقائيًا.")
 
     quick_panel()
+
+
+# Optional Windows-local diagnostic; never used by the trading decision path.
+with st.expander("اختبار ربط XM / MT5 — قراءة فقط"):
+    from mt5_readonly import render_mt5_panel
+    render_mt5_panel(st, secret)
+
