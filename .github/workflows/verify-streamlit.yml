@@ -17,7 +17,7 @@ jobs:
       - name: Compile app
         run: python -m py_compile app.py
       - name: Install production runtime
-        run: pip install --disable-pip-version-check "streamlit>=1.50,<2"
+        run: pip install --disable-pip-version-check -r requirements.txt
       - name: Import dependencies
         run: |
           python -c "import streamlit, altair, pandas, numpy, requests; print('imports-ok')"
@@ -46,3 +46,4 @@ jobs:
             exit 1
           fi
           echo "streamlit-smoke-ok"
+
